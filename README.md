@@ -1,10 +1,7 @@
 <h1 align="center">DeepSeek-V4.1-Flash-1017 EXL3 on 2x DGX Sparks with TensorFold</h1>
 
 <p align="center">
-  <sub>by <a href="https://x.com/MiaAI_lab">Mia's AI Lab</a></sub>
-  <br><br>
-  <a href="https://github.com/sponsors/MiaAI-Lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Sponsor%20me%20on%20GitHub-181717?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor me on GitHub" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
-  <a href="https://x.com/MiaAI_lab" target="_blank" rel="noopener noreferrer" style="display:inline-block;margin:0 8px;vertical-align:middle;"><img src="https://img.shields.io/badge/Follow%20me%20on%20X-000000?style=for-the-badge&logo=x&logoColor=white" alt="Follow Mia on X" height="28" style="height:28px;width:auto;vertical-align:middle;border:0;" /></a>
+  <sub>sehoon123's recipe, built on <a href="https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks">Mia's AI Lab's</a>: the same setup, with an exact wide copy-window decode path</sub>
 </p>
 
 Serve **DeepSeek-V4.1-Flash-1017** from two NVIDIA DGX Sparks (GB10, 128 GB each, linked by their ConnectX-7 ports)
@@ -24,7 +21,57 @@ or off, and **DSpark** speculative decoding from the checkpoint's own draft bloc
 - Optional `ABLIT=1`: keeps Mia EAQ 2.9 bpw and applies the matching [Keys overlay by drowzeys](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated).
   Requires your Hugging Face token and access to that gated repository; see [Abliterated mode](#abliterated-mode).
 
+## What this recipe adds
+
+This is [Mia's AI Lab's recipe](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks) at [`31eea46`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/commit/31eea4608f8bb292a92e2f7a1db400e928620c78) with the changes below (follow Mia's AI Lab on
+[X](https://x.com/MiaAI_lab), sponsor them on [GitHub](https://github.com/sponsors/MiaAI-Lab)). The setup, the commands,
+the settings and the engine pin are theirs, and so is the rest of this README, whose issue and pull-request numbers are
+their repository's.
+
+- **Wide copy windows, on by default** (`zig/patches/0017`; `TF_DS_COPY_ROWS=16`, `TF_DS_COPY_SKIP=1` in
+  `scripts/config.sh`). When a reply copies text from its prompt or from itself (an edited file, a quotation, a list
+  written again), a stream that runs alone checks up to 16 copied tokens a round instead of 6, and skips the drafter's
+  pass after a round that accepted its whole copy. Measured when it was added: a JavaScript file from the prompt copied
+  verbatim 123.6 → 204.1 tok/s, copied with every `const` turned into `let` 111.0 → 141.1; sparkDash's six decode cells
+  +1.2 % together (code, one stream +3.9 %).
+- **The drafter's confidence head when the stock shards are gone.** Mia's AI Lab's recipe gives the overlay's F32 copy of
+  `mtp.2.confidence_head.proj.weight` stock's F16 bytes back (`scripts/ablit_stock_dtypes.py`), which needs the stock
+  shards. When they are gone, preparation checks the head and writes it to `conf_head_f32.bin`, and both ranks load it
+  from there (`TF_DS_CONF_FILE`, `zig/patches/0018`); the checkpoint and the ~106 GB weight files stay as they are.
+- **`ABLIT_PRUNE_STOCK=1`**, for `ABLIT=1` on a smaller disk: once the overlay checkpoint is verified, the 24 stock shards
+  it replaced are removed (127 GB) and are not downloaded again ([Abliterated mode](#abliterated-mode)).
+- **`start.sh`**: a SIGTERM (systemd stopping the service) always reaches `./stop.sh` and stops both ranks (a foreground
+  `docker logs -f` used to defer the trap); the `TF_DS_*` variables of `zig/patches/0010`-`0018` are range-checked;
+  `TF_DS_FIX_K` reaches rank 1 as `--fix-k`.
+- **Research patches, off unless their variables are set**: draft-depth policies (`0010`-`0016`) and 0018's calibration
+  switches ([zig/patches/README.md](zig/patches/README.md)).
+- **[research/](research/README.md)**: the measurements behind these changes: where a 38.9 ms decode round goes on this
+  pair, the exactness checks, what did not help, and the tools.
+
+Replies do not change. Every check compared them with serial decoding (one token a round, no drafts) or with its token
+hashes: 62 of 62 copy-window runs (copies 0-90 % wrong, three streams at once, temperature 1, EOS and length endings) and
+611 decodes of the later offline runs, up to 125K-token prompts, none different ([research/](research/README.md)).
+
+The image is Mia's AI Lab's with these nine patches added (`tensorfold-dsv41:exl3-tp2-39b972fbfeab`). None is published,
+so the first `./start.sh` builds it on the head (two Zig builds, ~6 minutes) and copies it to the worker.
+
+<!-- MEASURED -->
+Measured on our pair (`ABLIT=1`, `CONTEXT=1048576`; sparkDash's decode bench, the streams together, median of two waves):
+
+| Decode, tok/s | 1 stream | 2 streams | 4 streams |
+| --- | --- | --- | --- |
+| Prose | 66.8 | 100.8 | 134.2 |
+| Code | 114.3 | 148.2 | 155.4 |
+
+(2026-10-20, on Mia's AI Lab's recipe at `e65785cd` with these patches and the confidence head from a file: the same image
+and the same confidence-head values as this commit gives that install.) The stock checkpoint (`ABLIT=0`) was not measured
+with these changes; for it, see Mia's AI Lab's numbers under Status.
+<!-- /MEASURED -->
+
 ## Status
+
+This section is Mia's AI Lab's, for their recipe at `31eea46` (the stock checkpoint unless it says otherwise); this
+recipe's own measurements are under [What this recipe adds](#what-this-recipe-adds).
 
 What is checked, and how:
 
@@ -166,8 +213,8 @@ watchdog exists because that can freeze a Spark; see [Memory and safety](#memory
 On the head:
 
 ```bash
-git clone https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks.git
-cd DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks
+git clone https://github.com/sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned.git
+cd DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned
 cp scripts/local.sh.example scripts/local.sh     # set WORKER=user@192.0.2.2 in it (and FABRIC_PEER, see below)
 DRY_RUN=1 ./start.sh                              # prints what it would do; changes and starts nothing
 ./start.sh
@@ -254,6 +301,15 @@ revision, including when `WORKER_CACHE_DIR` is customized, so stock caches canno
 a separately prepared checkpoint cannot make a stock server count as abliterated. The API model name remains `SERVED_NAME`.
 The stock performance and correctness results above do not validate the abliterated mode on this recipe's engine.
 
+**This recipe: `ABLIT_PRUNE_STOCK=1`.** With `ABLIT=1`, it removes the 24 stock shards whose 104 `wo_b` tensors the overlay
+replaced once the overlay checkpoint is verified (`scripts/prune_ablit_stock.py`: it writes its plan first, removes a blob
+only when no other snapshot links to it, and can be re-run), and preparation stops downloading stock: 127 GB less on the
+head. `ABLIT=0` afterwards downloads those shards again. The dtype step above runs before the pruning. On a checkpoint
+pruned before that step existed (or whose stock shards were deleted by hand), preparation checks the confidence head
+instead and, when it is F32, writes it to `conf_head_f32.bin` for both ranks (`scripts/ablit_conf_head.py`,
+`TF_DS_CONF_FILE`, `zig/patches/0018`), rewriting neither the checkpoint nor the weight files. This recipe's own
+measurements ([What this recipe adds](#what-this-recipe-adds)) are of the abliterated mode.
+
 ## What `start.sh` and `scripts/prepare.sh` do
 
 `scripts/prepare.sh` (run by `start.sh` when something is missing; safe to re-run) on the head:
@@ -285,6 +341,7 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 | `MODEL_ID`, `MODEL_REVISION` | `Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw` @ `6d54be4f` | the checkpoint. The Hub repo was renamed from `...-1017-EAQ-v1-2.9-bpw` (the old name redirects), and the Hugging Face cache is keyed by the repo's name and revision: a copy under the old name or an older revision (e.g. `e8ac7684`, which the Hub no longer has) is not found under the default, and `scripts/prepare.sh` would download 196 GiB. It now stops when the disk cannot hold that. To keep serving a copy you have, set both to what `~/.cache/huggingface/hub` holds |
 | `ABLIT` | 0 | `0`: stock Mia EAQ 2.9 bpw; `1`: apply the matching gated Keys overlay; requires your HF token and repository access (see Abliterated mode) |
 | `ABLIT_REVISION` | `0bdc2036113c4fdda38ef6005b3cbc0bc0dfa0f0` | pinned Keys overlay and application script; full commit hash |
+| `ABLIT_PRUNE_STOCK` | 0 | this recipe: `1` (with `ABLIT=1`) removes the 24 stock shards the overlay replaced once its checkpoint is verified (127 GB); `ABLIT=0` then downloads them again (see Abliterated mode) |
 | `HF_TOKEN` | unset | Hugging Face read token for downloads; alternatively authenticate with `hf auth login` on the head |
 | `CONTEXT` | 1048576 | a request's positions at most; rank 1's `--pool` follows it |
 | `PARALLEL` | 4 | requests at once (the engine's streams, 1 to 16; the family was measured at 4) |
@@ -292,19 +349,20 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 | `THINKING_BUDGET` | empty | reasoning tokens a reply may spend before the engine closes the think block itself and lets the answer continue (`--thinking-budget`; a request's `thinking_budget` wins); empty: no cap. A hard task can otherwise spend its whole `MAX_TOKENS` thinking and end with no text and no tool call. A model that keeps rambling after the cut is not stopped by it. For long agentic or tool-calling jobs, leave it empty or set it large: a small budget cuts the reasoning mid-plan, which can make the model repeat a tool call it already made |
 | `TEMPERATURE`, `TOP_P`, `TOP_K` | 1.0, 0.95, 20 | the server's sampling defaults; a request's own values win. This engine refuses a `top_k` above 56 with `TooManyCandidates` (the finite candidate list its sampler keeps), so `TOP_K` is at most 56; `top_k` 0 or -1 is refused too, with a different, misleading message |
 | `DRAFTS` | 1 | the checkpoint's DSpark draft blocks (drafted replies equal plain ones) |
+| `TF_DS_COPY_ROWS`, `TF_DS_COPY_SKIP` | 16, 1 | this recipe: wide copy windows (`zig/patches/0017`): a stream running alone checks up to 16 copied tokens a round, and `1` skips the drafter's pass after a round that accepted its whole copy; replies do not change. `6`, `0`: the engine's own |
 | `RDMA`, `GRAPHS`, `SIDE`, `PREFETCH`, `ENGRAM_AIO` | 1 | the engine's served settings |
 | `MAX_TOKENS` | 32768 | a reply's budget when a request sets none |
 | `MIN_AVAIL_GIB`, `MIN_AVAIL_WAIT_S` | 112, 30 | `start.sh` refuses to start with less memory available than this on either Spark (`0` skips the check); it re-reads the memory for up to `MIN_AVAIL_WAIT_S` seconds first, because the page cache a build or a large copy just left counts as available only once it is written back (`0` reads once) |
 | `MEMGUARD_GIB`, `MEMGUARD_HOLD_S`, `MEMGUARD_HARD_GIB` | 2.5, 4, 1 | `scripts/memguard.sh` kills a rank's container when the memory available stays under the floor for `MEMGUARD_HOLD_S` seconds without coming back over it, or at once when it falls under the hard floor. A dip that recovers is logged and not killed (decimals fine; `MEMGUARD_GIB=0` turns the guard off) |
 | `HEAD_ENGRAM_DIR` | empty | a local folder with Engram's two shards for rank 0 (as `WORKER_ENGRAM_DIR` is on the worker); empty reads them from `HF_CACHE` |
 | `HEAD_NFS_SERVER`, `HEAD_NFS_VOLUME` | empty | rank 0 reads the checkpoint over NFS through a docker volume the docker daemon mounts (no root, survives a reboot); empty uses `HF_CACHE` as a host path. sshfs does not work: it lists files as type "unknown", which the engine skips |
-| `TF_DS_ENGRAM_LANES`, `TF_DS_IDX_SPLIT` | unset | the engine patches' switches (`zig/patches/`, see Status); a `TF_DS_*` variable you export goes to both ranks |
+| `TF_DS_ENGRAM_LANES`, `TF_DS_IDX_SPLIT`, ... | unset | the engine patches' switches ([`zig/patches/README.md`](zig/patches/README.md), with this recipe's 0010-0018); a `TF_DS_*` variable you export goes to both ranks |
 | `RANK1_PROFILE` | empty | `1` or `2` starts rank 1 with `--profile`, which prints its prefill phase timings when rank 0 stops first (adds a sync per chunk: for attribution, not for timing) |
 | `API_KEY` | 0 | `1` makes rank 0 require a key (`Authorization: Bearer`; generated in `$STATE_DIR/api-key`, mode 600). The API is open on the network by default |
 | `HOST`, `PORT`, `SERVED_NAME` | 0.0.0.0, 8888, `DeepSeek-V4.1-Flash-1017` | |
 | `WORKER`, `FABRIC_PEER`, `NFS_*` | | see Requirements |
 | `TF_REF`, `INPUTS_REF`, `KIT_REF` | pinned | the engine, the inputs' tools and the kit (changing one rebuilds or re-checks) |
-| `PULL` | 1 | `0` never pulls a published image (`GHCR_IMAGE`, `IMAGE_TAG`, `IMAGE_DIGEST`; the image of these pins is `ghcr.io/miaai-lab/deepseek-v4.1-flash-1017-2x-dgx-sparks-tensorfold:exl3-tp2-7c9bf5d36350`) |
+| `PULL` | 1 | `0` never pulls a published image (`GHCR_IMAGE`, `IMAGE_TAG`, `IMAGE_DIGEST`). None is published for this recipe's patches (`exl3-tp2-39b972fbfeab`), so `scripts/prepare.sh` builds it; Mia's AI Lab's image of their pins (`ghcr.io/miaai-lab/deepseek-v4.1-flash-1017-2x-dgx-sparks-tensorfold:exl3-tp2-7c9bf5d36350`) lacks them |
 
 Extra arguments to `./start.sh` go to rank 0's `tensorfold-native serve` after the defaults; every `TENSORFOLD_*` and
 `TF_DS_*` variable you set goes to both ranks. Images are always on (rank 0 runs the vision tower).
@@ -347,10 +405,13 @@ start.sh, stop.sh            start and stop both ranks
 scripts/config.sh            every setting and its default (layered: environment, scripts/local.sh, .env)
 scripts/nodes.sh             the worker over ssh, the CX7 link and its RoCE rails, NFS volume, NCCL settings
 scripts/prepare.sh           image, downloads, kit, token map, weight files, the worker's NFS volume and disk
+scripts/ablit_stock_dtypes.py gives the overlay's cast MTP tensors stock's F16 bytes back (Mia's AI Lab's)
+scripts/ablit_conf_head.py   the confidence head as an fp32 file when the stock shards are gone (this recipe; and its test)
+scripts/prune_ablit_stock.py ABLIT_PRUNE_STOCK=1: removes the stock shards the overlay replaced (this recipe)
 scripts/memguard.sh          the memory watchdog start.sh runs on both Sparks (kills a rank's container below MEMGUARD_GIB)
 scripts/zig_flags.py         start.sh's check of rank 0's serve flags against the image's `capabilities --json`
 scripts/publish-image.sh     pushes the built image to ghcr.io (only on purpose)
-zig/Dockerfile, zig/patches  the engine image; patches to the pinned engine (three)
+zig/Dockerfile, zig/patches  the engine image; patches to the pinned engine (Mia's AI Lab's five, this recipe's nine)
 model/chat_template.jinja    the chat template rank 0 serves
 tools/validate.py            an end-to-end check of a running server
 tools/bench.py               prefill, decode, multi-stream and needle measurements as JSON, with `--compare A.json B.json`
@@ -360,16 +421,20 @@ tools/prompt_reuse.py        a conversation resumes from its kept prompt state (
 tools/toolcheck.py, needle.py, end_of_turn.py, anthropiccheck.py   single checks, from the GLM-5.3-Flash recipe
 docs/zig-engine.md           how the pieces fit, and what is not verified
 docs/hermes-agent.md         Hermes Agent as a client (by Steve Darlow)
+research/                    this recipe's decode measurements, notes and tools (not needed to run it)
 ```
 
 ## License
 
 This recipe's own code, scripts and documentation: Apache-2.0 ([`LICENSE`](LICENSE), [`NOTICE`](NOTICE)). The weights keep
 their own MIT license (DeepSeek's; Mia's AI Lab's quantization). TensorFold, BertholomusAI's fork and kit, and the other
-third-party parts keep theirs ([`NOTICE`](NOTICE)).
+third-party parts keep theirs ([`NOTICE`](NOTICE)). This recipe's changes to Mia's AI Lab's are sehoon123's, under the same
+license; `NOTICE` lists them.
 
 ## Credits
 
+- **[Mia's AI Lab](https://github.com/MiaAI-Lab)**: the recipe this one is built on, at [`31eea46`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/commit/31eea4608f8bb292a92e2f7a1db400e928620c78): its
+  scripts, documentation, measurements and engine patches 0001-0006 (Apache-2.0).
 - **[DeepSeek](https://huggingface.co/deepseek-ai)**: DeepSeek-V4.1-Flash-1017, its weights, its DSpark draft blocks, its
   Engram tables and its reference inference code (MIT).
 - **Mia's AI Lab** ([Mia-AiLab](https://huggingface.co/Mia-AiLab)): the EAQ v1 EXL3 2.9 bpw quantization served here,
@@ -418,5 +483,7 @@ third-party parts keep theirs ([`NOTICE`](NOTICE)).
   TensorFold contributors (Apache-2.0).
 - **NVIDIA**: the DGX Spark and GB10 hardware, and the PyTorch container (`nvcr.io/nvidia/pytorch:26.07-py3`) the image is
   built on (CUDA, NCCL, cuBLAS; under NVIDIA's container license).
+
+- **sehoon123**: this recipe's changes ([What this recipe adds](#what-this-recipe-adds)), Apache-2.0.
 
 Full list, with commits: [`CREDITS.md`](CREDITS.md).

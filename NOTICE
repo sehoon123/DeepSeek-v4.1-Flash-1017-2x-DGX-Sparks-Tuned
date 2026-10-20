@@ -53,3 +53,21 @@ GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold
 
 NVIDIA PyTorch container (nvcr.io/nvidia/pytorch:26.07-py3)
   The image's base, under NVIDIA's container license and its components' own licenses.
+
+--------------------------------------------------------------------------------------------------------------------
+sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned
+  https://github.com/sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned
+  A modified version of the project above (MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks, commit 31eea4608f8bb292a92e2f7a1db400e928620c78), under the
+  Apache License, Version 2.0. The changes are Copyright 2026 sehoon123 and licensed under the same license. In the notices
+  above, "this project" and "this repository", and their issue and pull-request numbers, mean Mia's AI Lab's repository.
+
+  What was changed (Apache-2.0, section 4(b)):
+  - zig/patches/0010-0018 (added): changes to BertholomusAI's engine, this repository's work under Apache-2.0; the code they
+    modify, and quote as diff context, stays under its authors' license (see "The DeepSeek-V4.1-Flash family" above).
+  - start.sh, scripts/config.sh, scripts/prepare.sh (modified): the wide copy-window defaults and checks, ABLIT_PRUNE_STOCK,
+    the confidence head from a file when the stock shards are gone, the TF_DS_* checks, the SIGTERM path, --fix-k for
+    rank 1, GHCR_IMAGE. scripts/local.sh.example (modified).
+  - scripts/prune_ablit_stock.py, scripts/ablit_conf_head.py, scripts/test_ablit_conf_head.py (added).
+  - README.md, CHANGELOG.md, CREDITS.md, NOTICE, zig/patches/README.md and the .github templates (modified);
+    .github/FUNDING.yml (removed: it named Mia's AI Lab's sponsorship).
+  - research/ (added): measurements, notes and tools; research/REFERENCES.md lists what they used.

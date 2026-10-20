@@ -1,5 +1,32 @@
 # Changelog
 
+## sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned
+
+This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
+issue and pull-request numbers are their repository's.
+
+- **Wide copy windows, on by default** (`zig/patches/0017`; `TF_DS_COPY_ROWS=16`, `TF_DS_COPY_SKIP=1` in
+  `scripts/config.sh`, checked by `start.sh`): a stream running alone checks up to 16 copied tokens a round instead of 6,
+  and skips the drafter's pass after a round that accepted its whole copy. Replies equal serial decoding (62 of 62 runs:
+  copies 0-90 % wrong, three streams, temperature 1). Measured on the pair when it was added: a JavaScript file copied from
+  the prompt 123.6 -> 204.1 tok/s verbatim and 111.0 -> 141.1 with every `const` turned into `let`; sparkDash's six decode
+  cells +1.2 % (code, one stream +3.9 %).
+- **The drafter's confidence head without the stock shards** (`scripts/ablit_conf_head.py` and its test, `zig/patches/0018`):
+  `scripts/ablit_stock_dtypes.py` needs the stock shards; on an overlay checkpoint whose stock shards are gone, `prepare.sh`
+  checks the head instead (a pure cast of F16 values) and writes it to `conf_head_f32.bin`, and `start.sh` gives it to both
+  ranks as `TF_DS_CONF_FILE`; neither the checkpoint nor the weight files are rewritten. Found here from the drafter's own
+  scores (as read, they ranked drafts worse than chance, AUC 0.45; the true head 0.84); with the true head and the stock
+  depth rule back, sparkDash's six cells +6.4 %.
+- **`ABLIT_PRUNE_STOCK=1`**: with `ABLIT=1`, removes the 24 stock shards the overlay replaced once its checkpoint is verified
+  (127 GB; `scripts/prune_ablit_stock.py` writes its plan first and removes a blob only when no other snapshot uses it), and
+  preparation stops downloading stock. The dtype step runs before it.
+- **`start.sh`**: a SIGTERM (systemd stopping the service) always reaches `./stop.sh` (a foreground `docker logs -f`
+  deferred the trap, so a stop could leave the ranks running); range checks for the `TF_DS_*` variables of
+  `zig/patches/0010`-`0018`; `TF_DS_FIX_K` reaches rank 1 as `--fix-k`.
+- **Research patches, off unless set**: draft-depth policies (`0010`-`0016`), 0018's calibration dumps and Platt scaling.
+  `research/`: the measurements and tools.
+- `GHCR_IMAGE` names this repository's namespace; nothing is published there, so `prepare.sh` builds the image.
+
 ## Unreleased
 
 - `prepare.sh`'s "cannot mount ... over NFS" error shows the last four lines of docker's output, not only the last (which was always

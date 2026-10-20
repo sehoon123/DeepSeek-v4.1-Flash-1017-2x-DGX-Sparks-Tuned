@@ -8,9 +8,7 @@ assignees: ""
 
 <!-- Thank you for using this recipe! The issue template is adapted from the GLM-5.3-Flash recipe's (Mia's AI Lab).
 
-     If you are looking for support, please check the README and scripts/config.sh first,
-     or reach out on X:
-      * https://x.com/MiaAI_lab
+     If you are looking for support, please check the README and scripts/config.sh first.
 
      This recipe has not served a request yet (README, Status): a first report that rank 0 or rank 1 exits at
      start is useful, with both ranks' logs.

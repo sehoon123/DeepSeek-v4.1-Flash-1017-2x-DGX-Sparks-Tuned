@@ -129,5 +129,19 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   other than PNG (NVIDIA's container license and the components' own).
 - [huggingface_hub](https://github.com/huggingface/huggingface_hub) (Apache-2.0), the `hf` download.
 
+## This recipe's changes
+
+- **sehoon123**: `zig/patches/0010`-`0018`, `scripts/prune_ablit_stock.py`, `scripts/ablit_conf_head.py` and its test, the
+  changes to `start.sh`, `scripts/config.sh` and `scripts/prepare.sh`, and `research/` (Apache-2.0, see [`NOTICE`](NOTICE)),
+  on Mia's AI Lab's recipe at [`31eea46`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/commit/31eea4608f8bb292a92e2f7a1db400e928620c78).
+- The confidence-head problem was found here from the drafter's own scores. Mia's AI Lab's recipe fixed it in the
+  checkpoint (`scripts/ablit_stock_dtypes.py`) after the reports of **sunlinhua-dotcom** (issue #11, pull request #12) and
+  **Ye1806431561** (issue #13, pull request #14) in its repository; this recipe keeps that fix and adds the file for a
+  checkpoint whose stock shards are gone.
+- The copy windows widen the engine's own copy proposals; checking text copied from the context in one pass is the idea of
+  prompt lookup decoding (Apoorv Saxena, 2023).
+
+This recipe is not affiliated with or endorsed by Mia's AI Lab.
+
 "DeepSeek" belongs to DeepSeek; "DGX Spark" and "GB10" belong to NVIDIA. This recipe is not affiliated with or endorsed
 by DeepSeek, NVIDIA, the TensorFold authors or BertholomusAI.
