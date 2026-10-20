@@ -1,0 +1,3 @@
+distinct replies 247, tokens 90444, distinct token ids 11989
+  rank 0: 85374 tokens over 505 of 505 blocks; for 99 % coverage 436 blocks, 99.5 % 464, 99.9 % 493
+  rank 1: 5070 tokens over 488 of 505 blocks; for 99 % coverage 450 blocks, 99.5 % 463, 99.9 % 483

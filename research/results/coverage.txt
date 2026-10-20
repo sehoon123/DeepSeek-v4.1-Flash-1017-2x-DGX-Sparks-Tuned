@@ -1,0 +1,31 @@
+nsys1-k3-r1.sqlite: window 9.6 s ~ 247 rounds of 38.85 ms, 319580 kernels
+  any kernel  99.2 % | any compute kernel (no prefetch)  98.8 % | MoE/linear streaming  85.4 %
+  per round: streaming covered 33.16 ms, NOT covered 5.69 ms (of which compute idle 0.45 ms)
+  MoE alone-union 22.32 ms, linear 10.84 ms, both running at once 0.00 ms a round
+  time in the uncovered intervals by kernel (ms/round; overlaps double count):
+     3.815  tf_ds_l2_prefetch_kernel
+     1.888  dsv41_rdma_collect
+     1.510  _hc_post_only
+     0.788  _hc_finish_s
+     0.758  _rowmm_parts
+     0.732  _sparse_attn_part
+     0.571  _sparse_attn_merge_rot2
+     0.558  _hc_mix_part
+     0.406  dsv41_rdma_stage
+     0.334  _bias
+
+nsys1-k0-r1.sqlite: window 17.4 s ~ 670 rounds of 25.977 ms, 881753 kernels
+  any kernel  99.1 % | any compute kernel (no prefetch)  98.7 % | MoE/linear streaming  80.5 %
+  per round: streaming covered 20.92 ms, NOT covered 5.05 ms (of which compute idle 0.35 ms)
+  MoE alone-union 10.34 ms, linear 10.59 ms, both running at once 0.00 ms a round
+  time in the uncovered intervals by kernel (ms/round; overlaps double count):
+     3.505  tf_ds_l2_prefetch_kernel
+     1.848  dsv41_rdma_collect
+     1.564  _hc_post_only
+     0.705  _hc_finish_s
+     0.670  _sparse_attn_part
+     0.544  _sparse_attn_merge_rot2
+     0.528  _rowmm_parts
+     0.488  _hc_mix_part
+     0.364  dsv41_rdma_stage
+     0.351  _bias

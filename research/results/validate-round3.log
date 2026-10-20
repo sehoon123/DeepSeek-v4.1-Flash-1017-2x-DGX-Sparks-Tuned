@@ -1,0 +1,11 @@
+PASS  text  'Paris' 0.2s
+PASS  thinking  reasoning 50 chars, answer '391'
+PASS  tool call  [{"id": "call_9dffabe5d0875132425e4216", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\"
+PASS  tool result  'The weather in Tokyo is currently clear with a temperature of 21°C.'
+PASS  image  'Yellow circle'
+SKIP  video (no PyAV here)
+PASS  long prompt  21875 tokens, '8638', 10.5s
+PASS  concurrent == solo  8 of 8 equal
+PASS  equal to the saved replies  8 of 8 equal
+
+all passed

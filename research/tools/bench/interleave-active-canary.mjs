@@ -1,0 +1,8 @@
+#!/usr/bin/env node
+import fs from 'node:fs';import {randomUUID} from 'node:crypto';
+import {runStreamingRequest,applyThinkingFlags,closeLlmStreamAgent} from '/home/USER/sparkDash/server/collectors/LlmStreaming.js';
+import {buildPrefillPrompt} from '/home/USER/sparkDash/server/collectors/PrefillBench.js';
+import {decodeBenchPromptForType} from '/home/USER/sparkDash/src/shared/llmPrompts.js';
+const [out]=process.argv.slice(2),base='http://127.0.0.1:8000',model='DeepSeek-V4.1-Flash-1017';const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function body(prompt,n,forced=false){const b={model,messages:[{role:'user',content:prompt}],max_tokens:n,temperature:0,top_p:1,stream:true,stream_options:{include_usage:true}};if(forced)Object.assign(b,{min_tokens:n,ignore_eos:true,stop:[]});applyThinkingFlags(b,model,false);return b;}
+try{const t=Date.now();const short=runStreamingRequest(base+'/v1/chat/completions',body(decodeBenchPromptForType('prose'),400,true),AbortSignal.timeout(900000),{collectContent:true,thinking:false});await sleep(500);const longStart=Date.now();const long=runStreamingRequest(base+'/v1/chat/completions',body(buildPrefillPrompt(100000,'active-'+randomUUID()),1),AbortSignal.timeout(900000),{collectContent:false,thinking:false});const [s,l]=await Promise.all([short,long]);const r={started:t,short:{ttft_ms:s.ttftMs,total_ms:s.totalMs,decode_tps:s.decodeTps,error:s.error||null},long:{submitted_after_ms:longStart-t,prompt_tokens:l.prefillTokens,ttft_ms:l.ttftMs,total_ms:l.totalMs,error:l.error||null},wall_ms:Date.now()-t,passed:!l.error&&!s.error&&s.totalMs<30000};fs.writeFileSync(out,JSON.stringify(r,null,2)+'\n');console.log(JSON.stringify(r,null,2));if(!r.passed)process.exitCode=1;}finally{await closeLlmStreamAgent();}

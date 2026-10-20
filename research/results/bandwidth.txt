@@ -1,0 +1,6 @@
+GB10 read bandwidth, tools/bench/bwprobe.py (torch in the engine image), 2026-10-20, one GPU of the pair
+(transcribed from the run's console output):
+  one 1 GiB read: 225.9 GB/s, 83 % of the 273 GB/s peak (LPDDR5X)
+  reads in chunks of 2 / 8 / 32 / 128 MiB: 96 / 143 / 165 / 175 GB/s
+A decode round's MoE phase moves ~48.6 MiB a rank a layer at one row (6 routed experts' halves and the shared expert's
+half; results/checkpoint-bytes.txt) in ~223 us (results/layer-timeline-k0.txt): ~228 GB/s, at that ceiling.

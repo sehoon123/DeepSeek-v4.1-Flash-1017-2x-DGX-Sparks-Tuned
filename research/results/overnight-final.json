@@ -1,0 +1,40 @@
+{
+  "completed": "2026-10-20T09:56:50+0900",
+  "recipe_commit": "e65785cd3cde8e23c38d60a732a014abb6ccb533",
+  "engine_ref": "629c524a0ea57512a5342abb498d1b7c25353343",
+  "image": "tensorfold-dsv41:exl3-tp2-da8e1eb22cc6",
+  "policy": {
+    "TF_DS_ADAPT_K": 1,
+    "TF_DS_ADAPT_PERIOD": 8,
+    "TF_DS_ADAPT_ACCEPT": 2,
+    "TF_DS_ADAPT_MAX_LIVE": 2,
+    "PREFILL_INTERLEAVE_MS": 250
+  },
+  "baseline": {
+    "prose.c1": 49.105,
+    "prose.c2": 77.4775,
+    "prose.c4": 102.06,
+    "code.c1": 62.74,
+    "code.c2": 87.285,
+    "code.c4": 111.4275
+  },
+  "soak_median": {
+    "prose.c1": 64.19,
+    "prose.c2": 91.69,
+    "prose.c4": 126.26,
+    "code.c1": 95.65,
+    "code.c2": 142.69,
+    "code.c4": 154.41
+  },
+  "improvement_pct": {
+    "prose.c1": 30.72,
+    "prose.c2": 18.34,
+    "prose.c4": 23.71,
+    "code.c1": 52.45,
+    "code.c2": 63.48,
+    "code.c4": 38.57
+  },
+  "soak_cycles": 7,
+  "all_passed": true,
+  "report": "OVERNIGHT-OPTIMIZATION.md"
+}

@@ -1,0 +1,32 @@
+== policy ceiling 15:29:36
+records 125030 from 3 dumps; integrity: |logged - fixed-head logit| max 1.91e-05 (FIXED HEAD)
+   Platt (scale, shift) per position: (1.012, -0.051), (1.075, 0.111), (1.083, 0.195), (1.078, 0.288), (1.061, 0.361)
+   refit lambda 0.1: bias [-0.053, 0.201, 0.239, 0.309, 0.363]  |w-w0|/|w0| 0.080
+   refit lambda 0.01: bias [0.011, 0.292, 0.297, 0.346, 0.382]  |w-w0|/|w0| 0.443
+== VAL greedy: 3250 rounds, 23 prompts; fixed head 70.0 tok/s (simulated)
+   fixed K3                         62.1  -11.2%  95% CI [-12.8, -9.9]
+   fixed K5                         58.4  -16.5%  95% CI [-18.2, -14.2]
+   oracle                           82.2  +17.5%  95% CI [+16.4, +18.6]
+   fixed head (today)               70.0   +0.0%  95% CI [+0.0, +0.0] AUC 0.842 logloss 0.4570
+   Platt per position               70.2   +0.3%  95% CI [+0.1, +0.5] AUC 0.844 logloss 0.4529
+   joint logits+EMA                 70.2   +0.2%  95% CI [-0.0, +0.5] AUC 0.845 logloss 0.4522
+   head refit (lambda 0.01)         70.2   +0.2%  95% CI [-0.0, +0.6] AUC 0.847 logloss 0.4508
+   MLP 64 on head inputs+EMA        68.5   -2.2%  95% CI [-2.9, -1.5] AUC 0.806 logloss 0.5515
+== VAL sampled: 1919 rounds, 13 prompts; fixed head 68.6 tok/s (simulated)
+   fixed K3                         60.3  -12.0%  95% CI [-14.5, -9.8]
+   fixed K5                         56.4  -17.7%  95% CI [-20.4, -14.8]
+   oracle                           80.4  +17.2%  95% CI [+14.8, +19.5]
+   fixed head (today)               68.6   +0.0%  95% CI [+0.0, +0.0] AUC 0.842 logloss 0.4570
+   Platt per position               68.7   +0.1%  95% CI [-0.1, +0.3] AUC 0.844 logloss 0.4529
+   joint logits+EMA                 68.7   +0.1%  95% CI [-0.1, +0.4] AUC 0.845 logloss 0.4522
+   head refit (lambda 0.01)         68.8   +0.3%  95% CI [-0.1, +0.7] AUC 0.847 logloss 0.4508
+   MLP 64 on head inputs+EMA        67.7   -1.3%  95% CI [-1.8, -0.5] AUC 0.806 logloss 0.5515
+== TEST SparkDash: 1220 rounds, 11 prompts; fixed head 84.4 tok/s (simulated)
+   fixed K3                         74.1  -12.2%  95% CI [-15.3, -8.6]
+   fixed K5                         76.5   -9.4%  95% CI [-10.7, -6.7]
+   oracle                           97.5  +15.6%  95% CI [+11.0, +20.3]
+   fixed head (today)               84.4   +0.0%  95% CI [+0.0, +0.0] AUC 0.871 logloss 0.3543
+   Platt per position               84.5   +0.2%  95% CI [-0.1, +0.5] AUC 0.876 logloss 0.3470
+   joint logits+EMA                 84.5   +0.2%  95% CI [-0.2, +0.6] AUC 0.877 logloss 0.3462
+   head refit (lambda 0.01)         84.4   +0.0%  95% CI [-0.4, +0.4] AUC 0.875 logloss 0.3481
+   MLP 64 on head inputs+EMA        83.5   -1.0%  95% CI [-2.0, -0.1] AUC 0.838 logloss 0.4307

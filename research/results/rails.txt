@@ -1,0 +1,4 @@
+rail2-a  decode  83.38 tok/s  per-request geomean vs 2-rail mean -0.01%  equal-to-serial 11/11  rounds 1338
+rail2-b  decode  83.43 tok/s  per-request geomean vs 2-rail mean +0.01%  equal-to-serial 11/11  rounds 1338
+rail1-a  decode  83.11 tok/s  per-request geomean vs 2-rail mean -0.36%  equal-to-serial 11/11  rounds 1338
+rail1-b  decode  83.33 tok/s  per-request geomean vs 2-rail mean -0.10%  equal-to-serial 11/11  rounds 1338

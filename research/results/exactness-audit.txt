@@ -1,0 +1,7 @@
+runs parsed 48 (missing files for 0), result records 856, distinct requests 248
+serial reference records 52; non-serial records checked against an expect/serial sha: 573 with expect_sha, 38 via serial/prefix/peer agreement (9 by peer agreement only)
+MISMATCHES: 0
+no independent reference (only a vacuous self-check): 193 records in 3 runs
+   runW2/d-fit-g 120
+   runW2/d-fit-s 70
+   runA/smoke 3

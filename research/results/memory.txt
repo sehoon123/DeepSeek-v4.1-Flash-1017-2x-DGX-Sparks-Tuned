@@ -1,0 +1,5 @@
+Read 2026-10-20 20:22 KST while the pair served (idle), ABLIT=1, CONTEXT=1048576, PARALLEL=4.
+/proc/meminfo, GiB: {"head": {"MemTotal": 121.62, "MemFree": 2.67, "MemAvailable": 7.08, "Cached": 6.31, "AnonPages": 1.7, "Shmem": 1.23}, "worker": {"MemTotal": 121.63, "MemFree": 3.2, "MemAvailable": 9.08, "Cached": 7.86, "AnonPages": 1.06, "Shmem": 1.23}}
+rank 0's /health (memory and load fields): {"model": "DeepSeek-V4.1-Flash-1017", "memory": {"active": 112698053412, "cache": 0, "peak": 112698053412}, "live": {"connections": 0, "waiting": 0, "decode_tokens_per_second": 0.0, "prefill_tokens_per_second": 0.0}}
+The weights are ~98 GiB a rank (results/checkpoint-bytes.txt: 196.12 GiB in all, split in two), so a 10 % smaller
+footprint would need other weights; the KV pool and the engine's 12.2 GiB reserve are the rest.

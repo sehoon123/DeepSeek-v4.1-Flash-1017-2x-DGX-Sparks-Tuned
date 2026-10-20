@@ -1,0 +1,17 @@
+set                               n_drafts  p0    p1    p2    p3    p4   | best tok/s (K) | tok/round@K5 model
+all fit-greedy (in-sample)          41155  0.725 0.681 0.666 0.696 0.702 |   66.4 (K3) | 2.939
+VAL greedy (23 prompts)              8280  0.679 0.643 0.613 0.672 0.663 |   62.1 (K3) | 2.683
+VAL sampled T=1 (13 prompts)         4732  0.656 0.621 0.619 0.655 0.669 |   60.5 (K2) | 2.591
+TEST SparkDash (11 prompts)          3900  0.775 0.781 0.764 0.811 0.784 |   76.5 (K5) | 3.514
+
+uniform landing-rate gain on TEST -> throughput gain at the best fixed depth:
+  +1 pt on every position:  +2.4 %
+  +2 pt on every position:  +4.8 %
+  +3 pt on every position:  +7.3 %
+  +5 pt on every position: +12.5 %
+same +3 pt on one group of positions only:
+  +3 pt p0 only   :  +2.8 %
+  +3 pt p1 only   :  +1.9 %
+  +3 pt p2-p4 only:  +2.3 %
+uniform gain needed for +10 % on TEST: +4.1 pt; for +5 %: +2.1 pt
+uniform gain needed for +10 % on VAL greedy: +6.3 pt

@@ -1,0 +1,169 @@
+head launches (us from the first, dyn smem, us long): [(0, 4096, 998), (3433, 20480, 1061), (24924, 4096, 1008), (28288, 20480, 1063)]
+main head start -> next round first MoE: 4934 us, 152 kernels
+kernel (grid)                        count   sum_us
+  glinear_kernel                 (  505)    2   2059.1
+  grouped_cp_kernel              ( 1440)    3    970.9
+  glinear_kernel                 (  320)    5    491.6
+  grouped_cp_kernel              (  800)    3    439.5
+  glinear_kernel                 (  128)    4    236.9
+  glinear_kernel                 (  256)    4    211.0
+  tf_ds_l2_prefetch_kernel       (    1)    2    141.5
+  _hc_mix_part                   (  240)    6    116.7
+  glinear_kernel                 (  112)    4    114.0
+  dsv41_rdma_collect             (   13)    6     99.6
+  _hc_finish_s                   (   10)    6     87.5
+  _rmsnorm_rot                   (    5)    3     85.8
+  _bias                          (  253)    5     72.6
+  dsv41_rdma_stage               (   16)    1     71.7
+  dsv41_rdma_stage               (    7)    6     69.5
+  dsv41_rdma_collect             (   32)    1     58.5
+order (kernel x consecutive count, us since the main head started):
+         0  glinear_kernel(505) x1
+       933  dsv41_rdma_stage(16) x1
+       999  dsv41_rdma_collect(32) x1
+      1058  tf_ds_copy_rows16_kernel(64) x2
+      1062  tf_ds_copy_rows16_kernel(8) x1
+      1067  rot_many_kernel(30) x1
+      1068  glinear_kernel(320) x1
+      1228  _rmsnorm(1) x1
+      1265  rot_many_kernel(30) x1
+      1266  glinear_kernel(96) x1
+      1276  _kv_norm_rope(1) x3
+      1399  _embed_init(25) x1
+      1401  _hc_mix_part(240) x1
+      1402  _hc_finish_s(10) x1
+      1413  rot_many_kernel(100) x1
+      1419  glinear_kernel(112) x1
+      1421  _rmsnorm_rot(5) x1
+      1441  glinear_kernel(128) x1
+      1485  _kv_norm_rope(5) x1
+      1499  _sparse_attn_part(80) x1
+      1501  _sparse_attn_merge(10) x1
+      1508  _rope_heads(10) x1
+      1517  rot_many_kernel(160) x1
+      1519  glinear_kernel(256) x1
+      1543  glinear_kernel(320) x1
+      1605  dsv41_rdma_stage(7) x1
+      1619  dsv41_rdma_collect(13) x1
+      1625  _hc_mix_part(240) x1
+      1639  _hc_finish_s(10) x1
+      1646  _rowmm_parts(160) x1
+      1658  _route_parts(5) x1
+      1662  decode_prep_kernel(201) x1
+      1666  grouped_cp_kernel(1440) x1
+      1881  grouped_cp_kernel(800) x1
+      2017  dsv41_rdma_stage(7) x1
+      2018  dsv41_rdma_collect(13) x1
+      2023  _hc_mix_part(240) x1
+      2034  _hc_finish_s(10) x1
+      2041  rot_many_kernel(100) x1
+      2046  glinear_kernel(112) x1
+      2047  _rmsnorm_rot(5) x1
+      2072  glinear_kernel(128) x1
+      2113  _kv_norm_rope(5) x1
+      2126  _sparse_attn_part(80) x1
+      2128  _sparse_attn_merge(10) x1
+      2135  _rope_heads(10) x1
+      2145  rot_many_kernel(160) x1
+      2147  glinear_kernel(256) x1
+      2175  glinear_kernel(320) x1
+      2239  dsv41_rdma_stage(7) x1
+      2253  dsv41_rdma_collect(13) x1
+      2257  _hc_mix_part(240) x1
+      2273  _hc_finish_s(10) x1
+      2280  _rowmm_parts(160) x1
+      2291  _route_parts(5) x1
+      2294  decode_prep_kernel(201) x1
+      2299  grouped_cp_kernel(1440) x1
+      2597  grouped_cp_kernel(800) x1
+      2757  dsv41_rdma_stage(7) x1
+      2758  dsv41_rdma_collect(13) x1
+      2762  _hc_mix_part(240) x1
+      2777  _hc_finish_s(10) x1
+      2783  rot_many_kernel(100) x1
+      2789  glinear_kernel(112) x1
+      2790  _rmsnorm_rot(5) x1
+      2817  glinear_kernel(128) x1
+      2859  _kv_norm_rope(5) x1
+      2872  _sparse_attn_part(80) x1
+      2874  _sparse_attn_merge(10) x1
+      2881  _rope_heads(10) x1
+      2890  rot_many_kernel(160) x1
+      2892  glinear_kernel(256) x1
+      2918  glinear_kernel(320) x1
+      2980  dsv41_rdma_stage(7) x1
+      2993  dsv41_rdma_collect(13) x1
+      2998  _hc_mix_part(240) x1
+      3013  _hc_finish_s(10) x1
+      3020  _rowmm_parts(160) x1
+      3028  _route_parts(5) x1
+      3032  decode_prep_kernel(201) x1
+      3036  grouped_cp_kernel(1440) x1
+      3278  grouped_cp_kernel(800) x1
+      3421  dsv41_rdma_stage(7) x1
+      3422  dsv41_rdma_collect(13) x1
+      3427  _hc_post(25) x1
+      3430  _collapse(25) x1
+      3431  _rmsnorm(5) x1
+      3432  rot_many_kernel(50) x1
+      3433  glinear_kernel(505) x1
+      4436  _bias(253) x1
+      4498  _score(64) x1
+      4499  _finish(1) x1
+      4504  dsv41_rdma_stage(1) x1
+      4505  dsv41_rdma_collect(1) x1
+      4508  _pick(1) x1
+      4526  _bias(253) x1
+      4528  _score(64) x1
+      4529  _finish(1) x1
+      4535  dsv41_rdma_stage(1) x1
+      4535  dsv41_rdma_collect(1) x1
+      4538  _pick(1) x1
+      4540  _bias(253) x1
+      4542  _score(64) x1
+      4543  _finish(1) x1
+      4548  dsv41_rdma_stage(1) x1
+      4549  dsv41_rdma_collect(1) x1
+      4552  _pick(1) x1
+      4557  _bias(253) x1
+      4559  _score(64) x1
+      4560  _finish(1) x1
+      4565  dsv41_rdma_stage(1) x1
+      4566  dsv41_rdma_collect(1) x1
+      4568  _pick(1) x1
+      4571  _bias(253) x1
+      4573  _score(64) x1
+      4574  _finish(1) x1
+      4579  dsv41_rdma_stage(1) x1
+      4580  dsv41_rdma_collect(1) x1
+      4583  _pick(1) x1
+      4592  tf_gather_rows_kernel(5) x1
+      4596  tf_bf16_to_f32_kernel(100) x1
+      4597  tf_bf16_to_f32_kernel(5) x1
+      4599  tf_ds_copy_rows16_kernel(25) x1
+      4600  tf_ds_copy_rows16_kernel(5) x1
+      4601  dot_kernel(90) x1
+      4604  reduce_1Block_kernel(5) x1
+      4654  _embed_init(5) x1
+      4657  _hc_mix_part(120) x1
+      4668  _hc_finish_s(1) x1
+      4670  _hc_sinkhorn(1) x1
+      4670  rot_many_kernel(20) x1
+      4671  glinear_kernel(112) x1
+      4706  _q_kv_norm(3) x1
+      4710  glinear_kernel(128) x1
+      4764  _sparse_attn_part(16) x1
+      4780  tf_ds_l2_prefetch_kernel(1) x1
+      4780  _sparse_attn_merge_rot2(32) x1
+      4786  glinear_kernel(256) x1
+      4828  glinear_kernel(320) x1
+      4879  dsv41_rdma_stage(2) x1
+      4895  tf_ds_l2_prefetch_kernel(1) x1
+      4895  dsv41_rdma_collect(3) x1
+      4898  _hc_post_only(40) x1
+      4900  _hc_finish_s(1) x1
+      4905  _rowmm_parts(480) x1
+      4923  _hc_mix_part(120) x1
+      4924  _route_parts(1) x1
+      4929  decode_prep_kernel(71) x1
+      4930  _hc_sinkhorn(1) x1

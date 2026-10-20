@@ -1,0 +1,21 @@
+ref-long|req-long.json|1|--serial 1||TF_DS_CONF_FILE=/work/conf_head_f32.bin|1500
+!cd /home/USER/model-downloads/dsv41-1017-local/research-20261020b/calib && python3 add-expect.py /home/USER/model-downloads/dsv41-1017-local/research-20261020b/calib/runW2/ref-long.r0.jsonl req-long.json req-long-x.json
+long-pol|req-long-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|1500
+long-prof|req-long-x.json|1|--profile 1|--profile 1|TF_DS_CONF_FILE=/work/conf_head_f32.bin|1500
+short-prof|req-nsys-c1.json|1|--profile 1|--profile 1|TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+d-fit-g|req-fit-g.json|1|--fix-k 5|--fix-k 5|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_CALIB_FILE=/out/@NAME@.bin|1800
+d-fit-s|req-fit-s.json|1|--fix-k 5|--fix-k 5|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_CALIB_FILE=/out/@NAME@.bin|1500
+d-test|req-test.json|1|--fix-k 5|--fix-k 5|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_CALIB_FILE=/out/@NAME@.bin|900
+ce8|req-ce.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|900
+ce4|req-ce.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ENTER=4|900
+ce6|req-ce.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ENTER=6|900
+ce12|req-ce.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ENTER=12|900
+ce8b|req-ce.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|900
+nsys1-k0|req-nsys-c1.json|1|--fix-k 0|--fix-k 0|TF_DS_CONF_FILE=/work/conf_head_f32.bin NSYS1=1|600
+!bash /home/USER/model-downloads/dsv41-1017-local/research-20261020b/calib/post-W2.sh /home/USER/model-downloads/dsv41-1017-local/research-20261020b/calib/runW2
+p1m-a|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+p512-a|req-test-x.json|1|--pool 524288|--pool 524288|TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+p1m-b|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+p512-b|req-test-x.json|1|--pool 524288|--pool 524288|TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+p256|req-test-x.json|1|--pool 262144|--pool 262144|TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+nsys1-p512|req-nsys-c1.json|1|--pool 524288|--pool 524288|TF_DS_CONF_FILE=/work/conf_head_f32.bin NSYS1=1|600

@@ -1,0 +1,8 @@
+clk-k0|req-nsys-c1.json|1|--fix-k 0 --profile 1|--fix-k 0 --profile 1|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_CLOCK_MARKS=1|600
+clk-pol|req-nsys-c1.json|1|--profile 1|--profile 1|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_CLOCK_MARKS=1|600
+clkL-pol|req-nsys-c1.json|1|--profile 1|--profile 1|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_CLOCK_MARKS=2|600
+rail2-a|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+rail1-a|req-test-x.json|1|--rdma rocep1s0f1|--rdma rocep1s0f1|TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+rail2-b|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+rail1-b|req-test-x.json|1|--rdma rocep1s0f1|--rdma rocep1s0f1|TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+!bash /home/USER/model-downloads/dsv41-1017-local/research-20261020b/calib/latprobe.sh /home/USER/model-downloads/dsv41-1017-local/research-20261020b/calib/runW3

@@ -1,0 +1,5 @@
+ce8   total  79.03 tok/s  per-request geomean vs base -0.13%  (non-copy -0.10%)  equal 36/36  | copyv 200.3 tok/s (42 rounds) copye 148.7 tok/s (71 rounds)
+ce8b  total  79.26 tok/s  per-request geomean vs base +0.14%  (non-copy +0.11%)  equal 36/36  | copyv 204.2 tok/s (42 rounds) copye 149.4 tok/s (71 rounds)
+ce4   total  78.24 tok/s  per-request geomean vs base -1.31%  (non-copy -1.37%)  equal 36/36  | copyv 201.6 tok/s (42 rounds) copye 149.1 tok/s (69 rounds)
+ce6   total  78.95 tok/s  per-request geomean vs base -0.29%  (non-copy -0.33%)  equal 36/36  | copyv 204.2 tok/s (42 rounds) copye 149.1 tok/s (70 rounds)
+ce12  total  79.34 tok/s  per-request geomean vs base +0.29%  (non-copy +0.32%)  equal 36/36  | copyv 202.9 tok/s (43 rounds) copye 148.0 tok/s (73 rounds)

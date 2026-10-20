@@ -1,0 +1,13 @@
+tensors 192495, total 196.12 GiB, layers 40
+  layer  0: 384 routed experts x 12.70 MiB, shared 21.1 MiB, attention 76.8 MiB, router 3.75 MiB, other 3.8 MiB
+  layer  1: 384 routed experts x 12.70 MiB, shared 21.1 MiB, attention 75.7 MiB, router 3.75 MiB, other 97.7 MiB
+  layer  2: 384 routed experts x 12.70 MiB, shared 21.1 MiB, attention 82.3 MiB, router 3.75 MiB, other 3.8 MiB
+  layer 14: 384 routed experts x 12.70 MiB, shared 16.9 MiB, attention 82.3 MiB, router 3.75 MiB, other 79.0 MiB
+  layer 20: 384 routed experts x 8.48 MiB, shared 16.9 MiB, attention 80.7 MiB, router 3.75 MiB, other 3.8 MiB
+  layer 39: 384 routed experts x 12.70 MiB, shared 21.1 MiB, attention 75.7 MiB, router 3.75 MiB, other 3.8 MiB
+  head.trellis: I16 [320, 8080, 96] = 473.4 MiB, 6 bits a weight
+  mtp.0.main_proj.trellis: I16 [960, 320, 64] = 37.5 MiB, 4 bits a weight
+  drafter (mtp) routed experts: 6496 MiB
+K0 forward, per rank: routed 1461 MiB + shared/attention/other/router 2227 MiB + head 237 MiB = 3924 MiB
+  at 226 GB/s: 18.21 ms
+  at 249 GB/s: 16.53 ms
