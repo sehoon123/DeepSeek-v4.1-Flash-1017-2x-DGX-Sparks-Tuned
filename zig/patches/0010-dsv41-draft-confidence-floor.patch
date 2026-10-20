@@ -1,0 +1,59 @@
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 41f64de..bffe876 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -293,6 +293,8 @@ pub const Lanes = struct {
+     built: Built = .{},
+     prof: ?Profile = null,
+     fix_k: ?usize = null, // a measurement (tf-dsv41-lanes --fix-k): K drafts a stream, chances 1 to K and 0 past it
++    min_k: usize = 0, // TF_DS_MIN_K: trust at least this many drafts, then the drafter's calibrated confidences
++    conf_bias: f64 = 0, // TF_DS_CONF_BIAS: add to every confidence logit before its sigmoid
+     drawn: [ring]u32 = undefined,
+     next: u64 = 0,
+     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
+@@ -727,7 +729,10 @@ pub const Lanes = struct {
+             for (out, 0..) |*o, j| o.* = if (j < k) 1.0 else 0.0;
+             return true;
+         }
+-        survivals(l.confs[0..out.len], out);
++        survivalsBiased(l.confs[0..out.len], out, self.conf_bias);
++        // The target-only Ablit changes can make the stock drafter's confidence calibration conservative even when its
++        // proposals still match. A floor preserves those useful drafts; positions past it keep the original policy.
++        for (out[0..@min(self.min_k, out.len)]) |*o| o.* = 1.0;
+         return true;
+     }
+ 
+@@ -804,9 +809,13 @@ pub const Lanes = struct {
+ 
+ /// Prefix survivals: out[j] = the product of sigmoid(conf[i]) for i <= j, in float64 (libm's exp, as chooseK).
+ pub fn survivals(conf: []const f32, out: []f64) void {
++    survivalsBiased(conf, out, 0);
++}
++
++fn survivalsBiased(conf: []const f32, out: []f64, bias: f64) void {
+     var surv: f64 = 1.0;
+     for (out, conf[0..out.len]) |*o, cf| {
+-        surv *= 1.0 / (1.0 + exp(-@as(f64, cf)));
++        surv *= 1.0 / (1.0 + exp(-(@as(f64, cf) + bias)));
+         o.* = surv;
+     }
+ }
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 55a532f..a2f0f47 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -143,6 +143,14 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     errdefer st.m.close();
+     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
+     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++    if (getenv("TF_DS_MIN_K")) |t| {
++        st.lanes.min_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++        if (st.lanes.min_k > 5) return error.BadFixK;
++    }
++    if (getenv("TF_DS_CONF_BIAS")) |t| {
++        st.lanes.conf_bias = std.fmt.parseFloat(f64, t) catch return error.BadFixK;
++        if (!std.math.isFinite(st.lanes.conf_bias)) return error.BadFixK;
++    }
+     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
+     st.vision = null;
+     if (st.m.cfg.vision) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);

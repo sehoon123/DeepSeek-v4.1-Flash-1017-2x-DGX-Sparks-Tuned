@@ -1,0 +1,363 @@
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index a525638..b5a58d3 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -32,6 +32,7 @@ pub const Model = struct {
+     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
+     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
+     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
++    copy_skips_head: bool = false, // a lone stream's fully accepted copy window skips the head's next pass
+ };
+ 
+ pub const Config = struct {
+@@ -63,6 +64,7 @@ pub const Config = struct {
+     mtp_step_ms: f64,
+     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
+     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
++    copy_skips_head: bool = false, // Model.copy_skips_head
+     k: Constants = .{},
+ 
+     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
+@@ -116,6 +118,7 @@ pub const Config = struct {
+             .shared_costs = try alloc.extendCosts(gpa, timed.items, batch_rows),
+             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
+             .mtp_step_ms = m.mtp_step_ms,
++            .copy_skips_head = m.copy_skips_head,
+         };
+     }
+ 
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index a70dd29..8a67472 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -256,7 +256,10 @@ pub const Engine = struct {
+         const o = try e.conclude(s, plan, out[0].sampled, tokens, parents, windows[0].positions);
+         if (o.path.len < rows or plan.parents != null) try e.backend.keep(&windows, &.{o.path});
+         const held_levels = s.held_levels;
+-        if (e.cfg.family_mtp and s.drafts) {
++        // A lone stream's fully accepted copy window doubles its copy width: the next window copies again and its plan
++        // drops the head's drafts, so their pass is skipped (drafts only propose: the target's bits do not change).
++        const copy_next = e.cfg.copy_skips_head and e.alone and !early and plan.kind == .copy and o.path.len == rows and o.cut == null and !s.finished;
++        if (e.cfg.family_mtp and s.drafts and !copy_next) {
+             if (early and o.cut == null) {
+                 var w = win.who(s);
+                 const d: u32 = @intCast(try e.rule.headDepth(&w, null, win.probe(e)));
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 105c3d9..7836fd3 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -29,6 +29,9 @@ const max_rows = round.max_rows;
+ 
+ /// A window of the pending row and the drafter's block: the widest one the gates checked row for row.
+ pub const window_rows = 6;
++/// A lone stream's widest copy window (TF_DS_COPY_ROWS; the drafter's windows stay at window_rows): the row-invariant
++/// round's rows (16) and the window rings' RING_EXTRA (16, the target's and the drafter's) bound it.
++pub const max_window = 16;
+ 
+ /// The image rows a fill_images frame carries at most.
+ pub const image_piece = 32 << 10;
+@@ -320,7 +323,7 @@ pub const Lanes = struct {
+     step: u64 = 0,
+     wire: Wire = .{},
+     streams: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
+-    wc: [window_rows]lanes.config.Cost = undefined, // the window costs (init)
++    wc: [max_window]lanes.config.Cost = undefined, // the window costs (init)
+     sc: [max_rows]lanes.config.Cost = undefined, // the shared forwards' costs (init)
+     used: [max_streams]bool = @splat(false),
+     seqs: [max_streams]std.ArrayList(i32) = @splat(.empty),
+@@ -343,6 +346,8 @@ pub const Lanes = struct {
+     probe_period: usize = 2,
+     probe_threshold: f64 = 2.5,
+     policy_log: bool = false,
++    copy_rows: usize = window_rows, // TF_DS_COPY_ROWS: a lone stream's widest copy window (6: the stock width, off)
++    copy_skip: bool = false, // TF_DS_COPY_SKIP=1: no drafter pass after a lone stream's fully accepted copy window
+     drawn: [ring]u32 = undefined,
+     next: u64 = 0,
+     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
+@@ -357,6 +362,65 @@ pub const Lanes = struct {
+         return ln;
+     }
+ 
++    /// The served policy's TF_DS_* switches (native.zig's serve and tf-dsv41-lanes alike: offline runs are the served ones).
++    pub fn applyEnv(self: *Lanes) !void {
++        if (envVar("TF_DS_FIX_K")) |t| self.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++        if (envVar("TF_DS_MIN_K")) |t| {
++            self.min_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++            if (self.min_k > 5) return error.BadFixK;
++        }
++        if (envVar("TF_DS_CONF_BIAS")) |t| {
++            self.conf_bias = std.fmt.parseFloat(f64, t) catch return error.BadFixK;
++            if (!std.math.isFinite(self.conf_bias)) return error.BadFixK;
++        }
++        if (envVar("TF_DS_ADAPT_K")) |t| self.adapt_k = std.mem.eql(u8, t, "1");
++        if (envVar("TF_DS_ADAPT_PERIOD")) |t| {
++            self.adapt_period = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++            if (self.adapt_period < 2 or self.adapt_period > 64) return error.BadFixK;
++        }
++        if (envVar("TF_DS_ADAPT_ACCEPT")) |t| {
++            self.adapt_accept = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++            if (self.adapt_accept < 1 or self.adapt_accept > 5) return error.BadFixK;
++        }
++        if (envVar("TF_DS_ADAPT_MAX_LIVE")) |t| {
++            self.adapt_max_live = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++            if (self.adapt_max_live < 1 or self.adapt_max_live > 4) return error.BadFixK;
++        }
++        if (envVar("TF_DS_ADAPT_BACKOFF")) |t| self.adapt_backoff = std.mem.eql(u8, t, "1");
++        if (envVar("TF_DS_ADAPT_MAX_PERIOD")) |t| {
++            self.adapt_max_period = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++            if (self.adapt_max_period < self.adapt_period or self.adapt_max_period > 128) return error.BadFixK;
++        }
++        if (envVar("TF_DS_ACCEPT_ROUTE")) |t| self.accept_route = std.mem.eql(u8, t, "1");
++        if (envVar("TF_DS_ROUTE_WARMUP")) |t| {
++            self.route_warmup = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++            if (self.route_warmup < 2 or self.route_warmup > 64) return error.BadFixK;
++        }
++        if (envVar("TF_DS_ROUTE_THRESHOLD")) |t| {
++            self.route_threshold = std.fmt.parseFloat(f64, t) catch return error.BadFixK;
++            if (!std.math.isFinite(self.route_threshold) or self.route_threshold < 0 or self.route_threshold > 5) return error.BadFixK;
++        }
++        if (envVar("TF_DS_PROBE_ROUTE")) |t| self.probe_route = std.mem.eql(u8, t, "1");
++        if (envVar("TF_DS_PROBE_SAMPLES")) |t| {
++            self.probe_samples = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++            if (self.probe_samples < 1 or self.probe_samples > 64) return error.BadFixK;
++        }
++        if (envVar("TF_DS_PROBE_PERIOD")) |t| {
++            self.probe_period = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++            if (self.probe_period < 2 or self.probe_period > 64) return error.BadFixK;
++        }
++        if (envVar("TF_DS_PROBE_THRESHOLD")) |t| {
++            self.probe_threshold = std.fmt.parseFloat(f64, t) catch return error.BadFixK;
++            if (!std.math.isFinite(self.probe_threshold) or self.probe_threshold < 0 or self.probe_threshold > 5) return error.BadFixK;
++        }
++        if (envVar("TF_DS_POLICY_LOG")) |t| self.policy_log = std.mem.eql(u8, t, "1");
++        if (envVar("TF_DS_COPY_ROWS")) |t| {
++            self.copy_rows = std.fmt.parseInt(usize, t, 10) catch return error.BadCopyRows;
++            if (self.copy_rows < window_rows or self.copy_rows > max_window or self.copy_rows > self.m.eng.round_rows) return error.BadCopyRows;
++        }
++        if (envVar("TF_DS_COPY_SKIP")) |t| self.copy_skip = std.mem.eql(u8, t, "1");
++    }
++
+     /// Tells rank 1 to stop, then frees the host state (the model is the caller's).
+     pub fn deinit(self: *Lanes) void {
+         for (self.snaps.items) |sn| {
+@@ -389,13 +453,15 @@ pub const Lanes = struct {
+     pub fn facts(self: *const Lanes) lanes.Model {
+         const drafting = self.m.drafting();
+         return .{
+-            .exact_width = window_rows,
++            .exact_width = @intCast(@max(window_rows, self.copy_rows)),
++            .first_copy_rows = if (self.copy_rows > window_rows) @as(u32, window_rows) else 0,
++            .copy_skips_head = self.copy_skip,
+             .gpu_tokens = false,
+             .mtp = drafting,
+             .speculate = drafting,
+             .speculate_early = false,
+             .drafts = if (self.m.dr) |dr| @intCast(dr.n) else 1,
+-            .window_costs = self.wc[0..],
++            .window_costs = self.wc[0..@max(window_rows, self.copy_rows)],
+             .mtp_step_ms = draft.draft_ms,
+             .streams_exact = true,
+             .hidden_rows = true,
+@@ -653,7 +719,7 @@ pub const Lanes = struct {
+             if (w.parents != null) return error.TreesNotBuilt;
+             const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
+             const rows = w.rows();
+-            if (rows > window_rows) return error.WindowTooWide;
++            if (rows > @max(window_rows, self.copy_rows)) return error.WindowTooWide;
+             const start: usize = @intCast(w.stream.cache_len);
+             for (w.positions, 0..) |p, r| if (p != start + 1 + r) return error.PositionMismatch;
+             if (w.held > l.nheld) return error.HeldMismatch;
+@@ -717,6 +783,7 @@ pub const Lanes = struct {
+             if (path.len == 0) return error.EmptyPath;
+             for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
+             const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
++            if (self.copy_rows > window_rows and w.held == 0 and w.tokens.len > 0) continue; // a copy (or forced) window is not the drafter's
+             const proposed = @min(@as(usize, 5), w.rows() - 1);
+             const accepted = @min(proposed, path.len - 1);
+             l.proposed[proposed] += 1;
+@@ -1251,3 +1318,7 @@ test "a prefix two conversations share: the second one resuming it in place woul
+     try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
+     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
+ }
++
++fn envVar(name: [:0]const u8) ?[]const u8 {
++    return std.mem.span(std.c.getenv(name) orelse return null);
++}
+diff --git a/zig/src/families/dsv41/lanes_main.zig b/zig/src/families/dsv41/lanes_main.zig
+index cb52f74..bdabff2 100644
+--- a/zig/src/families/dsv41/lanes_main.zig
++++ b/zig/src/families/dsv41/lanes_main.zig
+@@ -24,6 +24,7 @@ const Request = struct {
+     top_k: u32 = 20,
+     top_p: f64 = 0.95,
+     expect_sha: ?[]const u8 = null,
++    oracle: []const u32 = &.{}, // a serial run's reply: copy windows from it (--oracle-miss), a rollback test
+     images: []const ImageRows = &.{}, // a vision request: its spans' rows ready (zrec_v3req.py from a recording)
+ };
+ 
+@@ -37,6 +38,52 @@ const Job = struct {
+     stream: lanes.Stream,
+     began: std.Io.Timestamp,
+     done: bool = false,
++    oracle: Oracle = undefined,
++    use_oracle: bool = false,
++};
++
++/// A test proposer (a request's "oracle", a serial run's reply): the reply's next tokens as a copy, one of them made
++/// wrong in --oracle-miss percent of the windows (splitmix64 from --oracle-seed), so a lone stream's windows of every
++/// width end at every row; its match is past every enter_match, so each of its rounds is a copy window.
++const Oracle = struct {
++    reply: []const u32,
++    prompt_len: usize,
++    miss: u32,
++    state: u64,
++    out: [64]u32 = undefined,
++
++    fn next(o: *Oracle) u64 {
++        o.state +%= 0x9E3779B97F4A7C15;
++        var z = o.state;
++        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
++        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
++        return z ^ (z >> 31);
++    }
++
++    fn proposer(o: *Oracle) lanes.proposer.Proposer {
++        return .{ .ptr = o, .vtable = &vtable };
++    }
++
++    const vtable: lanes.proposer.Proposer.VTable = .{ .propose = proposeFn, .last_match = lastMatchFn };
++
++    fn proposeFn(ptr: *anyopaque, context: []const u32, max_draft: i64) anyerror![]const u32 {
++        const o: *Oracle = @ptrCast(@alignCast(ptr));
++        if (max_draft <= 0 or context.len <= o.prompt_len) return o.out[0..0];
++        const at = context.len - o.prompt_len;
++        if (at >= o.reply.len) return o.out[0..0];
++        const n = @min(@as(usize, @intCast(max_draft)), @min(o.reply.len - at, o.out.len));
++        @memcpy(o.out[0..n], o.reply[at..][0..n]);
++        if (o.next() % 100 < o.miss) {
++            const bad: usize = @intCast(o.next() % n);
++            o.out[bad] = (o.out[bad] + 1) % 129280;
++        }
++        return o.out[0..n];
++    }
++
++    fn lastMatchFn(ptr: *anyopaque) i64 {
++        _ = ptr;
++        return 1 << 20;
++    }
+ };
+ 
+ pub fn main(init: std.process.Init) !u8 {
+@@ -66,6 +113,8 @@ pub fn main(init: std.process.Init) !u8 {
+     const clock_marks: u8 = if (std.c.getenv("TF_DS_CLOCK_MARKS")) |v| std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0 else 0;
+     var phases = false; // --profile 2: also the rounds' GPU time by phase (eager rounds)
+     var serial = false; // --serial 1: every stream without drafts (one row a round)
++    var oracle_miss: u32 = 0; // --oracle-miss P: percent of oracle windows with one wrong token
++    var oracle_seed: u64 = 1; // --oracle-seed S
+     var fix_k: ?usize = null; // --fix-k K: every drafted stream verifies K drafts a round (a cost measurement)
+     var ai: usize = 8;
+     while (ai + 1 < args.len) : (ai += 2) {
+@@ -73,6 +122,11 @@ pub fn main(init: std.process.Init) !u8 {
+         const val = args[ai + 1];
+         if (std.mem.eql(u8, key, "--requests")) {
+             requests_file = val;
++        } else if (std.mem.eql(u8, key, "--oracle-miss")) {
++            oracle_miss = try std.fmt.parseInt(u32, val, 10);
++            if (oracle_miss > 100) return error.BadArgument;
++        } else if (std.mem.eql(u8, key, "--oracle-seed")) {
++            oracle_seed = try std.fmt.parseInt(u64, val, 10);
+         } else if (std.mem.eql(u8, key, "--parallel")) {
+             parallel = try std.fmt.parseInt(usize, val, 10);
+         } else if (std.mem.eql(u8, key, "--round-rows")) {
+@@ -175,7 +229,8 @@ pub fn main(init: std.process.Init) !u8 {
+     const reqs = (try std.json.parseFromSliceLeaky(Requests, a, text, .{ .ignore_unknown_fields = true })).requests;
+     var ln = dsv41.lanes.Lanes.init(gpa, m);
+     defer ln.deinit();
+-    ln.fix_k = fix_k;
++    try ln.applyEnv(); // the served policy's TF_DS_* switches, as native.zig's serve reads them
++    if (fix_k) |k| ln.fix_k = k;
+     if (profile) {
+         ln.prof = .{};
+         m.prof = true;
+@@ -204,6 +259,10 @@ pub fn main(init: std.process.Init) !u8 {
+             const r = &reqs[admitted];
+             const j = &jobs[admitted];
+             j.* = .{ .req = r, .index = admitted, .proposer = try lanes.SuffixLookup.init(gpa, .{ .min_match = 4 }), .stream = undefined, .began = std.Io.Timestamp.now(io, .awake) };
++            if (r.oracle.len > 0) {
++                j.oracle = .{ .reply = r.oracle, .prompt_len = r.prompt.len, .miss = oracle_miss, .state = oracle_seed +% admitted };
++                j.use_oracle = true;
++            }
+             j.stream = try lanes.Stream.init(gpa, .{
+                 .id = r.name,
+                 .prompt = r.prompt,
+@@ -212,7 +271,7 @@ pub fn main(init: std.process.Init) !u8 {
+                 .eos = &eos,
+                 .sampling = if (r.temperature > 0) .{ .seed = r.seed orelse 0, .temperature = r.temperature, .top_k = r.top_k, .top_p = r.top_p } else null,
+                 .drafts = !serial,
+-                .proposer = j.proposer.proposer(),
++                .proposer = if (j.use_oracle) j.oracle.proposer() else j.proposer.proposer(),
+             });
+             admitted += 1;
+             core.addStream(&j.stream) catch |err| {
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index bfae1c5..c85cd99 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -142,56 +142,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     });
+     errdefer st.m.close();
+     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
+-    if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+-    if (getenv("TF_DS_MIN_K")) |t| {
+-        st.lanes.min_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+-        if (st.lanes.min_k > 5) return error.BadFixK;
+-    }
+-    if (getenv("TF_DS_CONF_BIAS")) |t| {
+-        st.lanes.conf_bias = std.fmt.parseFloat(f64, t) catch return error.BadFixK;
+-        if (!std.math.isFinite(st.lanes.conf_bias)) return error.BadFixK;
+-    }
+-    if (getenv("TF_DS_ADAPT_K")) |t| st.lanes.adapt_k = std.mem.eql(u8, t, "1");
+-    if (getenv("TF_DS_ADAPT_PERIOD")) |t| {
+-        st.lanes.adapt_period = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+-        if (st.lanes.adapt_period < 2 or st.lanes.adapt_period > 64) return error.BadFixK;
+-    }
+-    if (getenv("TF_DS_ADAPT_ACCEPT")) |t| {
+-        st.lanes.adapt_accept = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+-        if (st.lanes.adapt_accept < 1 or st.lanes.adapt_accept > 5) return error.BadFixK;
+-    }
+-    if (getenv("TF_DS_ADAPT_MAX_LIVE")) |t| {
+-        st.lanes.adapt_max_live = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+-        if (st.lanes.adapt_max_live < 1 or st.lanes.adapt_max_live > 4) return error.BadFixK;
+-    }
+-    if (getenv("TF_DS_ADAPT_BACKOFF")) |t| st.lanes.adapt_backoff = std.mem.eql(u8, t, "1");
+-    if (getenv("TF_DS_ADAPT_MAX_PERIOD")) |t| {
+-        st.lanes.adapt_max_period = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+-        if (st.lanes.adapt_max_period < st.lanes.adapt_period or st.lanes.adapt_max_period > 128) return error.BadFixK;
+-    }
+-    if (getenv("TF_DS_ACCEPT_ROUTE")) |t| st.lanes.accept_route = std.mem.eql(u8, t, "1");
+-    if (getenv("TF_DS_ROUTE_WARMUP")) |t| {
+-        st.lanes.route_warmup = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+-        if (st.lanes.route_warmup < 2 or st.lanes.route_warmup > 64) return error.BadFixK;
+-    }
+-    if (getenv("TF_DS_ROUTE_THRESHOLD")) |t| {
+-        st.lanes.route_threshold = std.fmt.parseFloat(f64, t) catch return error.BadFixK;
+-        if (!std.math.isFinite(st.lanes.route_threshold) or st.lanes.route_threshold < 0 or st.lanes.route_threshold > 5) return error.BadFixK;
+-    }
+-    if (getenv("TF_DS_PROBE_ROUTE")) |t| st.lanes.probe_route = std.mem.eql(u8, t, "1");
+-    if (getenv("TF_DS_PROBE_SAMPLES")) |t| {
+-        st.lanes.probe_samples = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+-        if (st.lanes.probe_samples < 1 or st.lanes.probe_samples > 64) return error.BadFixK;
+-    }
+-    if (getenv("TF_DS_PROBE_PERIOD")) |t| {
+-        st.lanes.probe_period = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+-        if (st.lanes.probe_period < 2 or st.lanes.probe_period > 64) return error.BadFixK;
+-    }
+-    if (getenv("TF_DS_PROBE_THRESHOLD")) |t| {
+-        st.lanes.probe_threshold = std.fmt.parseFloat(f64, t) catch return error.BadFixK;
+-        if (!std.math.isFinite(st.lanes.probe_threshold) or st.lanes.probe_threshold < 0 or st.lanes.probe_threshold > 5) return error.BadFixK;
+-    }
+-    if (getenv("TF_DS_POLICY_LOG")) |t| st.lanes.policy_log = std.mem.eql(u8, t, "1");
++    try st.lanes.applyEnv(); // every TF_DS_* switch of the served policy (lanes.zig, tf-dsv41-lanes reads them alike)
+     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
+     st.vision = null;
+     if (st.m.cfg.vision) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);

@@ -1,0 +1,20 @@
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index b55ee6a..fe3f09d 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -686,10 +686,12 @@ pub const Lanes = struct {
+             if (self.accept_route and !l.route_decided and self.streams.count() <= self.adapt_max_live and proposed == 3) {
+                 l.route_rounds += 1;
+                 l.route_accepted += accepted;
+-                if (l.route_rounds >= self.route_warmup) {
++                if (l.route_rounds % self.route_warmup == 0) {
+                     const mean = @as(f64, @floatFromInt(l.route_accepted)) / @as(f64, @floatFromInt(l.route_rounds));
+-                    if (mean >= self.route_threshold) l.policy_k = 5;
+-                    l.route_decided = true;
++                    if (mean >= self.route_threshold) {
++                        l.policy_k = 5;
++                        l.route_decided = true;
++                    }
+                 }
+             }
+             if (self.adapt_k and self.streams.count() <= self.adapt_max_live) {

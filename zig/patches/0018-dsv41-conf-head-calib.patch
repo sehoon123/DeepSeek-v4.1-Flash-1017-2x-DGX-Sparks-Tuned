@@ -1,0 +1,226 @@
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index b5a58d3..bf40480 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -33,6 +33,7 @@ pub const Model = struct {
+     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
+     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
+     copy_skips_head: bool = false, // a lone stream's fully accepted copy window skips the head's next pass
++    enter_match: i64 = 8, // matching tokens a copy window needs
+ };
+ 
+ pub const Config = struct {
+@@ -119,6 +120,7 @@ pub const Config = struct {
+             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
+             .mtp_step_ms = m.mtp_step_ms,
+             .copy_skips_head = m.copy_skips_head,
++            .enter_match = m.enter_match,
+         };
+     }
+ 
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 7836fd3..120c4e4 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -283,9 +283,16 @@ const Lane = struct {
+     held: [draft.max_block]u32 = undefined,
+     confs: [draft.max_block]f32 = undefined,
+     nheld: usize = 0,
++    dump_round: u32 = 0, // TF_DS_CALIB_FILE: this stream's drafted rounds so far
+ };
+ 
+ extern "c" fn exp(x: f64) f64;
++const CFile = anyopaque;
++extern "c" fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*CFile;
++extern "c" fn fread(p: *anyopaque, size: usize, n: usize, f: *CFile) usize;
++extern "c" fn fwrite(p: *const anyopaque, size: usize, n: usize, f: *CFile) usize;
++extern "c" fn fclose(f: *CFile) c_int;
++extern "c" fn fflush(f: ?*CFile) c_int;
+ 
+ /// A kept prompt state (the prompt cache's saved state, kept at a chunk end the prompt pass reached before its
+ /// replay): the slot's own part on the device (Model.snapCopy), and the extent its compressed rows stay in,
+@@ -348,6 +355,13 @@ pub const Lanes = struct {
+     policy_log: bool = false,
+     copy_rows: usize = window_rows, // TF_DS_COPY_ROWS: a lone stream's widest copy window (6: the stock width, off)
+     copy_skip: bool = false, // TF_DS_COPY_SKIP=1: no drafter pass after a lone stream's fully accepted copy window
++    platt: [draft.max_block][2]f64 = undefined, // (identity until Lanes.init) TF_DS_CALIB_PLATT: each draft position's (scale, shift) of the confidence logit
++    platt_on: bool = false,
++    calib_out: ?*CFile = null, // TF_DS_CALIB_FILE: each draft's confidence-head features and fate, for an offline refit of the head
++    calib_stage: []f32 = &.{},
++    calib_feat: []u16 = &.{},
++    copy_min: i64 = 4, // TF_DS_COPY_MIN: tf-dsv41-lanes' suffix lookup min_match
++    enter_match: i64 = 8, // TF_DS_COPY_ENTER: matching tokens a copy window needs
+     drawn: [ring]u32 = undefined,
+     next: u64 = 0,
+     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
+@@ -359,6 +373,7 @@ pub const Lanes = struct {
+         const t = m.round_ms;
+         for (&ln.wc, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = t[@min(i, t.len - 1)] };
+         for (&ln.sc, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = t[@min(i, t.len - 1)] };
++        for (&ln.platt) |*x| x.* = .{ 1.0, 0.0 };
+         return ln;
+     }
+ 
+@@ -419,10 +434,92 @@ pub const Lanes = struct {
+             if (self.copy_rows < window_rows or self.copy_rows > max_window or self.copy_rows > self.m.eng.round_rows) return error.BadCopyRows;
+         }
+         if (envVar("TF_DS_COPY_SKIP")) |t| self.copy_skip = std.mem.eql(u8, t, "1");
++        if (envVar("TF_DS_COPY_ENTER")) |t| {
++            self.enter_match = std.fmt.parseInt(i64, t, 10) catch return error.BadCopyRows;
++            if (self.enter_match < 2 or self.enter_match > 64) return error.BadCopyRows;
++        }
++        if (envVar("TF_DS_COPY_MIN")) |t| {
++            self.copy_min = std.fmt.parseInt(i64, t, 10) catch return error.BadCopyRows;
++            if (self.copy_min < 3 or self.copy_min > 32) return error.BadCopyRows;
++        }
++        if (envVar("TF_DS_CALIB_PLATT")) |t| {
++            var it = std.mem.splitScalar(u8, t, ',');
++            var n: usize = 0;
++            while (it.next()) |x| : (n += 1) {
++                if (n >= 10) return error.BadPlatt;
++                const v = std.fmt.parseFloat(f64, std.mem.trim(u8, x, " ")) catch return error.BadPlatt;
++                if (!std.math.isFinite(v)) return error.BadPlatt;
++                self.platt[n / 2][n % 2] = v;
++            }
++            if (n != 10) return error.BadPlatt;
++            self.platt_on = true;
++        }
++        if (std.c.getenv("TF_DS_CONF_FILE")) |path| try self.loadConfFile(path);
++        if (std.c.getenv("TF_DS_CALIB_FILE")) |path| try self.openCalib(path);
++    }
++
++    /// TF_DS_CONF_FILE: the confidence head's weight (fp32 [hidden + markov rank], little endian) in place of the
++    /// checkpoint's, a head refit offline on this target's own drafts (rank 0 only: the follower's confidences go unread).
++    fn loadConfFile(self: *Lanes, path: [*:0]const u8) !void {
++        const d = if (self.m.dr) |*x| x else return error.NoDraftHead;
++        const w = self.m.cfg.hidden + self.m.cfg.markov_rank;
++        const f = fopen(path, "rb") orelse return error.BadConfFile;
++        defer _ = fclose(f);
++        const buf = try self.gpa.alloc(f32, w);
++        defer self.gpa.free(buf);
++        if (fread(buf.ptr, 4, w, f) != w) return error.BadConfFile;
++        var extra: u8 = 0;
++        if (fread(&extra, 1, 1, f) != 0) return error.BadConfFile; // longer than the head
++        for (buf) |x| if (!std.math.isFinite(x)) return error.BadConfFile;
++        try @import("prompt.zig").upload(&self.m.eng, d.confw, buf.ptr, w * 4);
++        try self.m.eng.s.synchronize();
++    }
++
++    fn openCalib(self: *Lanes, path: [*:0]const u8) !void {
++        const w = self.m.cfg.hidden + self.m.cfg.markov_rank;
++        self.calib_out = fopen(path, "wb") orelse return error.BadCalibFile;
++        self.calib_stage = try self.gpa.alloc(f32, max_streams * draft.max_block * w);
++        self.calib_feat = try self.gpa.alloc(u16, max_streams * draft.max_block * w);
++    }
++
++    /// One record a held draft for the offline refit of the confidence head: its stream's hash, drafted round, the token,
++    /// the head's logit, its position, fate (1: landed, 0: the first to miss, 2: past a miss), the sampling flag, the
++    /// drafts held, then the head's inputs (bf16 bits: the collapsed hidden row and the previous token's Markov row).
++    fn dumpCalib(self: *Lanes, w: be.Window, sampled: []const u32, l: *Lane) void {
++        const out = self.calib_out orelse return;
++        const width = self.m.cfg.hidden + self.m.cfg.markov_rank;
++        var landed: usize = 0;
++        while (landed < w.held and sampled[landed] == l.held[landed]) landed += 1;
++        var hash: u32 = 2166136261;
++        for (w.stream.id) |c| hash = (hash ^ c) *% 16777619;
++        const temp: u8 = if (w.stream.sampling) |sm| @intFromBool(sm.temperature > 0) else 0;
++        for (0..w.held) |j| {
++            var head: [20]u8 = undefined;
++            std.mem.writeInt(u32, head[0..4], hash, .little);
++            std.mem.writeInt(u32, head[4..8], l.dump_round, .little);
++            std.mem.writeInt(u32, head[8..12], l.held[j], .little);
++            std.mem.writeInt(u32, head[12..16], @bitCast(l.confs[j]), .little);
++            head[16] = @intCast(j);
++            head[17] = if (j < landed) 1 else if (j == landed) 0 else 2;
++            head[18] = temp;
++            head[19] = @intCast(w.held);
++            const feat = self.calib_feat[(l.slot * draft.max_block + j) * width ..][0..width];
++            if (fwrite(&head, 1, head.len, out) != head.len or fwrite(feat.ptr, 2, width, out) != width) {
++                std.debug.print("{{\"calib_write_failed\": true}}\n", .{});
++                _ = fclose(out);
++                self.calib_out = null;
++                return;
++            }
++        }
++        l.dump_round += 1;
++        _ = fflush(out);
+     }
+ 
+     /// Tells rank 1 to stop, then frees the host state (the model is the caller's).
+     pub fn deinit(self: *Lanes) void {
++        if (self.calib_out) |out| _ = fclose(out);
++        if (self.calib_stage.len > 0) self.gpa.free(self.calib_stage);
++        if (self.calib_feat.len > 0) self.gpa.free(self.calib_feat);
+         for (self.snaps.items) |sn| {
+             sn.buf.free();
+             self.gpa.destroy(sn);
+@@ -456,6 +553,7 @@ pub const Lanes = struct {
+             .exact_width = @intCast(@max(window_rows, self.copy_rows)),
+             .first_copy_rows = if (self.copy_rows > window_rows) @as(u32, window_rows) else 0,
+             .copy_skips_head = self.copy_skip,
++            .enter_match = self.enter_match,
+             .gpu_tokens = false,
+             .mtp = drafting,
+             .speculate = drafting,
+@@ -772,6 +870,7 @@ pub const Lanes = struct {
+             const l = self.streams.getPtr(w.stream).?;
+             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
+             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
++            if (self.calib_out != null and w.held > 0) self.dumpCalib(w, o.sampled, l);
+             l.nheld = 0;
+         }
+     }
+@@ -882,6 +981,16 @@ pub const Lanes = struct {
+             }
+             l.nheld = k;
+         }
++        if (self.calib_out != null) {
++            const w = m.cfg.hidden + m.cfg.markov_rank;
++            const rows = n * d.steps;
++            try m.eng.d.check(m.eng.d.api.cuMemcpyDtoH_v2(self.calib_stage.ptr, d.conf_in, rows * w * 4), "cuMemcpyDtoH");
++            for (asked[0..n], depths[0..n], 0..) |l, k, i| for (0..k) |j| {
++                const src = self.calib_stage[(i * d.steps + j) * w ..][0..w];
++                const dst = self.calib_feat[(l.slot * draft.max_block + j) * w ..][0..w];
++                for (src, dst) |x, *b| b.* = @truncate(@as(u32, @bitCast(x)) >> 16);
++            };
++        }
+     }
+ 
+     /// The chance that each held draft lands with every earlier one, as the round loop's allocation reads it: the
+@@ -914,7 +1023,7 @@ pub const Lanes = struct {
+             for (out, 0..) |*o, j| o.* = if (j < k) 1.0 else 0.0;
+             return true;
+         }
+-        survivalsBiased(l.confs[0..out.len], out, self.conf_bias);
++        if (self.platt_on) survivalsPlatt(l.confs[0..out.len], out, self.platt[0..], self.conf_bias) else survivalsBiased(l.confs[0..out.len], out, self.conf_bias);
+         // The target-only Ablit changes can make the stock drafter's confidence calibration conservative even when its
+         // proposals still match. A floor preserves those useful drafts; positions past it keep the original policy.
+         for (out[0..@min(self.min_k, out.len)]) |*o| o.* = 1.0;
+@@ -1044,6 +1153,14 @@ pub fn survivals(conf: []const f32, out: []f64) void {
+     survivalsBiased(conf, out, 0);
+ }
+ 
++fn survivalsPlatt(conf: []const f32, out: []f64, platt: []const [2]f64, bias: f64) void {
++    var surv: f64 = 1.0;
++    for (out, conf[0..out.len], platt[0..out.len]) |*o, cf, p| {
++        surv *= 1.0 / (1.0 + exp(-(p[0] * @as(f64, cf) + p[1] + bias)));
++        o.* = surv;
++    }
++}
++
+ fn survivalsBiased(conf: []const f32, out: []f64, bias: f64) void {
+     var surv: f64 = 1.0;
+     for (out, conf[0..out.len]) |*o, cf| {
+diff --git a/zig/src/families/dsv41/lanes_main.zig b/zig/src/families/dsv41/lanes_main.zig
+index bdabff2..e18a9be 100644
+--- a/zig/src/families/dsv41/lanes_main.zig
++++ b/zig/src/families/dsv41/lanes_main.zig
+@@ -258,7 +258,7 @@ pub fn main(init: std.process.Init) !u8 {
+         while (admitted < reqs.len and core.activeCount() < par) {
+             const r = &reqs[admitted];
+             const j = &jobs[admitted];
+-            j.* = .{ .req = r, .index = admitted, .proposer = try lanes.SuffixLookup.init(gpa, .{ .min_match = 4 }), .stream = undefined, .began = std.Io.Timestamp.now(io, .awake) };
++            j.* = .{ .req = r, .index = admitted, .proposer = try lanes.SuffixLookup.init(gpa, .{ .min_match = ln.copy_min }), .stream = undefined, .began = std.Io.Timestamp.now(io, .awake) };
+             if (r.oracle.len > 0) {
+                 j.oracle = .{ .reply = r.oracle, .prompt_len = r.prompt.len, .miss = oracle_miss, .state = oracle_seed +% admitted };
+                 j.use_oracle = true;

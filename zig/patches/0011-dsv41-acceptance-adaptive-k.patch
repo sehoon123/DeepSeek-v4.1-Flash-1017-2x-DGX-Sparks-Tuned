@@ -1,0 +1,91 @@
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index bffe876..f5b21ff 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -261,7 +261,12 @@ const Lane = struct {
+     slot: usize,
+     base: usize,
+     end: usize,
+-    first: u64 = 0, // the prompt's draw (a handle)
++    first: u64 = 0,
++    policy_rounds: u64 = 0,
++    policy_score: i32 = 0,
++    policy_k: usize = 3,
++    proposed: [6]u64 = @splat(0),
++    accepted: [6]u64 = @splat(0), // the prompt's draw (a handle)
+     held: [draft.max_block]u32 = undefined,
+     confs: [draft.max_block]f32 = undefined,
+     nheld: usize = 0,
+@@ -295,6 +300,9 @@ pub const Lanes = struct {
+     fix_k: ?usize = null, // a measurement (tf-dsv41-lanes --fix-k): K drafts a stream, chances 1 to K and 0 past it
+     min_k: usize = 0, // TF_DS_MIN_K: trust at least this many drafts, then the drafter's calibrated confidences
+     conf_bias: f64 = 0, // TF_DS_CONF_BIAS: add to every confidence logit before its sigmoid
++    adapt_k: bool = false, // TF_DS_ADAPT_K: probe K5 and keep it only while its observed acceptance supports it
++    adapt_period: usize = 8,
++    policy_log: bool = false,
+     drawn: [ring]u32 = undefined,
+     next: u64 = 0,
+     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
+@@ -653,10 +661,22 @@ pub const Lanes = struct {
+ 
+     /// The caches are positional: the next window starts at the stream's new length and writes over the rows past it.
+     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
+-        _ = ptr;
+-        for (windows, paths) |_, path| {
++        const self = of(ptr);
++        for (windows, paths) |w, path| {
+             if (path.len == 0) return error.EmptyPath;
+             for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
++            const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
++            const proposed = @min(@as(usize, 5), w.rows() - 1);
++            const accepted = @min(proposed, path.len - 1);
++            l.proposed[proposed] += 1;
++            l.accepted[proposed] += accepted;
++            l.policy_rounds += 1;
++            if (self.adapt_k and proposed >= 4) {
++                if (accepted >= 4) l.policy_score = @min(8, l.policy_score + 2)
++                else l.policy_score = @max(-4, l.policy_score - 2);
++                if (l.policy_score >= 4) l.policy_k = 5;
++                if (l.policy_score <= 0) l.policy_k = 3;
++            }
+         }
+     }
+ 
+@@ -729,6 +749,12 @@ pub const Lanes = struct {
+             for (out, 0..) |*o, j| o.* = if (j < k) 1.0 else 0.0;
+             return true;
+         }
++        if (self.adapt_k) {
++            const probe = l.policy_k == 3 and l.policy_rounds % self.adapt_period == self.adapt_period - 1;
++            const k = if (probe) @as(usize, 5) else l.policy_k;
++            for (out, 0..) |*o, j| o.* = if (j < k) 1.0 else 0.0;
++            return true;
++        }
+         survivalsBiased(l.confs[0..out.len], out, self.conf_bias);
+         // The target-only Ablit changes can make the stock drafter's confidence calibration conservative even when its
+         // proposals still match. A floor preserves those useful drafts; positions past it keep the original policy.
+@@ -803,6 +829,7 @@ pub const Lanes = struct {
+     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
+         const self = of(ptr);
+         const kv = self.streams.fetchRemove(s) orelse return;
++        if (self.policy_log) std.log.info("draft-policy stream={s} rounds={d} score={d} k={d} proposed={any} accepted={any}", .{ s.id, kv.value.policy_rounds, kv.value.policy_score, kv.value.policy_k, kv.value.proposed, kv.value.accepted });
+         self.used[kv.value.slot] = false;
+     }
+ };
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index a2f0f47..28bd121 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -151,6 +151,12 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         st.lanes.conf_bias = std.fmt.parseFloat(f64, t) catch return error.BadFixK;
+         if (!std.math.isFinite(st.lanes.conf_bias)) return error.BadFixK;
+     }
++    if (getenv("TF_DS_ADAPT_K")) |t| st.lanes.adapt_k = std.mem.eql(u8, t, "1");
++    if (getenv("TF_DS_ADAPT_PERIOD")) |t| {
++        st.lanes.adapt_period = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++        if (st.lanes.adapt_period < 2 or st.lanes.adapt_period > 64) return error.BadFixK;
++    }
++    if (getenv("TF_DS_POLICY_LOG")) |t| st.lanes.policy_log = std.mem.eql(u8, t, "1");
+     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
+     st.vision = null;
+     if (st.m.cfg.vision) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);

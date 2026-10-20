@@ -1,0 +1,72 @@
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 86578e0..c2effbc 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -265,6 +265,8 @@ const Lane = struct {
+     policy_rounds: u64 = 0,
+     policy_score: i32 = 0,
+     policy_k: usize = 3,
++    probe_in: usize = 0,
++    probe_period: usize = 0,
+     proposed: [6]u64 = @splat(0),
+     accepted: [6]u64 = @splat(0), // the prompt's draw (a handle)
+     held: [draft.max_block]u32 = undefined,
+@@ -304,6 +306,8 @@ pub const Lanes = struct {
+     adapt_period: usize = 8,
+     adapt_accept: usize = 4, // accepted drafts a K5 observation needs to raise/hold K5
+     adapt_max_live: usize = 2, // above this concurrency K3 is the measured exact/fast policy
++    adapt_backoff: bool = false, // failed K5 probes exponentially become rarer for low-acceptance prose
++    adapt_max_period: usize = 32,
+     policy_log: bool = false,
+     drawn: [ring]u32 = undefined,
+     next: u64 = 0,
+@@ -673,11 +677,19 @@ pub const Lanes = struct {
+             l.proposed[proposed] += 1;
+             l.accepted[proposed] += accepted;
+             l.policy_rounds += 1;
+-            if (self.adapt_k and self.streams.count() <= self.adapt_max_live and proposed >= 4) {
+-                if (accepted >= self.adapt_accept) l.policy_score = @min(8, l.policy_score + 2)
+-                else l.policy_score = @max(-4, l.policy_score - 2);
+-                if (l.policy_score >= 4) l.policy_k = 5;
+-                if (l.policy_score <= 0) l.policy_k = 3;
++            if (self.adapt_k and self.streams.count() <= self.adapt_max_live) {
++                if (proposed >= 4) {
++                    if (accepted >= self.adapt_accept) {
++                        l.policy_score = @min(8, l.policy_score + 2);
++                        l.probe_period = self.adapt_period;
++                    } else {
++                        l.policy_score = @max(-4, l.policy_score - 2);
++                        if (self.adapt_backoff and l.policy_k == 3) l.probe_period = @min(self.adapt_max_period, @max(self.adapt_period, @max(@as(usize, 1), l.probe_period) * 2));
++                    }
++                    if (l.policy_score >= 4) l.policy_k = 5;
++                    if (l.policy_score <= 0) l.policy_k = 3;
++                    l.probe_in = if (l.probe_period == 0) self.adapt_period else l.probe_period;
++                } else if (l.policy_k == 3 and l.probe_in > 0) l.probe_in -= 1;
+             }
+         }
+     }
+@@ -753,7 +765,7 @@ pub const Lanes = struct {
+         }
+         if (self.adapt_k) {
+             const crowded = self.streams.count() > self.adapt_max_live;
+-            const probe = !crowded and l.policy_k == 3 and l.policy_rounds % self.adapt_period == self.adapt_period - 1;
++            const probe = !crowded and l.policy_k == 3 and l.probe_in == 0;
+             const k = if (crowded) @as(usize, 3) else if (probe) @as(usize, 5) else l.policy_k;
+             for (out, 0..) |*o, j| o.* = if (j < k) 1.0 else 0.0;
+             return true;
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index d25bab6..c2df348 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -164,6 +164,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         st.lanes.adapt_max_live = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
+         if (st.lanes.adapt_max_live < 1 or st.lanes.adapt_max_live > 4) return error.BadFixK;
+     }
++    if (getenv("TF_DS_ADAPT_BACKOFF")) |t| st.lanes.adapt_backoff = std.mem.eql(u8, t, "1");
++    if (getenv("TF_DS_ADAPT_MAX_PERIOD")) |t| {
++        st.lanes.adapt_max_period = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++        if (st.lanes.adapt_max_period < st.lanes.adapt_period or st.lanes.adapt_max_period > 128) return error.BadFixK;
++    }
+     if (getenv("TF_DS_POLICY_LOG")) |t| st.lanes.policy_log = std.mem.eql(u8, t, "1");
+     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
+     st.vision = null;

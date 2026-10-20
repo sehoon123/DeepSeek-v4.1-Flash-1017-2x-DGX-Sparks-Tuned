@@ -1,0 +1,69 @@
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index fe3f09d..10fb3f7 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -314,6 +314,10 @@ pub const Lanes = struct {
+     accept_route: bool = false, // classify a stream from its first K3 rounds, then keep K3 or K5
+     route_warmup: usize = 8,
+     route_threshold: f64 = 1.75,
++    probe_route: bool = false, // classify from a bounded number of actual K5 probes, then stop probing
++    probe_samples: usize = 8,
++    probe_period: usize = 2,
++    probe_threshold: f64 = 2.5,
+     policy_log: bool = false,
+     drawn: [ring]u32 = undefined,
+     next: u64 = 0,
+@@ -694,6 +698,15 @@ pub const Lanes = struct {
+                     }
+                 }
+             }
++            if (self.probe_route and !l.route_decided and self.streams.count() <= self.adapt_max_live and proposed == 5) {
++                l.route_rounds += 1;
++                l.route_accepted += accepted;
++                if (l.route_rounds >= self.probe_samples) {
++                    const mean = @as(f64, @floatFromInt(l.route_accepted)) / @as(f64, @floatFromInt(l.route_rounds));
++                    l.policy_k = if (mean >= self.probe_threshold) 5 else 3;
++                    l.route_decided = true;
++                }
++            }
+             if (self.adapt_k and self.streams.count() <= self.adapt_max_live) {
+                 if (proposed >= 4) {
+                     if (accepted >= self.adapt_accept) {
+@@ -780,6 +793,13 @@ pub const Lanes = struct {
+             for (out, 0..) |*o, j| o.* = if (j < k) 1.0 else 0.0;
+             return true;
+         }
++        if (self.probe_route) {
++            const crowded = self.streams.count() > self.adapt_max_live;
++            const probe = !crowded and !l.route_decided and l.policy_rounds % self.probe_period == self.probe_period - 1;
++            const k = if (crowded) @as(usize, 3) else if (probe) @as(usize, 5) else l.policy_k;
++            for (out, 0..) |*o, j| o.* = if (j < k) 1.0 else 0.0;
++            return true;
++        }
+         if (self.accept_route) {
+             const k = if (self.streams.count() > self.adapt_max_live) @as(usize, 3) else l.policy_k;
+             for (out, 0..) |*o, j| o.* = if (j < k) 1.0 else 0.0;
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 538be65..bfae1c5 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -178,6 +178,19 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+         st.lanes.route_threshold = std.fmt.parseFloat(f64, t) catch return error.BadFixK;
+         if (!std.math.isFinite(st.lanes.route_threshold) or st.lanes.route_threshold < 0 or st.lanes.route_threshold > 5) return error.BadFixK;
+     }
++    if (getenv("TF_DS_PROBE_ROUTE")) |t| st.lanes.probe_route = std.mem.eql(u8, t, "1");
++    if (getenv("TF_DS_PROBE_SAMPLES")) |t| {
++        st.lanes.probe_samples = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++        if (st.lanes.probe_samples < 1 or st.lanes.probe_samples > 64) return error.BadFixK;
++    }
++    if (getenv("TF_DS_PROBE_PERIOD")) |t| {
++        st.lanes.probe_period = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
++        if (st.lanes.probe_period < 2 or st.lanes.probe_period > 64) return error.BadFixK;
++    }
++    if (getenv("TF_DS_PROBE_THRESHOLD")) |t| {
++        st.lanes.probe_threshold = std.fmt.parseFloat(f64, t) catch return error.BadFixK;
++        if (!std.math.isFinite(st.lanes.probe_threshold) or st.lanes.probe_threshold < 0 or st.lanes.probe_threshold > 5) return error.BadFixK;
++    }
+     if (getenv("TF_DS_POLICY_LOG")) |t| st.lanes.policy_log = std.mem.eql(u8, t, "1");
+     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
+     st.vision = null;
