@@ -30,7 +30,7 @@
 #   setup    PREPARE (auto | 1 | 0), WAIT_TIMEOUT (seconds, default 2400), DRY_RUN=1
 #   memory   MIN_AVAIL_GIB (refuse to start below it), MIN_AVAIL_WAIT_S (re-read for this long first), MEMGUARD_GIB (kill a rank's container below it), HEAD_NFS_SERVER,
 #            HEAD_NFS_VOLUME (rank 0 reads the checkpoint over NFS through a docker volume)
-#   ranks    every TENSORFOLD_*, TF_DS_* and TF_EXL3_* variable you set goes to both ranks (this recipe sets TF_DS_COPY_ROWS=48 and
+#   ranks    every TENSORFOLD_*, TF_DS_* and TF_EXL3_* variable you set goes to both ranks (this recipe sets TF_DS_COPY_ROWS=ROUND_ROWS and
 #            TF_DS_COPY_SKIP=1 unless you do: wide copy windows, scripts/config.sh)
 #            every other exported NCCL_* variable too (values of A-Z a-z 0-9 _ . , : = / - only), RANK1_PROFILE=1|2: rank 1's --profile
 set -euo pipefail

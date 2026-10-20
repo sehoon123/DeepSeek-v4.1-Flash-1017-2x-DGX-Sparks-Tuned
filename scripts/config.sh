@@ -109,7 +109,8 @@ PORT="${PORT:-8888}"
 # CONTEXT positions (rank 1's --pool is rank 0's --context), so PARALLEL streams at the full window take turns.
 CONTEXT="${CONTEXT:-1048576}"
 PARALLEL="${PARALLEL:-4}"              # requests at once (the engine's streams, TF_DS_STREAMS; the family measured 4)
-ROUND_ROWS="${ROUND_ROWS:-48}"         # a decode round's rows at most, 16 to 48 (this recipe: 48, for wide copy windows; 16: the engine's)
+ROUND_ROWS="${ROUND_ROWS:-32}"         # a decode round's rows at most, 16 to 48 (this recipe: 32, for wide copy windows; 48 copies faster
+                                       # for ~0.3 GiB more of each Spark's memory, README "Memory and safety"; 16: the engine's)
 MAX_TOKENS="${MAX_TOKENS:-32768}"      # a reply's budget when a request sets none
 THINKING="${THINKING:-1}"              # think first unless a request turns it off
 # The reasoning effort when a request names none: low, medium, high or xhigh (empty: the chat template's default)
@@ -129,7 +130,7 @@ DRAFTS="${DRAFTS:-1}"                  # the checkpoint's own DSpark draft block
 # ROUND_ROWS; 16 needs no ROUND_ROWS), and TF_DS_COPY_SKIP=1 skips the drafter's pass after a round that accepted its whole
 # copy. Replies do not change: the model still checks every token. TF_DS_COPY_ROWS=6 TF_DS_COPY_SKIP=0 give the engine's
 # own behaviour. Both ranks read them (start.sh checks them).
-export TF_DS_COPY_ROWS="${TF_DS_COPY_ROWS:-48}" TF_DS_COPY_SKIP="${TF_DS_COPY_SKIP:-1}"
+export TF_DS_COPY_ROWS="${TF_DS_COPY_ROWS:-$ROUND_ROWS}" TF_DS_COPY_SKIP="${TF_DS_COPY_SKIP:-1}"
 # The engine's settings as BertholomusAI's served two-node launch has them: CUDA graphs, the mixes' side stream, the
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
 # NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).

@@ -28,14 +28,15 @@ This is [Mia's AI Lab's recipe](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash
 the settings and the engine pin are theirs, and so is the rest of this README, whose issue and pull-request numbers are
 their repository's.
 
-- **Wide copy windows, on by default** (`zig/patches/0017` and `0021`; `TF_DS_COPY_ROWS=48`, `TF_DS_COPY_SKIP=1`,
-  `ROUND_ROWS=48` in `scripts/config.sh`). When a reply copies text from its prompt or from itself (an edited file, a
-  quotation, a list written again), a stream that runs alone checks up to 48 copied tokens a round instead of 6, and skips
+- **Wide copy windows, on by default** (`zig/patches/0017` and `0021`; `ROUND_ROWS=32` and `TF_DS_COPY_ROWS` equal to it,
+  `TF_DS_COPY_SKIP=1` in `scripts/config.sh`). When a reply copies text from its prompt or from itself (an edited file, a
+  quotation, a list written again), a stream that runs alone checks up to 32 copied tokens a round instead of 6, and skips
   the drafter's pass after a round that accepted its whole copy. With 16-row windows (0017 alone): a JavaScript file from
   the prompt copied verbatim 123.6 → 204.1 tok/s, with every `const` turned into `let` 111.0 → 141.1. From 16 to 48 rows
-  (0021): perfect copies of the reply +31.6 % (212 → 279 tok/s), with a quarter or half of the copied tokens wrong +14 to
-  +18 %, nine in ten wrong +4.6 %, the four natural prompts (two of them copies) +6.5 %; text without copies unchanged.
-  0021 costs ~0.5 GiB of each Spark's memory (the wider rounds' buffers).
+  (0021, one stream): writing out four Python files whole with a scattered edit each (a rename, print -> log, ...) +14 %
+  at 32 rows and +20 % at 48 (180.7 -> 206.3 / 216.9 tok/s; at temperature 1 +13 / +18 %), copies of the reply +21 / +32 %;
+  text without copies unchanged. Each 16 rows past 16 cost ~0.26 GiB of each Spark's memory (the wider rounds' buffers),
+  so 32 is the default: set `ROUND_ROWS=48` where the head has the room ("Memory and safety").
 - **The drafter's confidence head when the stock shards are gone.** Mia's AI Lab's recipe gives the overlay's F32 copy of
   `mtp.2.confidence_head.proj.weight` stock's F16 bytes back (`scripts/ablit_stock_dtypes.py`), which needs the stock
   shards. When they are gone, preparation checks the head and writes it to `conf_head_f32.bin`, and both ranks load it
