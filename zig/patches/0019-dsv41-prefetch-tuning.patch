@@ -1,0 +1,266 @@
+diff --git a/zig/src/families/dsv41/draft.zig b/zig/src/families/dsv41/draft.zig
+index 5ac250b..fd69459 100644
+--- a/zig/src/families/dsv41/draft.zig
++++ b/zig/src/families/dsv41/draft.zig
+@@ -22,6 +22,7 @@ const tri_attn = @import("tri_attn.zig");
+ const tri_markov = @import("tri_markov.zig");
+ const exl3_linear = @import("exl3_linear.zig");
+ const exl3_experts = @import("exl3_experts.zig");
++const ops_mod = @import("ops.zig");
+ const markov_tokens = @import("markov_tokens.zig");
+ const draft2d = @import("draft2d.zig");
+ 
+@@ -228,6 +229,11 @@ pub const Drafter = struct {
+     arows: u64,
+     // the pass's graphs (BatchDraftGraph: one a streams and steps; null: eager)
+     graphs: ?*PassGraphs = null,
++    // the pass's own L2 prefetch (on unless TF_DS_DRAFT_PF=0): a stream forked from the pass and joined at its end
++    pf: ?cuda.Stream = null,
++    pf_fork: ?cuda.Event = null,
++    pf_join: ?cuda.Event = null,
++    pf_out: bool = false,
+     // the last pass on the host: each stream's drafts and confidences (`steps` of them)
+     streams: usize = 0,
+     steps: usize = 0,
+@@ -355,6 +361,15 @@ pub const Drafter = struct {
+         dr.ao = try a.take(ring * hd * 2);
+         dr.apos = try a.take(ring * 8);
+         dr.arows = try a.take(ring * 8);
++        dr.pf = null;
++        dr.pf_fork = null;
++        dr.pf_join = null;
++        dr.pf_out = false;
++        if (draftPrefetchWanted()) {
++            dr.pf = try cuda.Stream.init(e.d, true);
++            dr.pf_fork = try cuda.Event.init(e.d, false);
++            dr.pf_join = try cuda.Event.init(e.d, false);
++        }
+         return dr;
+     }
+ 
+@@ -489,6 +504,8 @@ pub const Drafter = struct {
+         const d = c.hidden;
+         // the streams: every row's token embedding in each stream, pre (1, 0, 0, 0)
+         try tri_basic.embedInit(t, e.w.embed, dr.row(0), dr.h, dr.pre, R, d, c.hc);
++        // the prefetch: block 0's attention mix and input linears
++        try dr.prefetch(e, &blockIn(dr.ds.blocks[0], c), dpfBudget("TF_DS_DPF_C_MIB", 16 << 20));
+         // _stages_fused
+         var h = dr.h;
+         var spare = dr.h_alt;
+@@ -500,6 +517,8 @@ pub const Drafter = struct {
+             try Probe.check(probe, .attn_in, j, dr.x);
+             try Probe.check(probe, .attn_ring, j, pool.rings[j]);
+             try dr.attention(e, ch, pool, j, R);
++            // the prefetch behind wo_b: the ffn mix's weights, the router, the shared expert
++            try dr.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, lay.experts.count - 1) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, dpfBudget("TF_DS_DPF_B_MIB", 8 << 20));
+             try Probe.check(probe, .attn_out, j, dr.pa);
+             if (e.two) |tw| try tw.pairGather(e, dr.pa, dr.ga, R, d, 4) else try e.gatherF32(dr.pa, dr.ga, R * d);
+             try Probe.check(probe, .attn_gather, j, dr.ga);
+@@ -507,6 +526,10 @@ pub const Drafter = struct {
+             h = try dr.mix(e, h, &spare, &pending, lay.hc_ffn, dr.pre_a, lay.ffn_norm, pre_f, R);
+             try Probe.check(probe, .moe_in, j, dr.x);
+             try dr.moe(e, j, R);
++            // the prefetch behind the experts: the next block's attention mix and input linears, after the last the head
++            if (j + 1 < dr.ds.blocks.len) {
++                try dr.prefetch(e, &blockIn(dr.ds.blocks[j + 1], c), dpfBudget("TF_DS_DPF_C_MIB", 16 << 20));
++            } else try dr.prefetch(e, &.{lb(e.w.head)}, dpfBudget("TF_DS_DPF_H_MIB", 16 << 20));
+             try Probe.check(probe, .moe_out, j, dr.pm);
+             if (e.two) |tw| try tw.pairGather(e, dr.pm, dr.gm, R, d, 4) else try e.gatherF32(dr.pm, dr.gm, R * d);
+             try Probe.check(probe, .moe_gather, j, dr.gm);
+@@ -539,6 +562,36 @@ pub const Drafter = struct {
+         try e.ops.copyRows(e.s, dr.xcf, d * 4, dr.conf_in, w * 4, d * 4, N * steps);
+         try e.ops.copyRows(e.s, dr.ef, rank * 4, dr.conf_in + d * 4, w * 4, rank * 4, N * steps);
+         try e.blas.xv(dr.conf_in, dr.confw, dr.conf, N * steps, w);
++        try dr.joinPrefetch(e);
++    }
++
++    /// These ranges touched into L2 behind the pass's work queued so far, on the pass's prefetch stream (round.zig's
++    /// Round.prefetch): `ranges` in order, the last one cut where the launch reaches `budget` bytes. No arithmetic.
++    fn prefetch(dr: *Drafter, e: *const Engine, ranges: []const [2]u64, budget: u64) !void {
++        const s = dr.pf orelse return;
++        var a: ops_mod.Prefetch = .{};
++        var left = budget;
++        for (ranges) |r| {
++            if (r[1] == 0 or a.n == 16 or left == 0) continue;
++            const take = @min(r[1], left);
++            a.ptr[@intCast(a.n)] = r[0];
++            a.bytes[@intCast(a.n)] = take;
++            a.n += 1;
++            left -= take;
++        }
++        if (a.n == 0) return;
++        try dr.pf_fork.?.record(e.s);
++        try s.wait(dr.pf_fork.?);
++        try e.ops.l2Prefetch(s, a);
++        try dr.pf_join.?.record(s);
++        dr.pf_out = true;
++    }
++
++    /// The main stream waits for the pass's prefetches (a captured pass ends joined: its graph's every stream).
++    fn joinPrefetch(dr: *Drafter, e: *const Engine) !void {
++        if (!dr.pf_out) return;
++        try e.s.wait(dr.pf_join.?);
++        dr.pf_out = false;
+     }
+ 
+     /// pre_mix of _stages_fused: hc_pre2 of the streams h with the pending gathered partials posted in (into the spare
+@@ -571,6 +624,13 @@ pub const Drafter = struct {
+         try tri_norm.rmsnormRot(t, dr.qa, lay.wq_a.n, lay.q_norm, c.eps, &rot, dr.qr, lay.wq_a.n, R, lay.wq_a.n);
+         var qc = [_]exl3_linear.Call{.{ .layer = lay.wq_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = dr.xhq, .y = dr.q, .ldy = @intCast(lay.wq_b.n), .y_dtype = .bf16, .counters = 0, .rope = .{ .cos = rope.cos, .sin = rope.sin, .pos = pos, .hd = @intCast(hd), .rd = @intCast(rd) } }};
+         try prompt.groupedRotated(e, ch, R, &qc);
++        // the prefetch: the block's wo_a and wo_b behind q's linears
++        {
++            var r: [5][2]u64 = @splat(.{ 0, 0 });
++            for (lay.wo_a[0..lay.groups], 0..) |wo, gi| r[gi] = lb(wo);
++            r[4] = lb(lay.wo_b);
++            try dr.prefetch(e, &r, dpfBudget("TF_DS_DPF_A_MIB", 16 << 20));
++        }
+         // the block rows' keys: normed and roped, stored nowhere (ring row -1)
+         const plane_rows = pool.slots * pool.ring;
+         try tri_norm.kvNormRope(t, dr.ykv, lay.kv_norm, rope.cos, rope.sin, pos, pool.rings[j], plane_rows, dr.row(5), c.eps, true, rd, dr.kvb, R, hd);
+@@ -637,6 +697,35 @@ pub const Drafter = struct {
+     }
+ };
+ 
++/// The drafter pass prefetches its blocks' weights into L2 like the target's layers (+0.37 % decode at one stream, three
++/// reps each, 9 of 11 prompts faster and none slower); TF_DS_DRAFT_PF=0 turns it off.
++fn draftPrefetchWanted() bool {
++    const v = std.c.getenv("TF_DS_DRAFT_PF") orelse return true;
++    return !std.mem.eql(u8, std.mem.span(v), "0");
++}
++
++/// The bytes one of the pass's prefetches may touch into L2: `default`, or `name` in MiB (0 to 64; 0: none there).
++fn dpfBudget(name: [*:0]const u8, default: u64) u64 {
++    const v = std.c.getenv(name) orelse return default;
++    const m = std.fmt.parseInt(u64, std.mem.span(v), 10) catch return default;
++    return if (m > 64) default else m << 20;
++}
++
++/// A linear layer's trellis words (round.zig's linearBytes).
++fn lb(l: weights.Linear) [2]u64 {
++    return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
++}
++
++/// An mHC mix's weights hc_*_fn: fp32 [24, hc * d].
++fn hcFnBytes(c: anytype) u64 {
++    return 24 * @as(u64, c.hc) * c.hidden * 4;
++}
++
++/// A block's attention mix and input linears, in the order the block reads them.
++fn blockIn(lay: weights.Layer, c: anytype) [4][2]u64 {
++    return .{ .{ lay.hc_attn[0], hcFnBytes(c) }, lb(lay.wq_a), lb(lay.wkv), lb(lay.wq_b) };
++}
++
+ /// MultiDecoder._depth: the most drafts a stream verifies in a round of `live` streams (TF_DS_PARALLEL_DEPTH unset:
+ /// 5, 5, 3, 3), at most the engine's drafts and the rows a stream may take of a round (max_rows / live - 1).
+ pub fn depth(live: usize, drafts: usize, round_rows: usize) usize {
+diff --git a/zig/src/families/dsv41/ops.zig b/zig/src/families/dsv41/ops.zig
+index a82baee..2982c42 100644
+--- a/zig/src/families/dsv41/ops.zig
++++ b/zig/src/families/dsv41/ops.zig
+@@ -7,6 +7,13 @@
+ const std = @import("std");
+ const cuda = @import("cuda");
+ 
++/// An integer setting of the L2 prefetch from the environment: `default` when unset, malformed or outside [lo, hi].
++fn pfEnv(name: [*:0]const u8, default: c_longlong, lo: c_longlong, hi: c_longlong) c_longlong {
++    const v = std.c.getenv(name) orelse return default;
++    const x = std.fmt.parseInt(c_longlong, std.mem.span(v), 10) catch return default;
++    return if (x < lo or x > hi) default else x;
++}
++
+ /// launch_shape.h's tf_launch_blocks: a block a `threads` elements, at most 65535.
+ fn blocks(count: usize, threads: usize) u32 {
+     return @intCast(@min((count + threads - 1) / threads, 65535));
+@@ -173,18 +180,24 @@ pub const Ops = struct {
+         try cuda.launch.launch(o.cand_fast, .{ .grid = .{ .x = blocks(nb, 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+     }
+ 
+-    /// Every 128-byte line of `pf`'s ranges touched into L2 (one block of 128 threads); writes nothing.
++    /// Every 128-byte line of `pf`'s ranges touched into L2 (TF_DS_PF_BLOCKS blocks of 128 threads, one by default);
++    /// writes nothing.
+     pub fn l2Prefetch(o: *const Ops, s: cuda.Stream, pf: Prefetch) !void {
+         if (pf.n == 0) return;
+-        // the served decode settings (exl3/prefetch.py): 3 us before the first wave, waves of 128 chunks of 8 KiB
+-        // at 230 GB/s (TF_EXL3_L2_DELAY_NS, TF_EXL3_L2_RATE_GBPS), one block
+-        const delay_ns: c_longlong = 3000;
+-        const wave_ns: c_longlong = @intFromFloat(128.0 * 8192.0 / 230.0);
++        // waves of 128 chunks of 8 KiB at 230 GB/s, one block (exl3/prefetch.py's served settings), but no delay
++        // before the first wave: prefetch.py waits 3 us; starting at once measured +0.35 to +0.72 % decode at one
++        // stream in five windows and +0.6 / +1.0 % a stream at two / four. Read here from the environment:
++        // TF_EXL3_L2_DELAY_NS, TF_EXL3_L2_RATE_GBPS (0: unpaced), TF_DS_PF_BLOCKS (blocks sharing the rate, each pacing
++        // its own waves). A prefetch changes no arithmetic.
++        const nblk: u32 = @intCast(pfEnv("TF_DS_PF_BLOCKS", 1, 1, 48));
++        const rate = pfEnv("TF_EXL3_L2_RATE_GBPS", 230, 0, 1000);
++        const delay_ns: c_longlong = pfEnv("TF_EXL3_L2_DELAY_NS", 0, 0, 1_000_000);
++        const wave_ns: c_longlong = if (rate == 0) 0 else @divTrunc(@as(c_longlong, nblk) * 128 * 8192, rate);
+         var a: cuda.Args = .{};
+         a.add(pf);
+         a.add(delay_ns);
+         a.add(wave_ns);
+-        try cuda.launch.launch(o.l2_prefetch, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, s, &a);
++        try cuda.launch.launch(o.l2_prefetch, .{ .grid = .{ .x = nblk }, .block = .{ .x = 128 } }, s, &a);
+     }
+ 
+     /// The indexer's selection of every scanned key (its top-k takes all nb): out [rows, nb] int64 = j where j <
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index 607b843..dead408 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -577,7 +577,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches,
+         var r: [5][2]u64 = @splat(.{ 0, 0 });
+         for (lay.wo_a[0..lay.groups], 0..) |wo, j| r[j] = linearBytes(wo);
+         r[4] = linearBytes(lay.wo_b);
+-        try rd.prefetch(e, &r, prefetch_budget);
++        try rd.prefetch(e, &r, siteBudget("TF_DS_PF_A_MIB", prefetchBudget()));
+     }
+     try rd.mark(e, .a_q);
+     // _kv_idx: the compressor's caches (a kv source) and the indexer's selection
+@@ -725,7 +725,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches,
+     var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
+     try prompt.groupedRotated(e, ch, R, &cb_call);
+     // the prefetch behind wo_b: the ffn mix's weights, the router, the shared expert's gate
+-    try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, prefetch_budget / 2);
++    try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, siteBudget("TF_DS_PF_B_MIB", prefetchBudget() / 2));
+ }
+ 
+ /// Model.moe of a decode window (shared_side off: SHARED_OVERLAP unset in the served lane): the gate's chunk sums
+@@ -751,11 +751,11 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
+     if (li + 1 < e.w.layers.len) {
+         const nx = e.w.layers[li + 1];
+         if (nx.engram_wkv) |ew| {
+-            try rd.prefetch(e, &.{linearBytes(ew)}, prefetch_budget / 4);
++            try rd.prefetch(e, &.{linearBytes(ew)}, siteBudget("TF_DS_PF_E_MIB", prefetchBudget() / 4));
+         } else {
+-            try rd.prefetch(e, &.{ .{ nx.hc_attn[0], hcFnBytes(c) }, linearBytes(nx.wq_a), linearBytes(nx.wkv), if (nx.comp_wkv) |x| linearBytes(x) else .{ 0, 0 }, if (nx.comp_wgate) |x| linearBytes(x) else .{ 0, 0 }, linearBytes(nx.wq_b) }, prefetch_budget);
++            try rd.prefetch(e, &.{ .{ nx.hc_attn[0], hcFnBytes(c) }, linearBytes(nx.wq_a), linearBytes(nx.wkv), if (nx.comp_wkv) |x| linearBytes(x) else .{ 0, 0 }, if (nx.comp_wgate) |x| linearBytes(x) else .{ 0, 0 }, linearBytes(nx.wq_b) }, siteBudget("TF_DS_PF_C_MIB", prefetchBudget()));
+         }
+-    } else try rd.prefetch(e, &.{linearBytes(e.w.head)}, prefetch_budget);
++    } else try rd.prefetch(e, &.{linearBytes(e.w.head)}, siteBudget("TF_DS_PF_H_MIB", prefetchBudget()));
+ }
+ 
+ /// An EXL3 linear's words: their first byte and length (k * n values of k2 / 2 bits).
+@@ -765,7 +765,22 @@ fn linearBytes(l: weights.Linear) [2]u64 {
+ 
+ /// A paced prefetch launch's most bytes (the served launch trace: 16 MiB; 8 MiB behind wo_b, 4 MiB before an Engram
+ /// layer).
+-const prefetch_budget: u64 = 16 << 20;
++/// The bytes one prefetch may touch into L2: 16 MiB, or TF_DS_PF_BUDGET_MIB (1 to 64).
++fn prefetchBudget() u64 {
++    const v = std.c.getenv("TF_DS_PF_BUDGET_MIB") orelse return 16 << 20;
++    const m = std.fmt.parseInt(u64, std.mem.span(v), 10) catch return 16 << 20;
++    return if (m < 1 or m > 64) 16 << 20 else m << 20;
++}
++
++/// The bytes one prefetch site may touch into L2: `default`, or TF_DS_PF_<site>_MIB (0 to 64; 0: the site prefetches
++/// nothing). Sites: A behind q's linears (wo_a, wo_b), B behind wo_b (the ffn mix, the router, the shared expert), C
++/// behind the experts (the next layer's attention mix and input linears), E there before an Engram layer (its wkv), H
++/// after the last layer (the head).
++fn siteBudget(name: [*:0]const u8, default: u64) u64 {
++    const v = std.c.getenv(name) orelse return default;
++    const m = std.fmt.parseInt(u64, std.mem.span(v), 10) catch return default;
++    return if (m > 64) default else m << 20;
++}
+ 
+ /// An mHC mix's weights hc_*_fn: fp32 [24, hc * d].
+ fn hcFnBytes(c: anytype) u64 {

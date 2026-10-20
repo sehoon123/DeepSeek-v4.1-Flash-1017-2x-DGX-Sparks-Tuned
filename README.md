@@ -42,7 +42,16 @@ their repository's.
   it replaced are removed (127 GB) and are not downloaded again ([Abliterated mode](#abliterated-mode)).
 - **`start.sh`**: a SIGTERM (systemd stopping the service) always reaches `./stop.sh` and stops both ranks (a foreground
   `docker logs -f` used to defer the trap); the `TF_DS_*` variables of `zig/patches/0010`-`0018` are range-checked;
-  `TF_DS_FIX_K` reaches rank 1 as `--fix-k`.
+  `TF_DS_FIX_K` reaches rank 1 as `--fix-k`; `TF_EXL3_*` settings reach both ranks too.
+- **The L2 prefetcher, retuned, and the drafter's own** (`zig/patches/0019`). The engine touches the next kernels'
+  weights into L2 while latency-bound work runs; its first wave now starts at once instead of 3 µs late (+0.35 to
+  +0.72 % decode at one stream in five measurement windows, +0.6 / +1.0 % a stream at two / four), and the drafter's
+  pass prefetches its blocks' weights the way the target's layers do (+0.37 %, 9 of 11 prompts faster, none slower).
+  Each prefetch site's budget became a setting; the engine's budgets measured best and stay. A prefetch does no
+  arithmetic: every run's token hashes equal serial decoding's.
+- **Upstream's DSML tool-call fix** (`zig/patches/0020`: TensorFold commit `4803479e` by Manrique, @hashd1ve, merged
+  upstream after this recipe's engine pin): a `<tool_call>` in the prose, or a `</tool_call>` inside an argument (a file
+  being written), no longer drops a DeepSeek-V4.1 tool call or streams a wrong one.
 - **Research patches, off unless their variables are set**: draft-depth policies (`0010`-`0016`) and 0018's calibration
   switches ([zig/patches/README.md](zig/patches/README.md)).
 - **[research/](research/README.md)**: the measurements behind these changes: where a 38.9 ms decode round goes on this
@@ -52,7 +61,7 @@ Replies do not change. Every check compared them with serial decoding (one token
 hashes: 62 of 62 copy-window runs (copies 0-90 % wrong, three streams at once, temperature 1, EOS and length endings) and
 611 decodes of the later offline runs, up to 125K-token prompts, none different ([research/](research/README.md)).
 
-The image is Mia's AI Lab's with these nine patches added (`tensorfold-dsv41:exl3-tp2-39b972fbfeab`). None is published,
+The image is Mia's AI Lab's with these eleven patches added (`tensorfold-dsv41:exl3-tp2-b520af02c741`). None is published,
 so the first `./start.sh` builds it on the head (two Zig builds, ~6 minutes) and copies it to the worker.
 
 <!-- MEASURED -->

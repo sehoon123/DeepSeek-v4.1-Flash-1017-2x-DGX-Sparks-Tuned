@@ -131,13 +131,19 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
 
 ## This recipe's changes
 
-- **sehoon123**: `zig/patches/0010`-`0018`, `scripts/prune_ablit_stock.py`, `scripts/ablit_conf_head.py` and its test, the
+- **sehoon123**: `zig/patches/0010`-`0019`, `scripts/prune_ablit_stock.py`, `scripts/ablit_conf_head.py` and its test, the
   changes to `start.sh`, `scripts/config.sh` and `scripts/prepare.sh`, and `research/` (Apache-2.0, see [`NOTICE`](NOTICE)),
   on Mia's AI Lab's recipe at [`31eea46`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/commit/31eea4608f8bb292a92e2f7a1db400e928620c78).
 - The confidence-head problem was found here from the drafter's own scores. Mia's AI Lab's recipe fixed it in the
   checkpoint (`scripts/ablit_stock_dtypes.py`) after the reports of **sunlinhua-dotcom** (issue #11, pull request #12) and
   **Ye1806431561** (issue #13, pull request #14) in its repository; this recipe keeps that fix and adds the file for a
   checkpoint whose stock shards are gone.
+- `zig/patches/0019` retunes the engine's paced L2 prefetch (BertholomusAI's port of TensorFold's `exl3/prefetch.py`
+  settings; the prefetch kernel and its sites are theirs) and gives the drafter's pass the same prefetches.
+- **`zig/patches/0020-upstream-dsml-calls.patch`** is commit
+  [`4803479e`](https://github.com/bertholomus/TensorFold/commit/4803479e8f074f8b95b5f0573ff8bf625efc2ded) of BertholomusAI's
+  TensorFold fork by **Manrique** ([@hashd1ve](https://github.com/hashd1ve)), merged there as pull request #25 after this
+  recipe's engine pin, carried unchanged with its header (Apache-2.0): DSML tool calls read from their own tags.
 - The copy windows widen the engine's own copy proposals; checking text copied from the context in one pass is the idea of
   prompt lookup decoding (Apoorv Saxena, 2023).
 

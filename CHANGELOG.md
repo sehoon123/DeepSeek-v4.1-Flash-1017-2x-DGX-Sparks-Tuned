@@ -5,6 +5,16 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **The L2 prefetcher retuned, and the drafter's pass prefetching too** (`zig/patches/0019`): the prefetcher's first wave
+  starts at once (the engine waited 3 us; +0.35 to +0.72 % decode at one stream in five windows, +0.6 / +1.0 % a stream
+  at two / four streams), the drafter's pass prefetches its blocks' weights like the target's layers (+0.37 %, 9 of 11
+  prompts faster, none slower), and the prefetcher's constants are settings (`TF_EXL3_L2_DELAY_NS`,
+  `TF_EXL3_L2_RATE_GBPS`, `TF_DS_PF_BLOCKS`, `TF_DS_PF_BUDGET_MIB`, each site's `TF_DS_PF_{A,B,C,E,H}_MIB`,
+  `TF_DS_DRAFT_PF=0`, `TF_DS_DPF_{A,B,C,H}_MIB`; the engine's budgets measured best and are the defaults). Token hashes
+  equal serial decoding's in every run. `start.sh` forwards `TF_EXL3_*` to both ranks.
+- **Upstream's DSML tool-call fix** (`zig/patches/0020`): TensorFold commit `4803479e` by Manrique (@hashd1ve), merged
+  upstream as #25 after this recipe's pin, carried as published: DSML calls are read from their own tags, so a
+  `<tool_call>` in the prose or a `</tool_call>` in an argument no longer drops or misroutes a call.
 - **Wide copy windows, on by default** (`zig/patches/0017`; `TF_DS_COPY_ROWS=16`, `TF_DS_COPY_SKIP=1` in
   `scripts/config.sh`, checked by `start.sh`): a stream running alone checks up to 16 copied tokens a round instead of 6,
   and skips the drafter's pass after a round that accepted its whole copy. Replies equal serial decoding (62 of 62 runs:
