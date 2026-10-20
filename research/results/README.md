@@ -8,6 +8,7 @@ Measured 2026-10-19 and 20 (Korea time) on the setup in [../README.md](../README
 | `decode-hotfix-final.json`, `decode-hcopy.json`, `decode-conffix.json` | sparkDash decode waves (temperature 0, 400 tokens, two of each): before, after 0017, after 0017 and the true confidence head (`bench/conc-probe-dsv.mjs`) |
 | `sampled-default-1.json`, `sampled-conffix.json` | the same at the server's sampling (temperature 1), 10:25 and 13:32 (`bench/conc-probe-sampled.mjs`) |
 | `decode-upstream-prompts.json`, `decode-steady-c1.json`, `idle-probe-1.json` | with upstream sparkDash's stream labels; six waves of prose at one stream; requests after two- and four-minute idle gaps |
+| `decode-recipe-tuned.json`, `decode-recipe-tuned-vs-conffix.txt` | the same bench on this recipe, run as our production after the switch (20:40), against `decode-conffix.json` |
 | `overnight-final.json`, `overnight-soak.txt` | the overnight run's start, its soak medians and the seven soak cycles |
 | `decode-table.txt` | the decode tables of the README and the notes (`calib/decode-table.py`) |
 | `exactness-audit.txt` | every offline result against its serial reference or hash (`calib/verify-exact.py`) |

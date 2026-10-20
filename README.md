@@ -56,16 +56,19 @@ The image is Mia's AI Lab's with these nine patches added (`tensorfold-dsv41:exl
 so the first `./start.sh` builds it on the head (two Zig builds, ~6 minutes) and copies it to the worker.
 
 <!-- MEASURED -->
-Measured on our pair (`ABLIT=1`, `CONTEXT=1048576`; sparkDash's decode bench, the streams together, median of two waves):
+Measured on our pair with this commit, run as our production (`ABLIT=1`, `CONTEXT=1048576`; sparkDash's decode bench, the
+streams together, median of two waves, 2026-10-20):
 
 | Decode, tok/s | 1 stream | 2 streams | 4 streams |
 | --- | --- | --- | --- |
-| Prose | 66.8 | 100.8 | 134.2 |
-| Code | 114.3 | 148.2 | 155.4 |
+| Prose | 67.0 | 100.7 | 134.6 |
+| Code | 114.1 | 150.1 | 158.3 |
 
-(2026-10-20, on Mia's AI Lab's recipe at `e65785cd` with these patches and the confidence head from a file: the same image
-and the same confidence-head values as this commit gives that install.) The stock checkpoint (`ABLIT=0`) was not measured
-with these changes; for it, see Mia's AI Lab's numbers under Status.
+The same as on our earlier base (Mia's AI Lab's recipe at `e65785cd` with these patches and the confidence head from a
+file: +0.6 % together, within run-to-run noise; `research/results/decode-recipe-tuned-vs-conffix.txt`), as it should be:
+the image and the confidence-head values are the same, and `tools/validate.py` found the replies equal to the earlier
+ones (8 of 8). The stock checkpoint (`ABLIT=0`) was not measured with these changes; for it, see Mia's AI Lab's numbers
+under Status.
 <!-- /MEASURED -->
 
 ## Status

@@ -45,6 +45,9 @@ pruned). Read every number as this pair's. The tools keep the original machines'
   round (it changes output bits).
 - **Exactness**: 856 offline results in 48 runs; 611 compared with a serial reference or its hash, none different
   (`results/exactness-audit.txt`).
+- **This recipe as our production** (2026-10-20 20:38): the same image and confidence-head values as before the switch,
+  replies equal to the saved ones (`tools/validate.py`, 8 of 8), sparkDash's six cells +0.6 % (noise;
+  `results/decode-recipe-tuned-vs-conffix.txt`).
 - **Against Mia's AI Lab's README** (prose, one stream: 66.8 here, 74.9 there with the stock checkpoint): not explained
   here. Their own measurement after the dtype fix has the overlay at 70.7 against stock's 75.1 on their prose bench, so part
   of the gap is likely the overlay's weights.

@@ -1,0 +1,226 @@
+{
+  "label": "recipe-tuned-883b5f8",
+  "started": "2026-10-20T11:40:46.231Z",
+  "reps": 2,
+  "types": [
+    "prose",
+    "code"
+  ],
+  "concs": [
+    1,
+    2,
+    4
+  ],
+  "maxTokens": 400,
+  "waves": [
+    {
+      "type": "prose",
+      "n": 1,
+      "ok": 1,
+      "failed": 0,
+      "aggregateTps": 66.98,
+      "perRequestMedianTps": 66.98,
+      "ttftMedianMs": 131,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "2c2506759d"
+      ],
+      "errors": []
+    },
+    {
+      "type": "prose",
+      "n": 1,
+      "ok": 1,
+      "failed": 0,
+      "aggregateTps": 67.04,
+      "perRequestMedianTps": 67.04,
+      "ttftMedianMs": 131,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "2c2506759d"
+      ],
+      "errors": []
+    },
+    {
+      "type": "prose",
+      "n": 2,
+      "ok": 2,
+      "failed": 0,
+      "aggregateTps": 100.69,
+      "perRequestMedianTps": 52.12,
+      "ttftMedianMs": 235,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "0423426320",
+        "96cf88fb66"
+      ],
+      "errors": []
+    },
+    {
+      "type": "prose",
+      "n": 2,
+      "ok": 2,
+      "failed": 0,
+      "aggregateTps": 100.64,
+      "perRequestMedianTps": 52.02,
+      "ttftMedianMs": 239,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "0423426320",
+        "96cf88fb66"
+      ],
+      "errors": []
+    },
+    {
+      "type": "prose",
+      "n": 4,
+      "ok": 4,
+      "failed": 0,
+      "aggregateTps": 134.5,
+      "perRequestMedianTps": 35.56,
+      "ttftMedianMs": 391,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "503f00a4aa",
+        "eea94b4323",
+        "ed879f8c6c",
+        "9c4f998995"
+      ],
+      "errors": []
+    },
+    {
+      "type": "prose",
+      "n": 4,
+      "ok": 4,
+      "failed": 0,
+      "aggregateTps": 134.62,
+      "perRequestMedianTps": 35.83,
+      "ttftMedianMs": 394,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "503f00a4aa",
+        "eea94b4323",
+        "ed879f8c6c",
+        "9c4f998995"
+      ],
+      "errors": []
+    },
+    {
+      "type": "code",
+      "n": 1,
+      "ok": 1,
+      "failed": 0,
+      "aggregateTps": 113.58,
+      "perRequestMedianTps": 113.58,
+      "ttftMedianMs": 198,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "cedf4978c6"
+      ],
+      "errors": []
+    },
+    {
+      "type": "code",
+      "n": 1,
+      "ok": 1,
+      "failed": 0,
+      "aggregateTps": 114.61,
+      "perRequestMedianTps": 114.61,
+      "ttftMedianMs": 200,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "cedf4978c6"
+      ],
+      "errors": []
+    },
+    {
+      "type": "code",
+      "n": 2,
+      "ok": 2,
+      "failed": 0,
+      "aggregateTps": 150.24,
+      "perRequestMedianTps": 77.07,
+      "ttftMedianMs": 308,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "cedf4978c6",
+        "593da0460d"
+      ],
+      "errors": []
+    },
+    {
+      "type": "code",
+      "n": 2,
+      "ok": 2,
+      "failed": 0,
+      "aggregateTps": 150,
+      "perRequestMedianTps": 76.94,
+      "ttftMedianMs": 292,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "cedf4978c6",
+        "593da0460d"
+      ],
+      "errors": []
+    },
+    {
+      "type": "code",
+      "n": 4,
+      "ok": 4,
+      "failed": 0,
+      "aggregateTps": 158.22,
+      "perRequestMedianTps": 43.91,
+      "ttftMedianMs": 533,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "cedf4978c6",
+        "593da0460d",
+        "6f5af05dee",
+        "1b3ebdb939"
+      ],
+      "errors": []
+    },
+    {
+      "type": "code",
+      "n": 4,
+      "ok": 4,
+      "failed": 0,
+      "aggregateTps": 158.4,
+      "perRequestMedianTps": 43.89,
+      "ttftMedianMs": 508,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "cedf4978c6",
+        "593da0460d",
+        "6f5af05dee",
+        "1b3ebdb939"
+      ],
+      "errors": []
+    }
+  ],
+  "passed": true
+}
