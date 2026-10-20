@@ -11,3 +11,6 @@ WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-
 # ABLIT=0                     # 1: matching Keys overlay on Mia EAQ 2.9 bpw; needs your HF token AND access below
 # HF_TOKEN=hf_...              # HF read token (or use hf auth login on the head); never commit your token
 # ABLIT=1 requires access: https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
+# This recipe's own settings (defaults in scripts/config.sh):
+# TF_DS_COPY_ROWS=16          # wide copy windows for a stream running alone (6: the engine's own); TF_DS_COPY_SKIP=1 skips the drafter after a fully accepted copy round
+# ABLIT_PRUNE_STOCK=0         # 1 (with ABLIT=1): remove the 24 stock shards the overlay replaced once it is verified (127 GB); ABLIT=0 downloads them again

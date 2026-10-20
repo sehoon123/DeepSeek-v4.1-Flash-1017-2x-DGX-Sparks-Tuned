@@ -1,3 +1,4 @@
+# Modified for sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned (see NOTICE): ABLIT_PRUNE_STOCK, the wide copy-window defaults and GHCR_IMAGE.
 # Shared settings for start.sh, stop.sh and scripts/*.sh. A setting's value comes from the first of these that sets it:
 #   1. the environment: `PORT=9000 ./start.sh`
 #   2. scripts/local.sh (this setup's own values, above all WORKER; sourced as bash), then ./.env (KEY=value lines, read,
@@ -50,6 +51,9 @@ export ABLIT="${ABLIT:-0}"
 ABLIT_ID=drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated
 ABLIT_REVISION="${ABLIT_REVISION:-0bdc2036113c4fdda38ef6005b3cbc0bc0dfa0f0}"
 ABLIT_SIDECAR=exl3_wo_b_l10_35_mia29.safetensors
+# Ablit-only disk profile: after the graft is verified, remove the 24 stock shards whose 104 wo_b tensors were replaced.
+# Unchanged shards remain hardlinked into the grafted checkpoint. Stock mode then needs those shards downloaded again.
+ABLIT_PRUNE_STOCK="${ABLIT_PRUNE_STOCK:-0}"
 ENGRAM_ID="${ENGRAM_ID:-deepseek-ai/DeepSeek-V4.1-Flash-1017}"
 _erev=""; [[ "$ENGRAM_ID" == deepseek-ai/DeepSeek-V4.1-Flash-1017 ]] && _erev=1bae0e1088993b9b82de08f59de5be5a34e42170
 ENGRAM_REVISION="${ENGRAM_REVISION-$_erev}"
@@ -85,7 +89,7 @@ IMAGE="${IMAGE:-tensorfold-dsv41:$TAG_BASE-$(image_hash)}"
 # A published image of these pins, if any (scripts/publish-image.sh pushes it; the registry handling is the GLM-5.3-Flash
 # recipe's): prepare.sh pulls $GHCR_IMAGE:<TAG_BASE>-<hash>, or, when IMAGE_TAG names that tag and IMAGE_DIGEST is set,
 # the pinned digest (a tag can be moved, a digest cannot), and builds locally when there is none. None is published yet.
-GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/miaai-lab/deepseek-v4.1-flash-1017-2x-dgx-sparks-tensorfold}"
+GHCR_IMAGE="${GHCR_IMAGE:-ghcr.io/sehoon123/deepseek-v4.1-flash-1017-2x-dgx-sparks-tuned}"
 IMAGE_TAG="${IMAGE_TAG:-}"
 IMAGE_DIGEST="${IMAGE_DIGEST:-}"
 prebuilt_image() {
@@ -117,6 +121,11 @@ TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-20}"
 DRAFTS="${DRAFTS:-1}"                  # the checkpoint's own DSpark draft blocks (exact: drafted replies equal plain)
+# Wide copy windows for a stream that runs alone (this recipe, zig/patches/0017). When a reply copies text from its prompt
+# or from itself, a round checks up to TF_DS_COPY_ROWS copied tokens instead of the engine's 6, and TF_DS_COPY_SKIP=1 skips
+# the drafter's pass after a round that accepted its whole copy. Replies do not change: the model still checks every token.
+# TF_DS_COPY_ROWS=6 TF_DS_COPY_SKIP=0 give the engine's own behaviour. Both ranks read them (start.sh checks them).
+export TF_DS_COPY_ROWS="${TF_DS_COPY_ROWS:-16}" TF_DS_COPY_SKIP="${TF_DS_COPY_SKIP:-1}"
 # The engine's settings as BertholomusAI's served two-node launch has them: CUDA graphs, the mixes' side stream, the
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
 # NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).
@@ -200,6 +209,8 @@ die()  { printf '%s[%s] ERROR:%s %s\n' "$(_c 2 '1;31')" "$(basename "$0")" "$(_c
 [[ -z "${HF_TOKEN:-}" ]] || export HF_TOKEN
 ablit_notice() {
   [[ "$ABLIT" =~ ^[01]$ ]] || die "ABLIT is 0 or 1, not $ABLIT"
+  [[ "$ABLIT_PRUNE_STOCK" =~ ^[01]$ ]] || die "ABLIT_PRUNE_STOCK is 0 or 1, not $ABLIT_PRUNE_STOCK"
+  [[ "$ABLIT" == 1 || "$ABLIT_PRUNE_STOCK" == 0 ]] || die "ABLIT_PRUNE_STOCK=1 requires ABLIT=1"
   [[ "$ABLIT" == 1 ]] || return 0
   case "$MODEL_ID" in
     Mia-AiLab/DeepSeek-V4.1-Flash-1017-EAQ-v1-2.9-bpw|Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw) ;;
@@ -225,12 +236,13 @@ engram_in_container() { echo "/hf/hub/models--${ENGRAM_ID//\//--}/snapshots/$(en
 served_in_container() { echo "/hf/$DATA_SUB/model"; }
 
 # What scripts/prepare.sh last left ready (start.sh runs it again when this line changes). "+stock-dtypes": an overlay
-# checkpoint prepared before scripts/ablit_stock_dtypes.py gets that step on the next start.
+# checkpoint prepared before scripts/ablit_stock_dtypes.py gets that step on the next start. "prune_stock" (this recipe):
+# ABLIT_PRUNE_STOCK.
 PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
   echo "model=$MODEL_ID@$(snapshot_rev) engram=$ENGRAM_ID@$(engram_rev) image=$(image_ident "$IMAGE") kit=$KIT_REF" \
        "w=$(worker_host 1) wengram=$WORKER_ENGRAM_DIR wcache=$WORKER_CACHE_DIR ablit=$ABLIT" \
-       "overlay=$( [[ "$ABLIT" == 1 ]] && echo "$ABLIT_ID@$ABLIT_REVISION+stock-dtypes" || echo none)"
+       "overlay=$( [[ "$ABLIT" == 1 ]] && echo "$ABLIT_ID@$ABLIT_REVISION+stock-dtypes" || echo none) prune_stock=$ABLIT_PRUNE_STOCK"
 }
 
 # ---------------------------------------------------------------- API key

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Modified for sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned (see NOTICE): ABLIT_PRUNE_STOCK=1 (an Ablit-only disk profile), and the drafter's
+# confidence head from a file when the overlay checkpoint's stock shards are gone.
 # Prepare two Sparks to serve Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw with TensorFold's native engine. The
 # checkpoint, the kit and the served folder land on this Spark; the worker reads them over NFS:
 #   1. preflight: docker and the GPU on both Sparks, key-based ssh, the link between them
@@ -102,23 +104,29 @@ log "Image $IMAGE identical on both Sparks"
 # ---------------------------------------------------------------- 3. the checkpoint and Engram's tables
 command -v hf >/dev/null || die "the Hugging Face CLI ('hf') is not installed on this Spark: pip install -U huggingface_hub"
 avail=$(df -B1 --output=avail "$HF_CACHE" | tail -1)
-# A checkpoint that is not in the cache under MODEL_ID's name and revision is downloaded whole (196 GiB). The cache is keyed by the
-# repo's name, so a copy downloaded under another name (the repo was renamed from ...-1017-EAQ-v1-2.9-bpw to ...-1017-EXL3-EAQ-v1-2.9-bpw) or
-# another revision does not count: refuse here when the disk cannot hold it, instead of filling the disk half way (README, Status)
-if [[ ! -f "$(model_cache_dir)/snapshots/$(snapshot_rev)/model.safetensors.index.json" ]]; then
-  (( avail > 215 * 1024 ** 3 )) || die "$MODEL_ID @ $(snapshot_rev | cut -c1-8) is not in $HF_CACHE/hub yet and only $(( avail / 1024 ** 3 )) GiB are free there; it is 196 GiB. If you already have this checkpoint under another repo name or revision, set MODEL_ID and MODEL_REVISION in scripts/local.sh to what $HF_CACHE/hub holds (scripts/local.sh.example); otherwise free the disk"
-  (( avail > 420 * 1024 ** 3 )) ||
-    warn "$(( avail / 1024 ** 3 )) GiB free in $HF_CACHE: the checkpoint (196 GiB), Engram's tables (203 GB) and rank 0's weight file (~106 GB) need ~505 GB"
-fi
-log "Downloading $MODEL_ID${MODEL_REVISION:+ @ ${MODEL_REVISION:0:8}} into $HF_CACHE/hub (196 GiB the first time; resumes)"
-if ! hf download "$MODEL_ID" ${MODEL_REVISION:+--revision "$MODEL_REVISION"} --cache-dir "$HF_CACHE/hub" >/dev/null; then
-  [[ -n "$MODEL_REVISION" && -f "$(model_cache_dir)/snapshots/$MODEL_REVISION/model.safetensors.index.json" ]] ||
-    die "$MODEL_ID: the download failed"
-  warn "$MODEL_ID: could not reach Hugging Face; using the snapshot already here"
+STOCK_PRUNE_MARKER="$DATA_DIR/stock-pruned.json"
+GRAFT_READY="$DATA_DIR/checkpoint/.ablit-ready"
+if [[ "$ABLIT" == 1 && "$ABLIT_PRUNE_STOCK" == 1 && -f "$GRAFT_READY" && -f "$STOCK_PRUNE_MARKER" ]]; then
+  log "Ablit-only checkpoint is ready and its replaced stock shards were pruned: not redownloading stock"
+else
+  # A checkpoint that is not in the cache under MODEL_ID's name and revision is downloaded whole (196 GiB). The cache is keyed by the
+  # repo's name, so a copy downloaded under another name (the repo was renamed from ...-1017-EAQ-v1-2.9-bpw to ...-1017-EXL3-EAQ-v1-2.9-bpw) or
+  # another revision does not count: refuse here when the disk cannot hold it, instead of filling the disk half way (README, Status)
+  if [[ ! -f "$(model_cache_dir)/snapshots/$(snapshot_rev)/model.safetensors.index.json" ]]; then
+    (( avail > 215 * 1024 ** 3 )) || die "$MODEL_ID @ $(snapshot_rev | cut -c1-8) is not in $HF_CACHE/hub yet and only $(( avail / 1024 ** 3 )) GiB are free there; it is 196 GiB. If you already have this checkpoint under another repo name or revision, set MODEL_ID and MODEL_REVISION in scripts/local.sh to what $HF_CACHE/hub holds (scripts/local.sh.example); otherwise free the disk"
+    (( avail > 420 * 1024 ** 3 )) || warn "$(( avail / 1024 ** 3 )) GiB free in $HF_CACHE: the checkpoint (196 GiB), Engram's tables (203 GB) and rank 0's weight file (~106 GB) need ~505 GB"
+  fi
+  log "Downloading $MODEL_ID${MODEL_REVISION:+ @ ${MODEL_REVISION:0:8}} into $HF_CACHE/hub (196 GiB the first time; resumes)"
+  if ! hf download "$MODEL_ID" ${MODEL_REVISION:+--revision "$MODEL_REVISION"} --cache-dir "$HF_CACHE/hub" >/dev/null; then
+    [[ -n "$MODEL_REVISION" && -f "$(model_cache_dir)/snapshots/$MODEL_REVISION/model.safetensors.index.json" ]] || die "$MODEL_ID: the download failed"
+    warn "$MODEL_ID: could not reach Hugging Face; using the snapshot already here"
+  fi
 fi
 SNAP="$(model_cache_dir)/snapshots/$(snapshot_rev)"
-[[ -f "$SNAP/model.safetensors.index.json" ]] || die "$MODEL_ID: no complete snapshot at $SNAP"
-log "Checkpoint: $SNAP ($(du -shL "$SNAP" | cut -f1))"
+STOCK_SNAP="$SNAP"
+[[ -f "$SNAP/model.safetensors.index.json" ]] || die "$MODEL_ID: no snapshot index at $SNAP"
+if [[ -f "$STOCK_PRUNE_MARKER" ]]; then log "Stock checkpoint: grafted shards intentionally pruned (Ablit-only mode)"
+else log "Checkpoint: $SNAP ($(du -shL "$SNAP" | cut -f1))"; fi
 shards=($ENGRAM_SHARDS)
 inc=(--include model.safetensors.index.json --include config.json); for f in "${shards[@]}"; do inc+=(--include "$f"); done
 log "Downloading Engram's tables: ${ENGRAM_SHARDS// /, } of $ENGRAM_ID${ENGRAM_REVISION:+ @ ${ENGRAM_REVISION:0:8}} (~203 GB the first time; resumes)"
@@ -160,6 +168,13 @@ if [[ "$ABLIT" == 1 ]]; then
     in_hf -v "$PWD/scripts/ablit_stock_dtypes.py:/ablit_stock_dtypes.py:ro" --entrypoint python3 "$IMAGE" \
       /ablit_stock_dtypes.py "/hf/hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)" "$1"
   }
+  # This recipe: every shard the overlay checkpoint names is still in the stock snapshot. ABLIT_PRUNE_STOCK=1 removes the 24
+  # it replaced, and then ablit_stock_dtypes.py has nothing to compare those with.
+  stock_complete() {
+    python3 -I -c 'import json, os, sys
+names = set(json.load(open(os.path.join(sys.argv[2], "model.safetensors.index.json")))["weight_map"].values())
+sys.exit(0 if all(os.path.exists(os.path.join(sys.argv[1], n)) for n in names) else 1)' "$STOCK_SNAP" "$1"
+  }
   mkdir -p "$DATA_DIR"
   if [[ ! -f "$DATA_DIR/checkpoint/.ablit-ready" ]]; then
     log "Applying the Mia EAQ 2.9 bpw overlay in $DATA_DIR/checkpoint (stock stays intact; changed shards need extra disk)"
@@ -173,16 +188,34 @@ if [[ "$ABLIT" == 1 ]]; then
     python3 -I -c 'import json,sys; m=json.load(open(sys.argv[1])); assert m["n_edited"] == 104, "expected 104 Mia overlay tensors"' \
       "$DATA_DIR/checkpoint.new/ABLIT_META.json" || die "Mia overlay did not replace all 104 tensors"
     stock_dtypes "/hf/$DATA_SUB/checkpoint.new" || die "could not give the overlay checkpoint its stock dtypes back"
+    rm -f "$DATA_DIR/conf_head_f32.bin"   # this recipe: a confidence-head file from before is stale now
     touch "$DATA_DIR/checkpoint.new/.ablit-ready"
     rm -rf "$DATA_DIR/checkpoint"
     mv "$DATA_DIR/checkpoint.new" "$DATA_DIR/checkpoint"
     rm -rf "$DATA_DIR/stock.new"
   else
     log "Matching Mia overlay checkpoint: ready"
-    # prepared before the dtype step: a tensor given back changes the weight files' index, so step 5 and 7 rebuild them
-    stock_dtypes "/hf/$DATA_SUB/checkpoint" || die "could not give the overlay checkpoint its stock dtypes back"
+    if stock_complete "$DATA_DIR/checkpoint"; then
+      # prepared before the dtype step: a tensor given back changes the weight files' index, so step 5 and 7 rebuild them
+      stock_dtypes "/hf/$DATA_SUB/checkpoint" || die "could not give the overlay checkpoint its stock dtypes back"
+      rm -f "$DATA_DIR/conf_head_f32.bin"
+    else
+      # This recipe: the stock shards this checkpoint replaced are gone (ABLIT_PRUNE_STOCK=1), so there is nothing to compare
+      # with. Pruned after the dtype step, the checkpoint already holds stock's dtypes; pruned before it (or with the stock
+      # shards deleted by hand), it keeps the F32 head, and both ranks read the head from a file instead
+      # (scripts/ablit_conf_head.py writes it, start.sh passes TF_DS_CONF_FILE, zig/patches/0018 loads it). Neither the
+      # checkpoint nor the weight files change.
+      log "The overlay checkpoint's stock shards are gone: checking its confidence head here instead"
+      python3 -I scripts/ablit_conf_head.py "$DATA_DIR/checkpoint" "$DATA_DIR/conf_head_f32.bin" ||
+        die "the overlay checkpoint's stock shards are gone and its confidence head could not be checked or written to a file"
+    fi
   fi
   SNAP="$DATA_DIR/checkpoint"
+  if [[ "$ABLIT_PRUNE_STOCK" == 1 ]]; then
+    log "Ablit-only mode: pruning only the stock shards replaced by the verified 104-tensor graft"
+    python3 scripts/prune_ablit_stock.py "$STOCK_SNAP" "$SNAP" "$STOCK_PRUNE_MARKER" ||
+      die "the verified graft is intact, but pruning its replaced stock shards failed"
+  fi
 fi
 
 # ---------------------------------------------------------------- 4. the kit
@@ -251,10 +284,11 @@ rm -rf "$VIEW" && mv "$VIEW.new" "$VIEW"
 log "Served folder: $VIEW (the checkpoint linked, the recipe's chat template)"
 
 # ---------------------------------------------------------------- 6. the worker's NFS volume
+manifest_roots=("hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)" "$DATA_SUB" "$KIT_SUB/kit")
+[[ "$ABLIT" == 1 && "$ABLIT_PRUNE_STOCK" == 1 && -f "$STOCK_PRUNE_MARKER" ]] ||
+  manifest_roots=("hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)" "${manifest_roots[@]}")
 manifest() {  # the files a rank reads, with their sizes, as paths under HF_CACHE
-  (cd "$HF_CACHE" && find -L "hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)" \
-     "hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)" "$DATA_SUB" "$KIT_SUB/kit" \
-     -path '*/.git' -prune -o -type f -printf '%p %s\n' | LC_ALL=C sort)
+  (cd "$HF_CACHE" && find -L "${manifest_roots[@]}" -path '*/.git' -prune -o -type f -printf '%p %s\n' | LC_ALL=C sort)
 }
 want=$(manifest)
 ensure_nfs_volume 1
@@ -263,7 +297,8 @@ if ! out=$(worker_nfs 1 true 2>&1); then
 $(tail -4 <<<"$out" | sed 's/^/    /')
     This Spark must export HF_CACHE (as $NFS_PATH) read-only to that worker's address on its link (README: NFS)"
 fi
-have=$(worker 1 "docker run --rm --network none -v '$NFS_VOLUME:/hf:ro' -w /hf --entrypoint find '$BASE_IMAGE' -L 'hub/models--${MODEL_ID//\//--}/snapshots/$(snapshot_rev)' 'hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)' '$DATA_SUB' '$KIT_SUB/kit' -path '*/.git' -prune -o -type f -printf '%p %s\n'" 2>/dev/null | LC_ALL=C sort || true)
+roots_q=$(printf "'%s' " "${manifest_roots[@]}")
+have=$(worker 1 "docker run --rm --network none -v '$NFS_VOLUME:/hf:ro' -w /hf --entrypoint find '$BASE_IMAGE' -L $roots_q -path '*/.git' -prune -o -type f -printf '%p %s\\n'" 2>/dev/null | LC_ALL=C sort || true)
 [[ "$have" == "$want" ]] || { diff <(printf '%s\n' "$want") <(printf '%s\n' "$have") | head -10 >&2
   die "$(worker_host 1) does not see every file over NFS ($NFS_VOLUME)"; }
 log "Worker ($(worker_host 1)) reads the checkpoint, the kit and rank 0's files over NFS"

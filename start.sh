@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Modified for sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned (see NOTICE): the wide copy-window checks, the confidence head from a file, the TF_DS_*
+# checks, a SIGTERM that always reaches ./stop.sh, --fix-k for rank 1.
 # Serve Mia-AiLab/DeepSeek-V4.1-Flash-1017-EXL3-EAQ-v1-2.9-bpw (an EXL3 quantization of DeepSeek-V4.1-Flash-1017) on two DGX
 # Sparks with TensorFold's native engine, end to end: runs scripts/prepare.sh when the image, the checkpoint, the weight
 # files, the kit or the worker's NFS volume are not ready yet (the first run, or after the patches change), starts rank 1
@@ -28,7 +30,8 @@
 #   setup    PREPARE (auto | 1 | 0), WAIT_TIMEOUT (seconds, default 2400), DRY_RUN=1
 #   memory   MIN_AVAIL_GIB (refuse to start below it), MIN_AVAIL_WAIT_S (re-read for this long first), MEMGUARD_GIB (kill a rank's container below it), HEAD_NFS_SERVER,
 #            HEAD_NFS_VOLUME (rank 0 reads the checkpoint over NFS through a docker volume)
-#   ranks    every TENSORFOLD_* and TF_DS_* variable you set goes to both ranks
+#   ranks    every TENSORFOLD_* and TF_DS_* variable you set goes to both ranks (this recipe sets TF_DS_COPY_ROWS=16 and
+#            TF_DS_COPY_SKIP=1 unless you do: wide copy windows, scripts/config.sh)
 #            every other exported NCCL_* variable too (values of A-Z a-z 0-9 _ . , : = / - only), RANK1_PROFILE=1|2: rank 1's --profile
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
@@ -57,6 +60,20 @@ for v in CONTEXT PARALLEL MAX_TOKENS TOP_K; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] ||
 [[ "$PREFILL_INTERLEAVE_MS" =~ ^[0-9]+$ ]] && (( PREFILL_INTERLEAVE_MS <= 5000 )) || die "PREFILL_INTERLEAVE_MS is 0 to 5000 milliseconds, not $PREFILL_INTERLEAVE_MS"
 for v in THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_KEY; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "${RANK1_PROFILE:-}" =~ ^[012]?$ ]] || die "RANK1_PROFILE is empty, 0, 1 or 2, not '${RANK1_PROFILE:-}'"
+[[ -z "${TF_DS_FIX_K:-}" || "${TF_DS_FIX_K}" =~ ^[0-5]$ ]] || die "TF_DS_FIX_K is empty or 0 to 5, not '${TF_DS_FIX_K:-}'"
+[[ -z "${TF_DS_MIN_K:-}" || "${TF_DS_MIN_K}" =~ ^[0-5]$ ]] || die "TF_DS_MIN_K is empty or 0 to 5, not '${TF_DS_MIN_K:-}'"
+[[ -z "${TF_DS_CONF_BIAS:-}" || "${TF_DS_CONF_BIAS}" =~ ^-?[0-9]+([.][0-9]+)?$ ]] || die "TF_DS_CONF_BIAS is empty or a finite decimal, not '${TF_DS_CONF_BIAS:-}'"
+[[ -z "${TF_DS_ADAPT_PERIOD:-}" || "${TF_DS_ADAPT_PERIOD}" =~ ^([2-9]|[1-5][0-9]|6[0-4])$ ]] || die "TF_DS_ADAPT_PERIOD is empty or 2 to 64"
+[[ -z "${TF_DS_ADAPT_ACCEPT:-}" || "${TF_DS_ADAPT_ACCEPT}" =~ ^[1-5]$ ]] || die "TF_DS_ADAPT_ACCEPT is empty or 1 to 5"
+[[ -z "${TF_DS_ADAPT_MAX_LIVE:-}" || "${TF_DS_ADAPT_MAX_LIVE}" =~ ^[1-4]$ ]] || die "TF_DS_ADAPT_MAX_LIVE is empty or 1 to 4"
+[[ -z "${TF_DS_ADAPT_MAX_PERIOD:-}" || "${TF_DS_ADAPT_MAX_PERIOD}" =~ ^([2-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] || die "TF_DS_ADAPT_MAX_PERIOD is empty or 2 to 128"
+[[ -z "${TF_DS_ROUTE_WARMUP:-}" || "${TF_DS_ROUTE_WARMUP}" =~ ^([2-9]|[1-5][0-9]|6[0-4])$ ]] || die "TF_DS_ROUTE_WARMUP is empty or 2 to 64"
+[[ -z "${TF_DS_ROUTE_THRESHOLD:-}" || "${TF_DS_ROUTE_THRESHOLD}" =~ ^[0-5]([.][0-9]+)?$ ]] || die "TF_DS_ROUTE_THRESHOLD is empty or 0 to 5"
+[[ -z "${TF_DS_PROBE_SAMPLES:-}" || "${TF_DS_PROBE_SAMPLES}" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] || die "TF_DS_PROBE_SAMPLES is empty or 1 to 64"
+[[ -z "${TF_DS_PROBE_PERIOD:-}" || "${TF_DS_PROBE_PERIOD}" =~ ^([2-9]|[1-5][0-9]|6[0-4])$ ]] || die "TF_DS_PROBE_PERIOD is empty or 2 to 64"
+[[ -z "${TF_DS_PROBE_THRESHOLD:-}" || "${TF_DS_PROBE_THRESHOLD}" =~ ^[0-5]([.][0-9]+)?$ ]] || die "TF_DS_PROBE_THRESHOLD is empty or 0 to 5"
+[[ "$TF_DS_COPY_ROWS" =~ ^[0-9]+$ ]] && (( TF_DS_COPY_ROWS >= 6 && TF_DS_COPY_ROWS <= 16 )) || die "TF_DS_COPY_ROWS is 6 (the engine's own copy windows) to 16, not '$TF_DS_COPY_ROWS'"
+[[ "$TF_DS_COPY_SKIP" =~ ^[01]$ ]] || die "TF_DS_COPY_SKIP is 0 or 1, not '$TF_DS_COPY_SKIP'"
 nccl_extra_collect
 check_workers
 
@@ -76,7 +93,7 @@ B=$'\033[1m'; M=$'\033[1;35m'; G=$'\033[1;32m'; D=$'\033[2m'; R=$'\033[0m'
 source ./scripts/banner.sh
 echo
 banner
-printf '\n%s  Mia'"'"'s TensorFold Start Script%s\n' "$M" "$R"
+printf '\n%s  Mia'"'"'s TensorFold Start Script, tuned%s\n' "$M" "$R"
 printf '%s  %s · 2 x DGX Spark · %s at once · %s-token window · EXL3 2.9 bpw · port %s%s\n\n' "$D" "$MODEL_ID" "$PARALLEL" "$CONTEXT" "$PORT" "$R"
 STEPS=5
 step() { printf '%s[%s/%s]%s %s%s%s\n' "$M" "$1" "$STEPS" "$R" "$B" "$2" "$R"; }
@@ -176,8 +193,10 @@ fi
 # SIGTERM run ./stop.sh. Note the supervisor restarts a start that was killed by memguard too; give it a RestartSec.
 # (From MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold's start.sh, for the one worker here.)
 foreground() {
-  local watch w code
-  trap './stop.sh; exit 130' INT TERM
+  local watch="" logs="" w code
+  # Bash defers a trap while a foreground external `docker logs -f` is running. Follow logs in the background and wait
+  # with Bash's interruptible builtin, so systemd SIGTERM always reaches ./stop.sh and both real rank containers.
+  trap 'trap - INT TERM; kill "${watch:-}" "${logs:-}" 2>/dev/null || true; ./stop.sh; exit 130' INT TERM
   ( exec 8>&-                                        # not holding start.sh's lock once start.sh has exited
     while sleep 30; do
       running_here || exit 0
@@ -188,7 +207,9 @@ foreground() {
       exit 1
     done ) &
   watch=$!
-  docker logs -f "$CONTAINER_NAME" || true
+  docker logs -f "$CONTAINER_NAME" &
+  logs=$!
+  wait "$logs" || true
   kill "$watch" 2>/dev/null || true
   w=0; wait "$watch" || w=$?
   code=$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 1)
@@ -196,6 +217,13 @@ foreground() {
   worker 1 "docker stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME'" >/dev/null 2>&1 || true
   exit "$code"
 }
+# This recipe: on an overlay checkpoint whose stock shards are gone, scripts/prepare.sh leaves the drafter's confidence head
+# as fp32 in conf_head_f32.bin (the checkpoint keeps it as F32, which this engine reads as F16), and both ranks load it in
+# its place (zig/patches/0018). A TF_DS_CONF_FILE of your own wins.
+if [[ "$ABLIT" == 1 && -z "${TF_DS_CONF_FILE:-}" && -s "$DATA_DIR/conf_head_f32.bin" ]]; then
+  export TF_DS_CONF_FILE="/hf/$DATA_SUB/conf_head_f32.bin"
+  log "The drafter's confidence head is read from $DATA_DIR/conf_head_f32.bin (TF_DS_CONF_FILE: the checkpoint holds it as F32)"
+fi
 # What both ranks' engine reads, as BertholomusAI's two-node launch has it (HF_CACHE at /hf: this Spark's own, the worker's over NFS)
 ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "HF_HUB_OFFLINE=$HF_HUB_OFFLINE")
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
@@ -210,6 +238,8 @@ KIT=/hf/$KIT_SUB/kit
 # context, and its streams rank 0's (TF_DS_STREAMS): with other values the two ranks wait on each other.
 FOLLOW="--pool $CONTEXT --streams $PARALLEL --drafts $DRAFTS --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
 [[ -z "$ROUND_ROWS" ]] || FOLLOW+=" --round-rows $ROUND_ROWS"
+# Rank 0 reads TF_DS_FIX_K; the follower takes the matching CLI flag. A mismatch would benchmark a different policy.
+[[ -z "${TF_DS_FIX_K:-}" ]] || FOLLOW+=" --fix-k $TF_DS_FIX_K"
 # RANK1_PROFILE=1|2: rank 1's own profile (--profile; 2 adds prefill_phases_ms), AGGREGATED over the run and printed to its
 # log only when rank 0 goes away first (docker stop rank 0, read rank 1's log, then ./stop.sh). It synchronizes the stream
 # at every chunk and round: for attribution only, never for speed figures. Empty or 0: off.
