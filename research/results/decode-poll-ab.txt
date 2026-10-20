@@ -1,0 +1,11 @@
+sparkDash decode bench on the served pair (image b520af02c741), the dashboard container's GPU polling every 2 s (its
+default: POLL_INTERVAL_GPU / POLL_INTERVAL_BANDWIDTH 2000 ms, ~2 nvidia-smi runs a second on the head and ~1.6 on the worker
+over ssh) against every 10 s (docker-compose.override.yml), A/B/A/B; medians of two waves a cell.
+
+polling              prose/1   prose/2   prose/4    code/1    code/2    code/4
+2 s (a, 02:35)         68.09    101.81    136.28    114.74    151.25    159.09
+10 s (a, 02:39)        68.34    102.58    137.14    115.64    152.20    159.69
+2 s (b, 02:41)         67.70    101.52    135.77    114.66    149.60    155.30
+10 s (b, 02:43)        68.09    102.31    137.16    115.95    152.52    159.83
+10 s vs 2 s           +0.47%    +0.77%    +0.83%    +0.96%    +1.29%    +1.63%   geomean +0.99%
+10 s vs 10-20 AM      +6.07%   +11.55%   +10.41%   +21.30%    +7.99%    +3.94%   geomean +10.07%  (the morning's hotfix image)

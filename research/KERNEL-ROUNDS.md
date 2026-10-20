@@ -67,9 +67,12 @@ environment (`TF_EXL3_L2_DELAY_NS=3000 TF_DS_DRAFT_PF=0`), back to back: prose +
 
 ## The serving environment
 
-- **Polling `nvidia-smi` costs decode.** A dashboard on the head ran four `nvidia-smi` queries in a loop (~2 a second,
-  including `dmon -c 1 -d 1`). Pausing it (SIGSTOP) during a decode bench: +0.9 % prose and code, both reps; a second
-  identical loop beside it: -7.2 to -7.6 %. Keep GPU monitoring sparse while serving, or off.
+- **Polling `nvidia-smi` costs decode.** A dashboard on the head ran four `nvidia-smi` queries every 2 s (~2 runs a
+  second, including `dmon -c 1 -d 1`) on the head and, over ssh, ~1.6 a second on the worker. Pausing it (SIGSTOP)
+  during a decode bench: +0.9 % prose and code, both reps; a second identical loop beside it: -7.2 to -7.6 %. Polling
+  every 10 s instead (its `POLL_INTERVAL_GPU` / `POLL_INTERVAL_BANDWIDTH`), A/B/A/B on the served pair: +0.5 / +0.8 /
+  +0.8 % prose and +1.0 / +1.3 / +1.6 % code at 1 / 2 / 4 streams, geomean +1.0 % (`results/decode-poll-ab.txt`).
+  Per-process ioctl counts showed no other GPU poller. Keep GPU monitoring sparse while serving, or off.
 - **Plain CPU load costs little.** 18 busy loops on the head's 20 cores: -1.1 % prose, -1.4 % code. Measurement noise of
   0.8-1 % in one sweep came from short commands on the head (`top`, `perf`, `nvidia-smi`) landing in two prompts; with the
   head left alone the same configuration repeated within 0.01 tok/s.

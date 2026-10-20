@@ -77,8 +77,9 @@ streams together, median of two waves, 2026-10-21):
 Against the same image with the previous prefetch behaviour set through the environment (`TF_EXL3_L2_DELAY_NS=3000
 TF_DS_DRAFT_PF=0`), run just before: prose +2.0 / +0.9 / +0.1 %, code +1.5 / +0.8 / +0.6 % (geomean +1.0 %;
 `research/results/decode-0019-ab.txt`). `tools/validate.py` found the replies equal to the earlier image's (8 of 8). A
-dashboard polling `nvidia-smi` on the head ran throughout, as in the earlier measurements; pausing it is worth another
-~0.9 % (`research/KERNEL-ROUNDS.md`). The stock checkpoint (`ABLIT=0`) was not measured with these changes; for it, see
+dashboard polling `nvidia-smi` every 2 s on both Sparks ran throughout, as in the earlier measurements. With it polling
+every 10 s: prose 68.2 / 102.4 / 137.2, code 115.8 / 152.4 / 159.8 (+1.0 %, A/B/A/B; `research/results/decode-poll-ab.txt`):
+every `nvidia-smi` run stalls the served decode, so keep GPU monitoring sparse while serving. The stock checkpoint (`ABLIT=0`) was not measured with these changes; for it, see
 Mia's AI Lab's numbers under Status.
 <!-- /MEASURED -->
 
