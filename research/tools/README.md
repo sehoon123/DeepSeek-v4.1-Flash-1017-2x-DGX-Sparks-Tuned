@@ -21,6 +21,10 @@ local sparkDash checkout (not included). Nothing here is needed to run the recip
 - Kernels and memory: `nsys-analyze.py`, `nsys-cover2.py` (time covered by DRAM-streaming kernels), `nsys-moe-grid.py`,
   `nsys-layer.py`, `nsys-draftpass.py`, `ckpt-bytes.py`, `ckpt-accounting.py`, `clock-compare.py`, `clock-layers.py`.
 - RDMA: `latprobe.sh` (`ib_write_lat` on both rails), `rail-compare.py`.
+- `bench/bwmax.cu`: the GPU's read ceiling (grid-stride and blocked reads, three load flavours, an MoE-like layer pattern);
+  `bench/pingpong.cu`: the GPU <-> CPU round trip through pinned host memory (the gather's doorbell and flag path).
+  Build either with the image's nvcc: `nvcc -O2 -arch=sm_121 -std=c++17`.
+- `calib/spec-PS.txt`, `calib/spec-DP.txt`: the harness specs of the prefetch-site and drafter-prefetch sweeps.
 - `hcopy/`: the copy-window exactness runs (oracle copies with a share of wrong tokens, against serial decoding).
 - `profile/`: the lane profiler run (`--profile`) on sparkDash's prompts.
 - `bench/`: sparkDash-based decode and prefill probes (`conc-probe-dsv.mjs`, `conc-probe-sampled.mjs`, `idle-probe.mjs`,

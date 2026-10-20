@@ -4,3 +4,8 @@ GB10 read bandwidth, tools/bench/bwprobe.py (torch in the engine image), 2026-10
   reads in chunks of 2 / 8 / 32 / 128 MiB: 96 / 143 / 165 / 175 GB/s
 A decode round's MoE phase moves ~48.6 MiB a rank a layer at one row (6 routed experts' halves and the shared expert's
 half; results/checkpoint-bytes.txt) in ~223 us (results/layer-timeline-k0.txt): ~228 GB/s, at that ceiling.
+
+Correction (2026-10-20 evening, tools/bench/bwmax.cu): torch's copy is not the ceiling. Plain CUDA reads of 768 MiB reach
+263.4 GB/s (96.5 % of 273: 16-byte ld.global.nc.L1::no_allocate loads, 256 threads, 4 blocks a SM; __ldg grid-stride
+260.5), and an MoE-like pattern (40 x 48.7 MiB, one launch a layer) 244-249 GB/s, ~205 us a layer against the MoE phase's
+~223 us. The MoE phase is within ~8 % of what the hardware reads, not at it (KERNEL-ROUNDS.md).

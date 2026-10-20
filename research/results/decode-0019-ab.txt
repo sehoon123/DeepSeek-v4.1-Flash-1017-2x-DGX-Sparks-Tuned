@@ -1,0 +1,13 @@
+sparkDash decode bench on the served pair (conc-probe, temperature 0, two waves a cell, the streams' aggregate tok/s), image
+tensorfold-dsv41:exl3-tp2-b520af02c741 (patches 0019, 0020); 'old' is the same image with the previous engine's prefetch
+behaviour set through the environment. Medians of the two waves; old's code/2 had one stalled wave (128.07), its other is used.
+
+run                                                          prose/1   prose/2   prose/4    code/1    code/2    code/4
+new-1 (02:09, first start after the build)                     67.86    101.56    136.22    114.42    148.94    155.94
+old (02:13, TF_EXL3_L2_DELAY_NS=3000 TF_DS_DRAFT_PF=0)         66.69    100.75    135.50    113.59    149.92    157.86
+new-2 (02:22)                                                  68.00    101.67    135.69    115.28    151.06    158.83
+new-1 vs old                                                  +1.75%    +0.81%    +0.53%    +0.73%    -0.65%    -1.21%   geomean +0.32%
+new-2 vs old                                                  +1.96%    +0.92%    +0.14%    +1.48%    +0.76%    +0.61%   geomean +0.98%
+
+new-2 and old ran back to back after identical restarts; new-1 ran right after the image build and its copy to the
+worker (docker load of the whole image, writeback still running), which we take to explain its low code/2 and code/4.

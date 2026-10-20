@@ -1,0 +1,10 @@
+runs 16/16; all_equal 16/16; tokens [4389]; rounds [1337, 1338, 1339]
+base reps [83.12, 83.22] mean 83.17 tok/s; rep spread median 0.09 tok/s (0.11 %)
+  pf-base   reps  83.12  83.22  mean  83.17   +0.00 %  tie
+  pf-r260   reps  83.20  82.92  mean  83.06   -0.13 %  tie
+  pf-r0     reps  83.09  82.87  mean  82.98   -0.23 %  LOSS
+  pf-d0     reps  83.39  83.54  mean  83.47   +0.35 %  WIN
+  pf-b2     reps  82.58  82.50  mean  82.54   -0.76 %  LOSS
+  pf-bud24  reps  82.97  82.94  mean  82.95   -0.26 %  LOSS
+  pf-r200   reps  83.05  83.08  mean  83.06   -0.13 %  LOSS
+  pf-off    reps  79.47  79.41  mean  79.44   -4.48 %  LOSS

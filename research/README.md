@@ -14,6 +14,7 @@ pruned). Read every number as this pair's. The tools keep the original machines'
 | --- | --- |
 | [FINDINGS.md](FINDINGS.md) | the notebook of 10-20: profiling, the confidence-head diagnosis, copy windows, depth-policy ceilings, the round's kernels, bandwidth and RDMA; corrections are marked where they were made |
 | [OVERNIGHT-OPTIMIZATION.md](OVERNIGHT-OPTIMIZATION.md) | the overnight search over draft-depth policies, run while the confidence head was still misread (its patches 0005-0011 are 0010-0016 here) |
+| [KERNEL-ROUNDS.md](KERNEL-ROUNDS.md) | 10-20 / 10-21: the read ceiling (263 GB/s), the L2 prefetcher, the tensor-parallel gather, each prefetch site, the drafter's prefetch (`zig/patches/0019`), and the serving environment (GPU polling, CPU load) |
 | [GITHUB-COMPARISON.md](GITHUB-COMPARISON.md) | this pair against the figures other DeepSeek-V4.1-Flash recipes publish (10-19) |
 | [results/](results/README.md) | data, and the outputs the notes quote |
 | [tools/](tools/README.md) | the offline harness and the analysis scripts |
@@ -30,10 +31,16 @@ pruned). Read every number as this pair's. The tools keep the original machines'
 - **Copy windows (0017)**: 62 of 62 runs equal to serial decoding; a file copied from the prompt 123.6 → 204.1 tok/s
   verbatim and 111.0 → 141.1 with edits; sparkDash's six cells +1.2 % (`results/decode-table.txt`).
 - **Where a round goes** (one stream at a fixed depth of 3, 38.85 ms; `results/coverage.txt`): a DRAM-streaming kernel
-  (MoE, linear layers, heads, drafter) runs during 33.2 ms of it (85 %), at the read ceiling (MoE ~228 GB/s; torch's own
-  1 GiB read 226 GB/s, `results/bandwidth.txt`). The other 5.7 ms are latency-bound: the 76 tensor-parallel all-gathers of
+  (MoE, linear layers, heads, drafter) runs during 33.2 ms of it (85 %), near the read ceiling (MoE ~228 GB/s; a plain
+  CUDA read reaches 263 GB/s and an MoE-like pattern 244-249, `KERNEL-ROUNDS.md`; the 226 GB/s first given here was
+  torch's 1 GiB copy, not the ceiling). The other 5.7 ms are latency-bound: the 76 tensor-parallel all-gathers of
   ~24 µs each (their wire floor is ~6.6 µs, `results/rdma-latency.txt`) and the small kernels `coverage.txt` lists (hc
   mixes, attention's parts); the GPU idles 0.45 ms.
+- **Kernel rounds** (`KERNEL-ROUNDS.md`): the round reads ~8.8 GB a rank at the served depth, 33.5 ms at the read
+  ceiling against 38.85 ms measured, so kernels and gaps hold at most ~13 %. The prefetcher's first wave starting at once
+  and the drafter's pass prefetching its blocks (`zig/patches/0019`) gave +1.0 % served (six sparkDash cells, geomean);
+  every site's budget, pacing and block count were swept and the engine's are the best measured. A dashboard polling
+  `nvidia-smi` twice a second cost the served decode 0.9 %.
 - **The depth rule is at its ceiling**: richer predictors of how many drafts land gain at most +0.3 % on held-out prompts,
   where an oracle would gain +16-17 % (`results/policy-ceiling.txt`).
 - **The drafter decides the rest**: a point of landing rate is worth ~2.4 %; +10 % needs +4.1 points on sparkDash's prompts

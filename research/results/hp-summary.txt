@@ -1,0 +1,6 @@
+bench floor (idle, 1 / 4 rows): us_gather 8.4-10.9 / 10.9-12.2; host post 0.25, flag 0.03, sendc p50 3.75 / 5.50 us, loop 29 ns
+run        tok/s eq | GPU: stage deliv copy | host: post flag sendc(p50) spread loop | d1+d5 = deliv-post-flag-[sendc .. sendc/2]
+hp-k0off   39.07 T |  2.85  9.55  1.60 | 0.24 0.03  4.50 ( 5.06) 0.60   23ns |  4.78 ..  7.03 us  (ranks: gpu 2 host 2, big 108)
+hp-k0on    41.50 T |  2.91 12.37  3.00 | 0.22 0.03  4.75 ( 5.27) 0.64   28ns |  7.36 ..  9.73 us  (ranks: gpu 2 host 2, big 108)
+hp-pol     83.14 T |  3.47 16.55  3.50 | 0.24 0.03  7.50 ( 8.18) 0.72   27ns |  8.78 .. 12.53 us  (ranks: gpu 2 host 2, big 3990)
+hp-pold0   83.52 T |  4.76 16.41  3.48 | 0.26 0.03  7.75 ( 8.33) 0.79   24ns |  8.36 .. 12.23 us  (ranks: gpu 2 host 2, big 3988)

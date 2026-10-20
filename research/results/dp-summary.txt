@@ -1,0 +1,11 @@
+runDP (2026-10-21 01:36-01:48): the drafter pass's own L2 prefetch (dev build: off unless TF_DS_DRAFT_PF=1)
+runs 6; all_equal 6/6; tokens [4400]
+speed = median over the 11 prompts of (reference s/token / run s/token) - 1; reference = the median of the runs dp-off-1, dp-off-2, dp-off-3
+run          env (besides TF_DS_CONF_FILE)                par   tok/s rounds    speed
+dp-off-1     TF_EXL3_L2_DELAY_NS=0                          1   83.79   1339   +0.00%
+dp-on-1      TF_EXL3_L2_DELAY_NS=0 TF_DS_DRAFT_PF=1         1   84.03   1338   +0.37%
+dp-off-2     TF_EXL3_L2_DELAY_NS=0                          1   83.78   1338   +0.00%
+dp-on-2      TF_EXL3_L2_DELAY_NS=0 TF_DS_DRAFT_PF=1         1   84.11   1338   +0.34%
+dp-on-3      TF_EXL3_L2_DELAY_NS=0 TF_DS_DRAFT_PF=1         1   84.14   1339   +0.38%
+dp-off-3     TF_EXL3_L2_DELAY_NS=0                          1   83.79   1338   +0.00%
+4 streams (a stream's tok/s): off 37.55, on 37.73 (+0.47 %), all_equal True

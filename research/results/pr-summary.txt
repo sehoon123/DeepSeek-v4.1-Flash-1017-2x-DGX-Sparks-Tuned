@@ -1,0 +1,23 @@
+runs 11/11; all_equal 11/11; tokens [4389]
+run             tok/s rounds | gathers n/round | stage r0/r1 | peer r0/r1 -> one-way  skew(r1 early by) | copy-out r0/r1 | chain total
+pr-base-1       83.20   1338 |  125548    93.8 | 3.43/3.33   | 14.87/18.51 ->  16.69  +1.82 | 3.44/3.04 |  23.31 us
+pr-base-2       83.01   1339 |  125642    93.8 | 3.43/3.37   | 15.15/18.37 ->  16.76  +1.61 | 3.53/3.25 |  23.55 us
+pr-noprobe-1    83.27   1338 | (probe off)
+pr-off-1        79.41   1337 |  125456    93.8 | 3.33/3.29   | 12.81/14.26 ->  13.54  +0.72 | 1.94/2.03 |  18.83 us
+pr-off-2        79.20   1337 |  125453    93.8 | 3.34/3.31   | 12.82/14.93 ->  13.88  +1.05 | 2.11/1.91 |  19.21 us
+pr-dl10-1       82.13   1339 |  125639    93.8 | 3.33/3.34   | 13.96/19.00 ->  16.48  +2.52 | 2.72/2.68 |  22.52 us
+pr-dl25-1       80.34   1338 |  125550    93.8 | 3.32/3.32   | 13.87/16.79 ->  15.33  +1.46 | 2.11/2.13 |  20.77 us
+pr-d0-1         83.46   1339 |  125640    93.8 | 4.89/4.75   | 14.19/18.98 ->  16.59  +2.40 | 3.78/3.14 |  24.87 us
+pr-d0-2         83.54   1339 |  125640    93.8 | 4.78/4.77   | 15.24/17.89 ->  16.57  +1.33 | 3.41/3.41 |  24.75 us
+pr-k0base-1     40.55   4212 |  395424    93.9 | 2.89/2.83   | 10.66/12.23 ->  11.45  +0.79 | 3.39/2.88 |  17.44 us
+pr-k0off-1      37.67   4212 |  395424    93.9 | 2.94/2.84   | 8.05/10.72 ->   9.39  +1.33 | 1.80/1.59 |  13.97 us
+
+probe overhead: probe-on base 83.11 tok/s (reps 83.2, 83.01) vs probe-off 83.27: -0.20 %; earlier probe-less base 83.17 / pf-d0 83.47
+
+per setting (mean of reps):
+  prefetch on (base)   tok/s  83.11  one-way  16.73 us  stage 3.39  copy-out 3.31  skew +1.72
+  prefetch OFF         tok/s  79.31  one-way  13.71 us  stage 3.32  copy-out 2.00  skew +0.89
+  delay 0 (d0)         tok/s  83.50  one-way  16.58 us  stage 4.80  copy-out 3.44  skew +1.86
+  delay 10 us          tok/s  82.13  one-way  16.48 us  stage 3.33  copy-out 2.70  skew +2.52
+  delay 25 us          tok/s  80.34  one-way  15.33 us  stage 3.32  copy-out 2.12  skew +1.46
+  K0 prefetch on 40.55 tok/s one-way 11.45 us | off 37.67 tok/s one-way 9.39 us

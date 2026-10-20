@@ -1,0 +1,22 @@
+runPS (2026-10-21 01:02-01:26): the prefetch sites' budgets (A 16, B 8, C 16, H 16 MiB) and the first wave's delay
+runs 16; all_equal 16/16; tokens [4400]
+speed = median over the 11 prompts of (reference s/token / run s/token) - 1; reference = the median of the runs ps-d0-1, ps-d0-2, ps-d0-3
+run          env (besides TF_DS_CONF_FILE)                par   tok/s rounds    speed
+ps-d0-1      TF_EXL3_L2_DELAY_NS=0                          1   82.83   1338   +0.00%
+ps-a12-1     TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_A_MIB=12        1   83.50   1337   -0.26%
+ps-b4-1      TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_B_MIB=4         1   82.92   1339   -0.81%
+ps-c8-1      TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_C_MIB=8         1   82.98   1338   -0.75%
+ps-h0-1      TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_H_MIB=0         1   83.38   1338   -0.18%
+ps-base-1    (the engine: 3000 ns)                          1   82.78   1338   -0.72%
+ps-d0-2      TF_EXL3_L2_DELAY_NS=0                          1   83.68   1338   +0.00%
+ps-a24-1     TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_A_MIB=24        1   83.60   1338   -0.17%
+ps-b14-1     TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_B_MIB=14        1   82.98   1339   -0.50%
+ps-c24-1     TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_C_MIB=24        1   83.68   1338   +0.18%
+ps-h32-1     TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_H_MIB=32        1   83.33   1338   -0.50%
+ps-d0-3      TF_EXL3_L2_DELAY_NS=0                          1   83.76   1338   +0.00%
+ps-base-p2   (the engine: 3000 ns)                          2   55.47   1407    (n/a)
+ps-d0-p2     TF_EXL3_L2_DELAY_NS=0                          2   55.79   1406    (n/a)
+ps-base-p4   (the engine: 3000 ns)                          4   37.40   1466    (n/a)
+ps-d0-p4     TF_EXL3_L2_DELAY_NS=0                          4   37.77   1461    (n/a)
+par 2 / 4: tok/s is a stream's (tokens over its own decode seconds): d0 +0.58 % (2 streams), +0.99 % (4 streams) against the engine's 3 us.
+Runs 1, 6 and 9 had stalls in prompts 6-7 while commands ran on the head (see KERNEL-ROUNDS.md); the median over prompts ignores them.

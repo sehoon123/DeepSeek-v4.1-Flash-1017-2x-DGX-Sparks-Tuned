@@ -59,25 +59,27 @@ their repository's.
 
 Replies do not change. Every check compared them with serial decoding (one token a round, no drafts) or with its token
 hashes: 62 of 62 copy-window runs (copies 0-90 % wrong, three streams at once, temperature 1, EOS and length endings) and
-611 decodes of the later offline runs, up to 125K-token prompts, none different ([research/](research/README.md)).
+611 decodes of the later offline runs, up to 125K-token prompts, and every run of the kernel rounds (patch 0019), none
+different ([research/](research/README.md)).
 
 The image is Mia's AI Lab's with these eleven patches added (`tensorfold-dsv41:exl3-tp2-b520af02c741`). None is published,
 so the first `./start.sh` builds it on the head (two Zig builds, ~6 minutes) and copies it to the worker.
 
 <!-- MEASURED -->
 Measured on our pair with this commit, run as our production (`ABLIT=1`, `CONTEXT=1048576`; sparkDash's decode bench, the
-streams together, median of two waves, 2026-10-20):
+streams together, median of two waves, 2026-10-21):
 
 | Decode, tok/s | 1 stream | 2 streams | 4 streams |
 | --- | --- | --- | --- |
-| Prose | 67.0 | 100.7 | 134.6 |
-| Code | 114.1 | 150.1 | 158.3 |
+| Prose | 68.0 | 101.7 | 135.7 |
+| Code | 115.3 | 151.1 | 158.8 |
 
-The same as on our earlier base (Mia's AI Lab's recipe at `e65785cd` with these patches and the confidence head from a
-file: +0.6 % together, within run-to-run noise; `research/results/decode-recipe-tuned-vs-conffix.txt`), as it should be:
-the image and the confidence-head values are the same, and `tools/validate.py` found the replies equal to the earlier
-ones (8 of 8). The stock checkpoint (`ABLIT=0`) was not measured with these changes; for it, see Mia's AI Lab's numbers
-under Status.
+Against the same image with the previous prefetch behaviour set through the environment (`TF_EXL3_L2_DELAY_NS=3000
+TF_DS_DRAFT_PF=0`), run just before: prose +2.0 / +0.9 / +0.1 %, code +1.5 / +0.8 / +0.6 % (geomean +1.0 %;
+`research/results/decode-0019-ab.txt`). `tools/validate.py` found the replies equal to the earlier image's (8 of 8). A
+dashboard polling `nvidia-smi` on the head ran throughout, as in the earlier measurements; pausing it is worth another
+~0.9 % (`research/KERNEL-ROUNDS.md`). The stock checkpoint (`ABLIT=0`) was not measured with these changes; for it, see
+Mia's AI Lab's numbers under Status.
 <!-- /MEASURED -->
 
 ## Status

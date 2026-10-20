@@ -1,0 +1,8 @@
+dp-off-1|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0|600
+dp-on-1|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0 TF_DS_DRAFT_PF=1|600
+dp-off-2|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0|600
+dp-on-2|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0 TF_DS_DRAFT_PF=1|600
+dp-on-3|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0 TF_DS_DRAFT_PF=1|600
+dp-off-3|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0|600
+dp-off-p4|req-test-x.json|4|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0|600
+dp-on-p4|req-test-x.json|4|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0 TF_DS_DRAFT_PF=1|600

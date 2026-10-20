@@ -1,0 +1,16 @@
+ps-d0-1|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0|600
+ps-a12-1|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_A_MIB=12|600
+ps-b4-1|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_B_MIB=4|600
+ps-c8-1|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_C_MIB=8|600
+ps-h0-1|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_H_MIB=0|600
+ps-base-1|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+ps-d0-2|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0|600
+ps-a24-1|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_A_MIB=24|600
+ps-b14-1|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_B_MIB=14|600
+ps-c24-1|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_C_MIB=24|600
+ps-h32-1|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0 TF_DS_PF_H_MIB=32|600
+ps-d0-3|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0|600
+ps-base-p2|req-test-x.json|2|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+ps-d0-p2|req-test-x.json|2|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0|600
+ps-base-p4|req-test-x.json|4|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+ps-d0-p4|req-test-x.json|4|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_EXL3_L2_DELAY_NS=0|600
