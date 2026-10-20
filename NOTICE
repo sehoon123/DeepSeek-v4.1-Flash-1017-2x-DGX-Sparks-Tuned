@@ -66,7 +66,7 @@ sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned
     modify, and quote as diff context, stays under its authors' license (see "The DeepSeek-V4.1-Flash family" above).
   - start.sh, scripts/config.sh, scripts/prepare.sh (modified): the wide copy-window defaults and checks, ABLIT_PRUNE_STOCK,
     the confidence head from a file when the stock shards are gone, the TF_DS_* checks, the SIGTERM path, --fix-k for
-    rank 1, GHCR_IMAGE. scripts/local.sh.example (modified).
+    rank 1, GHCR_IMAGE, ~/.local/bin on PATH. scripts/local.sh.example (modified).
   - scripts/prune_ablit_stock.py, scripts/ablit_conf_head.py, scripts/test_ablit_conf_head.py (added).
   - README.md, CHANGELOG.md, CREDITS.md, NOTICE, zig/patches/README.md and the .github templates (modified);
     .github/FUNDING.yml (removed: it named Mia's AI Lab's sponsorship).

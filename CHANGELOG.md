@@ -25,6 +25,8 @@ issue and pull-request numbers are their repository's.
   `zig/patches/0010`-`0018`; `TF_DS_FIX_K` reaches rank 1 as `--fix-k`.
 - **Research patches, off unless set**: draft-depth policies (`0010`-`0016`), 0018's calibration dumps and Platt scaling.
   `research/`: the measurements and tools.
+- `scripts/config.sh` also searches `~/.local/bin` (last) for the `hf` CLI: a systemd user service's PATH lacks it, and
+  `prepare.sh` stopped there with "install the Hugging Face CLI" when run from one.
 - `GHCR_IMAGE` names this repository's namespace; nothing is published there, so `prepare.sh` builds the image.
 
 ## Unreleased

@@ -6,6 +6,9 @@
 #   3. the defaults below
 # The loading of local.sh and .env is the GLM-5.3-Flash recipe's (MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold).
 _cfg_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# This recipe: `pip install --user` and pipx put the hf CLI in ~/.local/bin, which the PATH of a systemd user service (as
+# start.sh runs under one, with FOREGROUND=1) lacks: search it last, so tools already on PATH still win.
+if [[ -n "${HOME:-}" && -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then PATH="$PATH:$HOME/.local/bin"; fi
 if [[ -f "$_cfg_root/scripts/local.sh" ]]; then
   declare -A _cfg_env=()
   while IFS= read -r _n; do _cfg_env[$_n]=${!_n}; done < <(compgen -e)
