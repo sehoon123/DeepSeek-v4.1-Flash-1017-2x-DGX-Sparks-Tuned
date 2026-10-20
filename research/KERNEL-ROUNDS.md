@@ -114,6 +114,47 @@ scale; sharpening it (alpha 1.5-10) brought it back to the argmax drafts' rate b
 After top-p the target's draw is mostly its argmax, and where it is not, the drafter's runner-ups do not predict which
 other token it draws. Every sampled run's hashes equalled serial decoding's.
 
+## Round 8: copy windows on realistic edits, at temperature 1, and their policy (`results/copy-policy.txt`)
+
+- Four of this repository's Python files, each to be written out whole with one scattered edit (a rename, print -> log,
+  PASS -> OK, url -> base_url): 48-row windows +18 to +20 % over 16 rows (180.7 -> 213.5-216.9 tok/s), and +18.1 % at
+  temperature 1 (175.5 -> 207.3); at temperature 1 the natural copy mix +4.6 %. Every reply equal to a serial run's.
+- Long repetitive generations (30 tests, an enum of every HTTP status, a 40-element table, a 12-command CLI): -0.5 % (T=0)
+  and -0.7 % (T=1). One T=1 code prompt lost 9 %: short repeated patterns grow windows that sampling then leaves (the
+  same 334 tokens accepted, 453 instead of 397 checked).
+- Policies tried and rejected: a first window of 12 or 24 rows (dense edits -7 / -9 %; the oracle runs favour it only
+  because their misses come per window), restarting a missed window at the tokens it kept (plain text -12 %: spurious
+  matches kept wide windows), and an expected-tokens-a-ms cap from each stream's copy record (no change: the costly misses
+  follow runs of hits, which the record cannot foresee). Diffs in `patches/`.
+
+## Round 9: prefill, clocks and the existing switches (rejected)
+
+- Prompt chunks of 4,096 rows instead of 2,048: prefill +8 % (32K) to +18 % (64K), but replies to prompts past 2,048
+  tokens change: chunk boundaries set how a row's window keys are blocked (ring part, chunk part), so the attention adds
+  them in another order. Also +2.5 GB of arena. Exactness rules it out.
+- GPU clock range 300-2,418 MHz (the default application clock) instead of 300-2,250: decode +0.15 % (one stream) / +0.45 %
+  (four), prefill +1.2-1.7 %, all replies equal; the round's latency-bound part waits on memory and the fabric, not the SM
+  clock. Kept at the reference 2,250.
+- `TF_DS_IDX_SPLIT=1`, `TF_DS_ENGRAM_LANES=2` (patches 0001, 0002) on 32K / 64K / 126K prompts: within the run-to-run spread
+  (two baselines differ by 7 % at 64K); no gain.
+
+## Round 10: the MoE kernel rebuilt from source, deeper staging (negative, `results/kernel-stages.txt`)
+
+The kit's `grouped_cp_kernel` (experts_cb2.cu of the engine's deepseek-v41-tp2 branch) rebuilt as the engine's torch
+extension builds it (cpp_extension, `-O3 -lineinfo`, sm_121, nvcc 13.3 in the engine image): all 162 variants' SASS equal
+to the kit's, so the kit's MoE kernels can be rebuilt and varied exactly. Instantiating each warp's ring of cp.async
+trellis-copy stages at 4 and 5 (the header: the staging changes no bits; every run's hashes equal): S=4 within the noise,
+S=5 -1.5 % (one stream) and -2.2 % (four). The kit's S=3 is the best setting. Also swept, defaults kept: the drafter-pass
+prefetch budgets (-0.43 to 0.00 %) and the copy windows' entry match (6 / 12 tokens against 8: edits +2.6 / -1.8 %, plain
+text -0.6 / +0.4 %).
+
+## Round 11: memory under a mixed served load (`results/soak-memory.txt`)
+
+No leak: device memory grows only with new graph shapes (~7 MB a context bucket) and prompt-cache states (512 MiB budget).
+Rounds past 16 rows cost the engine 0.44 GiB at 32 and 0.62 GiB at 48 (its load line: 104.96 / 105.40 / 105.58 GiB), on a head
+that showed 4.83-4.87 GiB idle after the load and 4.94 GiB at a 258K prefill's lowest, against a 4 GiB memguard floor. The
+recipe's default is therefore 32 rows (edits +14 % instead of +20 %); 48 where the head has the room.
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels

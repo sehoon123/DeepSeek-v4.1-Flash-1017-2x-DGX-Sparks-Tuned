@@ -1,0 +1,19 @@
+The kit's MoE decode kernel (grouped_cp_kernel, experts_cb2.cu of bertholomus/TensorFold deepseek-v41-tp2) rebuilt from
+source as the engine's torch extension builds it (cpp_extension, -O3 -lineinfo, -gencode sm_121, nvcc 13.3 V13.3.73 in the
+engine image): all 162 grouped_cp_kernel functions' SASS identical to the kit's cubin. The same source with S (each warp's
+ring of cp.async trellis-copy stages; the header: the staging changes no bits) also instantiated at 4 and 5, loaded by
+TF_DS_DECODE_STAGES in a research build; one stream, req-test-x (11 prompts), 48-row rounds, the harness (2026-10-21 07:04-07:18).
+
+S=3 (the kit)            85.06 tok/s  equal True
+S=3                      84.39 tok/s  equal True
+S=4                      84.62 tok/s  equal True
+S=4                      84.63 tok/s  equal True
+S=5                      83.27 tok/s  equal True
+S=5                      83.62 tok/s  equal True
+S=3, four streams        38.11 tok/s  equal True
+S=4, four streams        37.88 tok/s  equal True
+S=5, four streams        37.29 tok/s  equal True
+
+S=4 within the noise, S=5 -1.5 % (one stream) / -2.2 % (four): the kit's S=3 stays. Every reply equal to its reference.
+Drafter-pass prefetch budgets (TF_DS_DPF_A/B/C/H_MIB 8/24, 4/12, 8/24, 0/32 against 16/8/16/16): -0.43 to 0.00 %;
+TF_DS_COPY_ENTER 6 / 12 against 8: edits +2.6 / -1.8 %, plain text -0.6 / +0.4 %: the defaults stay.

@@ -1,0 +1,25 @@
+--- a/src/tensorfold/cuda/exl3/experts_grouped.cuh
++++ b/src/tensorfold/cuda/exl3/experts_grouped.cuh
+@@ -1980,11 +1980,19 @@
+                                       a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P,    \
+                                       a.SK, a.maxm, a.slots, ep))
+ #define TF_EPI(LO_, HI_)                                                                                        \
+-    if (epi == 1) TF_LAUNCH(8, 4, 3, LO_, HI_, 1);                                                              \
++    if (a.pf == 5) {                                                                                            \
++        if (epi == 1) TF_LAUNCH(8, 4, 5, LO_, HI_, 1);                                                          \
++        else if (epi == 2) TF_LAUNCH(8, 4, 5, LO_, HI_, 2);                                                     \
++        else TF_LAUNCH(8, 4, 5, LO_, HI_, 0);                                                                   \
++    } else if (a.pf == 4) {                                                                                     \
++        if (epi == 1) TF_LAUNCH(8, 4, 4, LO_, HI_, 1);                                                          \
++        else if (epi == 2) TF_LAUNCH(8, 4, 4, LO_, HI_, 2);                                                     \
++        else TF_LAUNCH(8, 4, 4, LO_, HI_, 0);                                                                   \
++    } else if (epi == 1) TF_LAUNCH(8, 4, 3, LO_, HI_, 1);                                                       \
+     else if (epi == 2) TF_LAUNCH(8, 4, 3, LO_, HI_, 2);                                                         \
+     else TF_LAUNCH(8, 4, 3, LO_, HI_, 0);
+-    TORCH_CHECK(a.nt == 8 && a.warps == 4 && a.pf == 3, "unsupported decode tile setting nt=", a.nt, " warps=",
+-                a.warps, " stages=", a.pf);
++    TORCH_CHECK(a.nt == 8 && a.warps == 4 && a.pf >= 3 && a.pf <= 5, "unsupported decode tile setting nt=", a.nt,
++                " warps=", a.warps, " stages=", a.pf);
+     if (a.lo == 8 && a.hi == 8) { TF_EPI(8, 8) }
+     else if (a.lo >= 2 && a.hi <= 10) { TF_EPI(2, 10) }
+     else { TF_EPI(2, 16) }

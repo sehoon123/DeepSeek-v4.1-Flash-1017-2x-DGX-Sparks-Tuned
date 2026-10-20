@@ -1,0 +1,119 @@
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -212,6 +212,8 @@
+     served: ?u64 = null,
+     granted: ?u32 = null,
+     copy_width: ?u32 = null,
++    copy_hits: u64 = 0, // a lone stream's copied tokens accepted (Config.copy_ev)
++    copy_misses: u64 = 0, // its copy windows that missed
+     gate: ?call_gate.Gate = null,
+ 
+     pub fn init(gpa: Allocator, spec: Spec) !Stream {
+@@ -258,6 +260,8 @@
+         s.served = null;
+         s.granted = null;
+         s.copy_width = null;
++        s.copy_hits = 0;
++        s.copy_misses = 0;
+     }
+ 
+     pub fn dropHeld(s: *Stream, gpa: Allocator) void {
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -33,6 +33,7 @@
+     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
+     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
+     copy_skips_head: bool = false, // a lone stream's fully accepted copy window skips the head's next pass
++    copy_ev: bool = false, // a lone stream's copy windows no wider than the most tokens a ms its copy record expects
+     enter_match: i64 = 8, // matching tokens a copy window needs
+ };
+ 
+@@ -66,6 +67,7 @@
+     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
+     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
+     copy_skips_head: bool = false, // Model.copy_skips_head
++    copy_ev: bool = false, // Model.copy_ev
+     k: Constants = .{},
+ 
+     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
+@@ -120,6 +122,7 @@
+             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
+             .mtp_step_ms = m.mtp_step_ms,
+             .copy_skips_head = m.copy_skips_head,
++            .copy_ev = m.copy_ev,
+             .enter_match = m.enter_match,
+         };
+     }
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -371,7 +371,13 @@
+                     if (s.proposer) |pr| pr.observe(@intCast(rows - 1), @intCast(kept));
+                     if (e.alone) {
+                         const width = s.copy_width orelse e.cfg.first_copy;
+-                        s.copy_width = if (kept == rows - 1) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
++                        var next: u32 = if (kept == rows - 1) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
++                        if (e.cfg.copy_ev) {
++                            s.copy_hits += kept;
++                            s.copy_misses += @intFromBool(kept < rows - 1);
++                            next = @min(next, bestCopy(e, s));
++                        }
++                        s.copy_width = next;
+                     }
+                 } else if (p.kind == .head) {
+                     if (p.lanes) |l| if (s.odds != null) observeLanes(s, l, path);
+@@ -510,6 +516,32 @@
+     }
+ 
+     /// Each held tree lane whose parent row the round reached: the target took it or not (its depth and rank).
++    /// Config.copy_ev: the copy window (tokens, first_copy to max_copy) with the most expected tokens a ms, a copied
++    /// token landing with the stream's record (q = (hits + 19) / (hits + misses + 20): a miss a window ends its run) and
++    /// a window of w tokens costing family_costs[w + 1] (timed at load): (sum q^i, i = 1..w, + 1) / ms.
++    fn bestCopy(e: *const Engine, s: *const Stream) u32 {
++        const hits: f64 = @floatFromInt(s.copy_hits);
++        const q = (hits + 19.0) / (hits + @as(f64, @floatFromInt(s.copy_misses)) + 20.0);
++        var best: u32 = e.cfg.max_copy;
++        var best_v: f64 = -1.0;
++        var lands: f64 = 0.0;
++        var qi: f64 = 1.0;
++        var w: u32 = 1;
++        while (w <= e.cfg.max_copy) : (w += 1) {
++            qi *= q;
++            lands += qi;
++            if (w < e.cfg.first_copy) continue;
++            const ms = e.cfg.family_costs.get(@intCast(w + 1)) orelse continue;
++            if (ms <= 0) continue;
++            const v = (lands + 1.0) / ms;
++            if (v > best_v) {
++                best_v = v;
++                best = w;
++            }
++        }
++        return best;
++    }
++
+     fn observeLanes(s: *Stream, l: *const shape.Shape, path: []const u32) void {
+         var on: [256]bool = @splat(false);
+         for (path) |r| if (r < on.len) {
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -33,6 +33,12 @@
+ /// round's rows (TF_DS_ROUND_ROWS) and the window rings' RING_EXTRA (48 here, the target's and the drafter's) bound it.
+ pub const max_window = 48;
+ 
++/// TF_DS_COPY_EV=1: a lone stream's copy windows no wider than the most tokens a ms its copy record expects (research).
++fn copyEv() bool {
++    const v = std.c.getenv("TF_DS_COPY_EV") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
+ /// The image rows a fill_images frame carries at most.
+ pub const image_piece = 32 << 10;
+ 
+@@ -553,6 +559,7 @@
+             .exact_width = @intCast(@max(window_rows, self.copy_rows)),
+             .first_copy_rows = if (self.copy_rows > window_rows) @as(u32, window_rows) else 0,
+             .copy_skips_head = self.copy_skip,
++            .copy_ev = copyEv(),
+             .enter_match = self.enter_match,
+             .gpu_tokens = false,
+             .mtp = drafting,

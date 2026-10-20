@@ -1,0 +1,37 @@
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -33,6 +33,7 @@
+     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
+     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
+     copy_skips_head: bool = false, // a lone stream's fully accepted copy window skips the head's next pass
++    copy_restart_kept: bool = false, // after a miss a lone stream's next copy window takes the tokens the missed one kept
+     enter_match: i64 = 8, // matching tokens a copy window needs
+ };
+ 
+@@ -66,6 +67,7 @@
+     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
+     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
+     copy_skips_head: bool = false, // Model.copy_skips_head
++    copy_restart_kept: bool = false, // Model.copy_restart_kept
+     k: Constants = .{},
+ 
+     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
+@@ -120,6 +122,7 @@
+             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
+             .mtp_step_ms = m.mtp_step_ms,
+             .copy_skips_head = m.copy_skips_head,
++            .copy_restart_kept = m.copy_restart_kept,
+             .enter_match = m.enter_match,
+         };
+     }
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -371,7 +371,7 @@
+                     if (s.proposer) |pr| pr.observe(@intCast(rows - 1), @intCast(kept));
+                     if (e.alone) {
+                         const width = s.copy_width orelse e.cfg.first_copy;
+-                        s.copy_width = if (kept == rows - 1) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
++                        s.copy_width = if (kept == rows - 1) @min(e.cfg.max_copy, 2 * width + 1) else if (e.cfg.copy_restart_kept) @max(e.cfg.first_copy, @min(e.cfg.max_copy, @as(u32, @intCast(kept)))) else e.cfg.first_copy;
+                     }
+                 } else if (p.kind == .head) {
+                     if (p.lanes) |l| if (s.odds != null) observeLanes(s, l, path);

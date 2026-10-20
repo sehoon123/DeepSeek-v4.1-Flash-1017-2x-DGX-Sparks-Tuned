@@ -1,0 +1,25 @@
+Copy windows on realistic edits and at temperature 1 (the harness, one stream, 2026-10-21 05:25-06:30). req-edit: four of
+this repository's Python files, each to be output whole with a scattered edit (a rename, print -> log, PASS -> OK, url ->
+base_url); -s: the same at temperature 1 (seeds 201-204); req-rep: four long, repetitive code generations (30 tests, an
+HTTP status enum, a 40-element table, a 12-command CLI). Every reply's token hash equals a serial run's.
+
+case                           tok/round    tok/s
+edits, 16 rows                    12.468   180.67
+edits, 48 rows                    21.472   213.54
+edits, 48 rows (2)                21.472   216.87
+edits T=1, 16 rows                12.326   175.51
+edits T=1, 48 rows                20.812   207.32
+natural mix T=1, 16                6.204   125.44
+natural mix T=1, 48                7.003   131.17
+repetitive code T=1, 16            5.209   111.02
+repetitive code T=1, 48            5.209   110.22
+repetitive code T=0, 16            5.185   112.25
+repetitive code T=0, 48            5.200   111.74
+
+Rejected policy variants (48 rows):
+- first copy window 12 / 24 rows (TF_DS_COPY_FIRST): verbatim +2 / +4 %, copy with dense edits (copye) -7 / -9 %;
+  the oracle runs favour it (+11-16 %) only because their misses come per window, not per token.
+- restart a missed window at the tokens it kept (TF_DS_COPY_RESTART): edits +3 %, but plain text -12 % (3.278 -> 2.722
+  tokens a round): short spurious matches in ordinary text kept wide windows that missed.
+- one T=1 code prompt (c1code_s) lost 9 % at 48 rows (drafted 397 -> 453, accepted 334 both): repeated patterns grow
+  windows that sampling then leaves; the four repetitive-code prompts above lose 0.5-0.7 %.

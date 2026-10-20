@@ -1,0 +1,14 @@
+The served pair under a mixed load (2026-10-21 07:24-07:48, image 4900101c191d, 48-row rounds; MemAvailable from /proc/meminfo
+every 10 s, the engine's /metrics device memory): edits / copies / repetitive code at temperature 0 and 1 (T=0 replies equal
+across rounds), sparkDash's decode bench, copies at prompts of 5K / 11K / 22K / 43K tokens (twice), three distinct 47K
+prompts, one 258K prompt (144 s), 2-4 concurrent mixed requests (13, no errors).
+
+- The head: MemAvailable 6,414 MiB after the load, 4.83-4.87 GiB idle after it all, 4,940 MiB at its lowest during the
+  258K prefill (the 4 GiB memguard floor never reached). The engine's device memory grows only with new graph shapes (about
+  7 MB a context bucket) and new prompt-cache states (512 MiB budget; 76 MiB used at the end); repeating the same requests
+  changed nothing: no leak.
+- The engine's own accounting at load: model 104.96 GiB with 16-row rounds, 105.40 at 32, 105.58 at 48 (the arena 4,538 /
+  4,799 / 5,060 MB). With the prompt cache full and a long prefill's transient (~0.4 GiB) a 48-row head could come within
+  ~0.5 GiB of a 4 GiB floor; Mia's AI Lab's issue #4 saw a kill at 4.085 GiB on a head with more beside the server.
+- So the recipe's default is 32 rows (realistic edits +14 % instead of +20 % at 48, 0.18 GiB a Spark less); 48 where the
+  head has the room. Mia's AI Lab's default floor is 2.5 GiB (MEMGUARD_GIB); this pair runs 4.
