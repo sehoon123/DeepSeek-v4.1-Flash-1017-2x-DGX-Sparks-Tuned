@@ -5,6 +5,12 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **Copy windows of up to 48 rows** (`zig/patches/0021`; `ROUND_ROWS=48`, `TF_DS_COPY_ROWS=48` by default): the window
+  rings get 48 spare rows (model.py's RING_EXTRA is 16; keys are read by position, so the ring's size changes no
+  arithmetic, and a prompt chunk still takes ring mode at 16 rows or fewer), and the router's chunk sums run in launches
+  of at most 16 rows, the captured variants' widest. Replies equal serial decoding (oracle copies 0-90 % wrong, three
+  streams, temperature 1, 32K-126K prompts); perfect copies +31.6 %, a natural copy mix +6.5 %, other text unchanged.
+  `start.sh` accepts `TF_DS_COPY_ROWS` up to `ROUND_ROWS`.
 - **The L2 prefetcher retuned, and the drafter's pass prefetching too** (`zig/patches/0019`): the prefetcher's first wave
   starts at once (the engine waited 3 us; +0.35 to +0.72 % decode at one stream in five windows, +0.6 / +1.0 % a stream
   at two / four streams), the drafter's pass prefetches its blocks' weights like the target's layers (+0.37 %, 9 of 11

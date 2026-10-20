@@ -1,0 +1,93 @@
+diff --git a/zig/src/families/dsv41/draft.zig b/zig/src/families/dsv41/draft.zig
+index fd69459..c72372d 100644
+--- a/zig/src/families/dsv41/draft.zig
++++ b/zig/src/families/dsv41/draft.zig
+@@ -40,7 +40,7 @@ pub const max_rows = max_streams * 5; // every stream of the pool, a five-row bl
+ /// sparse_attn's pick list of a single-split call: padded with -1 to a multiple of 16 entries.
+ const pick_pad = 16;
+ /// dspark.py: ring_size = window + 16.
+-pub const ring_extra = 16;
++pub const ring_extra = 48; // prompt.ring_extra's (the drafter's absorbs follow the target's copy windows)
+ /// The stages (DSpark blocks) and a stream's block rows at most.
+ pub const max_stages = 4;
+ pub const max_block = 8;
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 120c4e4..50f3bf0 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -30,8 +30,8 @@ const max_rows = round.max_rows;
+ /// A window of the pending row and the drafter's block: the widest one the gates checked row for row.
+ pub const window_rows = 6;
+ /// A lone stream's widest copy window (TF_DS_COPY_ROWS; the drafter's windows stay at window_rows): the row-invariant
+-/// round's rows (16) and the window rings' RING_EXTRA (16, the target's and the drafter's) bound it.
+-pub const max_window = 16;
++/// round's rows (TF_DS_ROUND_ROWS) and the window rings' RING_EXTRA (48 here, the target's and the drafter's) bound it.
++pub const max_window = 48;
+ 
+ /// The image rows a fill_images frame carries at most.
+ pub const image_piece = 32 << 10;
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 4d85b6f..7c22d1f 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -41,8 +41,12 @@ const key_elems: usize = 1 << 24;
+ /// 2^26 / (4 n_comp) < 512).
+ const pruned_rows: usize = 512;
+ 
+-/// model.py's RING_EXTRA: window ring slots beyond the window (a verify window never clobbers a key it reads).
+-pub const ring_extra = 16;
++/// model.py's RING_EXTRA: window ring slots beyond the window (a verify window never clobbers a key it reads). 48 here
++/// (model.py: 16), so a lone stream's copy window of up to 48 rows stays in ring mode; keys are read by position
++/// (slot = position % ring size, a runtime argument), so the ring's size changes no arithmetic.
++pub const ring_extra = 48;
++/// A prompt chunk of this many rows or fewer runs in ring mode: model.py's RING_EXTRA (16), the captured kernels' cases.
++pub const ring_mode_rows = 16;
+ /// model.py's RAW: per-position compressor inputs kept (a ratio-2 group's earlier row for the next chunk).
+ pub const raw_rows = 64;
+ 
+@@ -734,11 +738,12 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
+     // _cs: the layer's RoPE kind (compressed layers rotate by the compressed table) for every rotation it makes
+     const rope = if (lay.ratio != 0) e.compressed else e.plain;
+     const ring_rows = c.window + ring_extra;
+-    // ring mode (a chunk of RING_EXTRA rows or fewer): the rows' keys into the ring first, the attention reads the ring.
++    // ring mode (a chunk of ring_mode_rows, model.py's RING_EXTRA, or fewer): the rows' keys into the ring first, the
++    // attention reads the ring.
+     // With replay_floor, not when the window reaches below `floor` (the replay's cut: below it the ring holds the slot's
+     // previous request's keys): such a chunk reads by the gather path from the floor, as one large chunk's rows would
+     const below = floor > start -| (c.window - 1);
+-    const ring_mode = n <= ring_extra and !(replay_floor and below);
++    const ring_mode = n <= ring_mode_rows and !(replay_floor and below);
+     const one_split = !ring_mode and n <= tri.decode_rows;
+     // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to 128 rows
+     if (n > 128) {
+diff --git a/zig/src/families/dsv41/tri_norm.zig b/zig/src/families/dsv41/tri_norm.zig
+index 4198dfa..2cad134 100644
+--- a/zig/src/families/dsv41/tri_norm.zig
++++ b/zig/src/families/dsv41/tri_norm.zig
+@@ -16,6 +16,8 @@ pub const rowmm2_rows = 2;
+ pub const rowmm_rb = 16;
+ /// kernels.ROWMM_PARTS_MIN (TF_DS_ROWMM_PARTS_MIN unset in the served lane): rowmm_gate's chunk sums from this many rows.
+ pub const rowmm_parts_min = 1;
++/// The most rows a captured _rowmm_parts variant takes (RB = rows, 1 to 16).
++pub const rowmm_parts_rb = 16;
+ 
+ fn ci(name: []const u8, v: usize) aot.Const {
+     return aot.ci(name, @intCast(v));
+@@ -119,6 +121,17 @@ pub fn rpTile(rows: usize) RpTile {
+ pub fn rowmmGate(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: usize, n: usize) !usize {
+     const tile = rpTile(rows);
+     const kc = k / 256;
++    // this recipe: a decode round wider than the captured variants' rows (a lone stream's copy window past 16 rows)
++    // takes them in pieces of rowmm_parts_rb rows: a row's chunk sums are the same whatever rows share its launch
++    if (rows > rowmm_parts_rb and rows <= tri.decode_rows and k % 256 == 0 and n >= 32) {
++        var r0: usize = 0;
++        var got: usize = 0;
++        while (r0 < rows) : (r0 += rowmm_parts_rb) {
++            const rr = @min(rowmm_parts_rb, rows - r0);
++            got = try rowmmGate(t, x + r0 * xs * 2, xs, w, out + r0 * kc * n * 4, rr, k, n);
++        }
++        return got;
++    }
+     // switch "rowmm_parts" (on in the served build); the wrapper's dtype check (x bf16, w fp16) holds by these pointer types
+     if (!(rowmm_parts_min <= rows and rows <= tri.decode_rows and k % 256 == 0 and kc % tile.cpg == 0 and n >= 32)) {
+         try rowmm2(t, x, xs, w, out, rows, k, n);

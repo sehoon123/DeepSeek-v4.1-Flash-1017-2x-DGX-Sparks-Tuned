@@ -30,7 +30,7 @@
 #   setup    PREPARE (auto | 1 | 0), WAIT_TIMEOUT (seconds, default 2400), DRY_RUN=1
 #   memory   MIN_AVAIL_GIB (refuse to start below it), MIN_AVAIL_WAIT_S (re-read for this long first), MEMGUARD_GIB (kill a rank's container below it), HEAD_NFS_SERVER,
 #            HEAD_NFS_VOLUME (rank 0 reads the checkpoint over NFS through a docker volume)
-#   ranks    every TENSORFOLD_*, TF_DS_* and TF_EXL3_* variable you set goes to both ranks (this recipe sets TF_DS_COPY_ROWS=16 and
+#   ranks    every TENSORFOLD_*, TF_DS_* and TF_EXL3_* variable you set goes to both ranks (this recipe sets TF_DS_COPY_ROWS=48 and
 #            TF_DS_COPY_SKIP=1 unless you do: wide copy windows, scripts/config.sh)
 #            every other exported NCCL_* variable too (values of A-Z a-z 0-9 _ . , : = / - only), RANK1_PROFILE=1|2: rank 1's --profile
 set -euo pipefail
@@ -72,7 +72,7 @@ for v in THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_K
 [[ -z "${TF_DS_PROBE_SAMPLES:-}" || "${TF_DS_PROBE_SAMPLES}" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] || die "TF_DS_PROBE_SAMPLES is empty or 1 to 64"
 [[ -z "${TF_DS_PROBE_PERIOD:-}" || "${TF_DS_PROBE_PERIOD}" =~ ^([2-9]|[1-5][0-9]|6[0-4])$ ]] || die "TF_DS_PROBE_PERIOD is empty or 2 to 64"
 [[ -z "${TF_DS_PROBE_THRESHOLD:-}" || "${TF_DS_PROBE_THRESHOLD}" =~ ^[0-5]([.][0-9]+)?$ ]] || die "TF_DS_PROBE_THRESHOLD is empty or 0 to 5"
-[[ "$TF_DS_COPY_ROWS" =~ ^[0-9]+$ ]] && (( TF_DS_COPY_ROWS >= 6 && TF_DS_COPY_ROWS <= 16 )) || die "TF_DS_COPY_ROWS is 6 (the engine's own copy windows) to 16, not '$TF_DS_COPY_ROWS'"
+[[ "$TF_DS_COPY_ROWS" =~ ^[0-9]+$ ]] && (( TF_DS_COPY_ROWS >= 6 && TF_DS_COPY_ROWS <= ${ROUND_ROWS:-16} )) || die "TF_DS_COPY_ROWS is 6 (the engine's own copy windows) to ROUND_ROWS (${ROUND_ROWS:-16}; 48 at most), not '$TF_DS_COPY_ROWS'"
 [[ "$TF_DS_COPY_SKIP" =~ ^[01]$ ]] || die "TF_DS_COPY_SKIP is 0 or 1, not '$TF_DS_COPY_SKIP'"
 nccl_extra_collect
 check_workers

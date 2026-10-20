@@ -28,12 +28,14 @@ This is [Mia's AI Lab's recipe](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash
 the settings and the engine pin are theirs, and so is the rest of this README, whose issue and pull-request numbers are
 their repository's.
 
-- **Wide copy windows, on by default** (`zig/patches/0017`; `TF_DS_COPY_ROWS=16`, `TF_DS_COPY_SKIP=1` in
-  `scripts/config.sh`). When a reply copies text from its prompt or from itself (an edited file, a quotation, a list
-  written again), a stream that runs alone checks up to 16 copied tokens a round instead of 6, and skips the drafter's
-  pass after a round that accepted its whole copy. Measured when it was added: a JavaScript file from the prompt copied
-  verbatim 123.6 → 204.1 tok/s, copied with every `const` turned into `let` 111.0 → 141.1; sparkDash's six decode cells
-  +1.2 % together (code, one stream +3.9 %).
+- **Wide copy windows, on by default** (`zig/patches/0017` and `0021`; `TF_DS_COPY_ROWS=48`, `TF_DS_COPY_SKIP=1`,
+  `ROUND_ROWS=48` in `scripts/config.sh`). When a reply copies text from its prompt or from itself (an edited file, a
+  quotation, a list written again), a stream that runs alone checks up to 48 copied tokens a round instead of 6, and skips
+  the drafter's pass after a round that accepted its whole copy. With 16-row windows (0017 alone): a JavaScript file from
+  the prompt copied verbatim 123.6 → 204.1 tok/s, with every `const` turned into `let` 111.0 → 141.1. From 16 to 48 rows
+  (0021): perfect copies of the reply +31.6 % (212 → 279 tok/s), with a quarter or half of the copied tokens wrong +14 to
+  +18 %, nine in ten wrong +4.6 %, the four natural prompts (two of them copies) +6.5 %; text without copies unchanged.
+  0021 costs ~0.5 GiB of each Spark's memory (the wider rounds' buffers).
 - **The drafter's confidence head when the stock shards are gone.** Mia's AI Lab's recipe gives the overlay's F32 copy of
   `mtp.2.confidence_head.proj.weight` stock's F16 bytes back (`scripts/ablit_stock_dtypes.py`), which needs the stock
   shards. When they are gone, preparation checks the head and writes it to `conf_head_f32.bin`, and both ranks load it
@@ -62,7 +64,7 @@ hashes: 62 of 62 copy-window runs (copies 0-90 % wrong, three streams at once, t
 611 decodes of the later offline runs, up to 125K-token prompts, and every run of the kernel rounds (patch 0019), none
 different ([research/](research/README.md)).
 
-The image is Mia's AI Lab's with these eleven patches added (`tensorfold-dsv41:exl3-tp2-b520af02c741`). None is published,
+The image is Mia's AI Lab's with these twelve patches added (`tensorfold-dsv41:exl3-tp2-4900101c191d`). None is published,
 so the first `./start.sh` builds it on the head (two Zig builds, ~6 minutes) and copies it to the worker.
 
 <!-- MEASURED -->

@@ -109,7 +109,7 @@ PORT="${PORT:-8888}"
 # CONTEXT positions (rank 1's --pool is rank 0's --context), so PARALLEL streams at the full window take turns.
 CONTEXT="${CONTEXT:-1048576}"
 PARALLEL="${PARALLEL:-4}"              # requests at once (the engine's streams, TF_DS_STREAMS; the family measured 4)
-ROUND_ROWS="${ROUND_ROWS:-}"           # a decode round's rows at most, 16 to 48 (empty: the engine's 16)
+ROUND_ROWS="${ROUND_ROWS:-48}"         # a decode round's rows at most, 16 to 48 (this recipe: 48, for wide copy windows; 16: the engine's)
 MAX_TOKENS="${MAX_TOKENS:-32768}"      # a reply's budget when a request sets none
 THINKING="${THINKING:-1}"              # think first unless a request turns it off
 # The reasoning effort when a request names none: low, medium, high or xhigh (empty: the chat template's default)
@@ -124,11 +124,12 @@ TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-20}"
 DRAFTS="${DRAFTS:-1}"                  # the checkpoint's own DSpark draft blocks (exact: drafted replies equal plain)
-# Wide copy windows for a stream that runs alone (this recipe, zig/patches/0017). When a reply copies text from its prompt
-# or from itself, a round checks up to TF_DS_COPY_ROWS copied tokens instead of the engine's 6, and TF_DS_COPY_SKIP=1 skips
-# the drafter's pass after a round that accepted its whole copy. Replies do not change: the model still checks every token.
-# TF_DS_COPY_ROWS=6 TF_DS_COPY_SKIP=0 give the engine's own behaviour. Both ranks read them (start.sh checks them).
-export TF_DS_COPY_ROWS="${TF_DS_COPY_ROWS:-16}" TF_DS_COPY_SKIP="${TF_DS_COPY_SKIP:-1}"
+# Wide copy windows for a stream that runs alone (this recipe, zig/patches/0017 and 0021). When a reply copies text from
+# its prompt or from itself, a round checks up to TF_DS_COPY_ROWS copied tokens instead of the engine's 6 (at most
+# ROUND_ROWS; 16 needs no ROUND_ROWS), and TF_DS_COPY_SKIP=1 skips the drafter's pass after a round that accepted its whole
+# copy. Replies do not change: the model still checks every token. TF_DS_COPY_ROWS=6 TF_DS_COPY_SKIP=0 give the engine's
+# own behaviour. Both ranks read them (start.sh checks them).
+export TF_DS_COPY_ROWS="${TF_DS_COPY_ROWS:-48}" TF_DS_COPY_SKIP="${TF_DS_COPY_SKIP:-1}"
 # The engine's settings as BertholomusAI's served two-node launch has them: CUDA graphs, the mixes' side stream, the
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
 # NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).
