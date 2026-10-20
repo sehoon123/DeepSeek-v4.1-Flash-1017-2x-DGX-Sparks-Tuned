@@ -68,21 +68,19 @@ The image is Mia's AI Lab's with these twelve patches added (`tensorfold-dsv41:e
 so the first `./start.sh` builds it on the head (two Zig builds, ~6 minutes) and copies it to the worker.
 
 <!-- MEASURED -->
-Measured on our pair with this commit, run as our production (`ABLIT=1`, `CONTEXT=1048576`; sparkDash's decode bench, the
-streams together, median of two waves, 2026-10-21):
+Measured on our pair with this commit, run as our production (`ABLIT=1`, `CONTEXT=1048576`, `ROUND_ROWS=48`; sparkDash's
+decode bench, the streams together, median of two waves, 2026-10-21, a dashboard polling `nvidia-smi` every 10 s):
 
 | Decode, tok/s | 1 stream | 2 streams | 4 streams |
 | --- | --- | --- | --- |
-| Prose | 68.0 | 101.7 | 135.7 |
-| Code | 115.3 | 151.1 | 158.8 |
+| Prose | 68.1 | 102.4 | 137.5 |
+| Code | 115.4 | 152.4 | 165.2 |
 
-Against the same image with the previous prefetch behaviour set through the environment (`TF_EXL3_L2_DELAY_NS=3000
-TF_DS_DRAFT_PF=0`), run just before: prose +2.0 / +0.9 / +0.1 %, code +1.5 / +0.8 / +0.6 % (geomean +1.0 %;
-`research/results/decode-0019-ab.txt`). `tools/validate.py` found the replies equal to the earlier image's (8 of 8). A
-dashboard polling `nvidia-smi` every 2 s on both Sparks ran throughout, as in the earlier measurements. With it polling
-every 10 s: prose 68.2 / 102.4 / 137.2, code 115.8 / 152.4 / 159.8 (+1.0 %, A/B/A/B; `research/results/decode-poll-ab.txt`):
-every `nvidia-smi` run stalls the served decode, so keep GPU monitoring sparse while serving. The stock checkpoint (`ABLIT=0`) was not measured with these changes; for it, see
-Mia's AI Lab's numbers under Status.
+sparkDash's prompts copy little, so 0021 leaves these as they were (patch 0019's A/B: +1.0 %, `research/results/decode-0019-ab.txt`;
+the dashboard polling every 10 s instead of 2 s: +1.0 %, `research/results/decode-poll-ab.txt`, so keep GPU monitoring sparse
+while serving). Replies that copy text go faster: one stream, copies of a reply +31.6 % against 16-row windows, a natural
+mix +6.5 % (`research/results/wide-copy-windows.txt`). `tools/validate.py` found the replies equal to the earlier images'
+(8 of 8). The stock checkpoint (`ABLIT=0`) was not measured with these changes; for it, see Mia's AI Lab's numbers under Status.
 <!-- /MEASURED -->
 
 ## Status

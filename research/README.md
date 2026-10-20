@@ -14,7 +14,8 @@ pruned). Read every number as this pair's. The tools keep the original machines'
 | --- | --- |
 | [FINDINGS.md](FINDINGS.md) | the notebook of 10-20: profiling, the confidence-head diagnosis, copy windows, depth-policy ceilings, the round's kernels, bandwidth and RDMA; corrections are marked where they were made |
 | [OVERNIGHT-OPTIMIZATION.md](OVERNIGHT-OPTIMIZATION.md) | the overnight search over draft-depth policies, run while the confidence head was still misread (its patches 0005-0011 are 0010-0016 here) |
-| [KERNEL-ROUNDS.md](KERNEL-ROUNDS.md) | 10-20 / 10-21: the read ceiling (263 GB/s), the L2 prefetcher, the tensor-parallel gather, each prefetch site, the drafter's prefetch (`zig/patches/0019`), and the serving environment (GPU polling, CPU load) |
+| [KERNEL-ROUNDS.md](KERNEL-ROUNDS.md) | 10-20 / 10-21: the read ceiling (263 GB/s), the L2 prefetcher, the tensor-parallel gather, each prefetch site, the drafter's prefetch (`zig/patches/0019`), the serving environment (GPU polling, CPU load), copy windows of 48 rows (`zig/patches/0021`), and drafts coupled to the sampler's randomness (negative) |
+| [patches/](patches/) | research-only engine diffs, not in the image: `draft-coupling.diff` (round 7) |
 | [GITHUB-COMPARISON.md](GITHUB-COMPARISON.md) | this pair against the figures other DeepSeek-V4.1-Flash recipes publish (10-19) |
 | [results/](results/README.md) | data, and the outputs the notes quote |
 | [tools/](tools/README.md) | the offline harness and the analysis scripts |
@@ -41,6 +42,9 @@ pruned). Read every number as this pair's. The tools keep the original machines'
   and the drafter's pass prefetching its blocks (`zig/patches/0019`) gave +1.0 % served (six sparkDash cells, geomean);
   every site's budget, pacing and block count were swept and the engine's are the best measured. A dashboard polling
   `nvidia-smi` twice a second cost the served decode 0.9 %.
+- **Copy windows of 48 rows** (`KERNEL-ROUNDS.md` round 6, `zig/patches/0021`): perfect copies +31.6 %, a natural copy mix
+  +6.5 %, replies equal serial decoding in every check; the 16-row cap was the window rings' spare rows and the router's
+  captured variants, not arithmetic.
 - **The depth rule is at its ceiling**: richer predictors of how many drafts land gain at most +0.3 % on held-out prompts,
   where an oracle would gain +16-17 % (`results/policy-ceiling.txt`).
 - **The drafter decides the rest**: a point of landing rate is worth ~2.4 %; +10 % needs +4.1 points on sparkDash's prompts

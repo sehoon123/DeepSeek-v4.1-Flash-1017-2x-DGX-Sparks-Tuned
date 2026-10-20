@@ -10,6 +10,8 @@ Measured 2026-10-19 and 20 (Korea time) on the setup in [../README.md](../README
 | `decode-upstream-prompts.json`, `decode-steady-c1.json`, `idle-probe-1.json` | with upstream sparkDash's stream labels; six waves of prose at one stream; requests after two- and four-minute idle gaps |
 | `decode-recipe-tuned.json`, `decode-recipe-tuned-vs-conffix.txt` | the same bench on this recipe, run as our production after the switch (20:40), against `decode-conffix.json` |
 | `decode-0019-old.json`, `decode-0019-new1.json`, `decode-0019-new2.json`, `decode-0019-ab.txt` | the same bench on the image with patches 0019 and 0020, against itself with the previous prefetch behaviour set through the environment (2026-10-21 02:09-02:24) |
+| `wide-copy-windows.txt`, `decode-0021.json` | copy windows of 16 to 48 rows (the harness) and sparkDash's bench after deploying them (2026-10-21 03:00-04:55) |
+| `draft-coupling.txt` | drafts racing the target sampler's Gumbel draws at temperature 1 (negative) |
 | `decode-poll-ab.txt` | the same bench with a dashboard's `nvidia-smi` polling every 2 s against every 10 s, A/B/A/B (2026-10-21 02:35-02:45) |
 | `pf-summary.txt`, `pr-summary.txt`, `hp-summary.txt`, `ps-summary.txt`, `dp-summary.txt` | the kernel rounds' offline sweeps: the prefetcher's constants, the gather probes (GPU and host side), each prefetch site's budget, the drafter's prefetch (`KERNEL-ROUNDS.md`) |
 | `overnight-final.json`, `overnight-soak.txt` | the overnight run's start, its soak medians and the seven soak cycles |

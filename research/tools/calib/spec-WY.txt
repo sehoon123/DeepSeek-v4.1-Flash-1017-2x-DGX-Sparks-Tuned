@@ -1,0 +1,9 @@
+wy-32-or0|req-hc-oracle.json|1|--round-rows 32 --oracle-miss 0 --oracle-seed 1|--round-rows 32|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=32|700
+wy-32-or25|req-hc-oracle.json|1|--round-rows 32 --oracle-miss 25 --oracle-seed 7|--round-rows 32|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=32|700
+wy-32-or50|req-hc-oracle.json|1|--round-rows 32 --oracle-miss 50 --oracle-seed 11|--round-rows 32|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=32|700
+wy-32-or90|req-hc-oracle.json|1|--round-rows 32 --oracle-miss 90 --oracle-seed 13|--round-rows 32|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=32|700
+wy-32-or50p3|req-hc-oracle.json|3|--round-rows 32 --oracle-miss 50 --oracle-seed 17|--round-rows 32|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=32|700
+wy-16-or0|req-hc-oracle.json|1|--oracle-miss 0 --oracle-seed 1||TF_DS_CONF_FILE=/work/conf_head_f32.bin|700
+wy-24-nat|req-hc-nat.json|1|--round-rows 24|--round-rows 24|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=24|600
+wy-32-nat|req-hc-nat.json|1|--round-rows 32|--round-rows 32|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=32|600
+wy-16-nat|req-hc-nat.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600

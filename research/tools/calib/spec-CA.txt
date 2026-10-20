@@ -1,0 +1,7 @@
+ca-off-1|req-test-s.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+ca-a2|req-test-s.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_DRAFT_COUPLE=1 TF_DS_DRAFT_COUPLE_SCALE=2|600
+ca-a3|req-test-s.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_DRAFT_COUPLE=1 TF_DS_DRAFT_COUPLE_SCALE=3|600
+ca-a1.5|req-test-s.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_DRAFT_COUPLE=1 TF_DS_DRAFT_COUPLE_SCALE=1.5|600
+ca-a5|req-test-s.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_DRAFT_COUPLE=1 TF_DS_DRAFT_COUPLE_SCALE=5|600
+ca-a10|req-test-s.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_DRAFT_COUPLE=1 TF_DS_DRAFT_COUPLE_SCALE=10|600
+ca-off-2|req-test-s.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600

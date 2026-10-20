@@ -1,0 +1,39 @@
+Copy windows of 16, 24, 32 and 48 rows for a stream running alone (TF_DS_COPY_ROWS with --round-rows; the harness,
+tf-dsv41-lanes on both Sparks, production stopped, 2026-10-21 03:09-04:41). req-hc-nat: four prompts, two of them copies
+of a JavaScript file (verbatim, and with const -> let); req-hc-oracle: six prompts (two at temperature 1) whose copy
+proposals are the serial reply with N % of the copied tokens made wrong (--oracle-miss N). 'equal': every reply's token
+hash equals serial decoding's.
+
+run              reqs tok/round    tok/s  equal
+ww-16-nat           4     5.886   125.44  True
+wy-24-nat           4     6.242   128.00  True
+wy-32-nat           4     6.416   130.84  True
+wz-48-nat           4     6.601   132.86  True
+vf-nat              4     6.601   133.55  True
+wy-16-or0           6    15.398   212.15  True
+wy-32-or0           6    27.538   257.09  True
+wz-48-or0           6    37.684   279.14  True
+vf-or0              6    37.684   280.51  True
+wz-16-or25          6    10.302   162.08  True
+wy-32-or25          6    14.763   184.42  True
+wz-16-or50          6     7.325   126.84  True
+wy-32-or50          6     9.910   149.95  True
+wz-48-or50          6    10.491   148.93  True
+vf-or50             6    10.491   149.32  True
+wz-16-or90          6     3.729    75.39  True
+wy-32-or90          6     3.839    76.21  True
+wz-48-or90          6     4.011    78.85  True
+wy-32-or50p3        6     4.539    42.67  True
+ww-16-testx        11     3.278    84.50  True
+wz-48-testx        11     3.278    84.66  True
+vf-testx           11     3.280    84.83  True
+wz-16-testx-p4     11     2.988    38.01  True
+wz-48-testx-p4     11     3.025    37.96  True
+vf-testx-p4        11     3.037    37.25  True
+vf-s2               2     3.425    84.09  True
+vf-test-s          11     3.148    81.11  True
+vf-long             3     2.499    68.40  True
+
+vf-*: the deployed candidate (patches 0019-0021, 48 rows). vf-test-s: 11 sparkDash prompts at temperature 1 (seeds 101-111),
+hashes equal to a serial run's (11 of 11); vf-long: 32K / 64K / 126K prompts against their serial hashes. par 4 tok/s is a
+stream's. Arena (rank 0): 4,538 MB at 16 rows, 4,799 at 32, 5,060 at 48.

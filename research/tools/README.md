@@ -24,7 +24,9 @@ local sparkDash checkout (not included). Nothing here is needed to run the recip
 - `bench/bwmax.cu`: the GPU's read ceiling (grid-stride and blocked reads, three load flavours, an MoE-like layer pattern);
   `bench/pingpong.cu`: the GPU <-> CPU round trip through pinned host memory (the gather's doorbell and flag path).
   Build either with the image's nvcc: `nvcc -O2 -arch=sm_121 -std=c++17`.
-- `calib/spec-PS.txt`, `calib/spec-DP.txt`: the harness specs of the prefetch-site and drafter-prefetch sweeps.
+- `calib/spec-PS.txt`, `calib/spec-DP.txt`: the harness specs of the prefetch-site and drafter-prefetch sweeps;
+  `calib/spec-WW/WY/WZ/VF.txt` the copy-window rounds, `calib/spec-CP/CA.txt` the coupling runs; `calib/calib-run4.sh` is
+  `calib-run3.sh` with `NORESTORE=1` (leave the service stopped between windows).
 - `hcopy/`: the copy-window exactness runs (oracle copies with a share of wrong tokens, against serial decoding).
 - `profile/`: the lane profiler run (`--profile`) on sparkDash's prompts.
 - `bench/`: sparkDash-based decode and prefill probes (`conc-probe-dsv.mjs`, `conc-probe-sampled.mjs`, `idle-probe.mjs`,

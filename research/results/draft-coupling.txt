@@ -1,0 +1,21 @@
+The drafter's Markov steps racing the target sampler's Gumbel draws (research build, TF_DS_DRAFT_COUPLE=1; not shipped).
+The target samples token = argmax(logit / T - log(-log(u(seed, position, id)))) over its top-k / top-p candidates;
+coupled drafts use the same u on the drafter's scores, scaled by TF_DS_DRAFT_COUPLE_SCALE (alpha). 11 sparkDash prompts
+at temperature 1 (top-k 20, top-p 0.95, seeds 101-111), one stream; 'serial': token hashes equal to a serial run's.
+
+run           alpha  serial tok/round   tok/s
+cp-off-s-1      off   11/11     3.148   81.46
+cp-on-s-1         1   11/11     3.082   79.35
+cp-off-s-2      off   11/11     3.151   80.37
+cp-on-s-2         1   11/11     3.082   79.35
+ca-off-1        off   11/11     3.148   81.05
+ca-a1.5         1.5   11/11     3.144   80.61
+ca-a2             2   11/11     3.160   81.31
+ca-a3             3   11/11     3.139   80.80
+ca-a5             5   11/11     3.139   80.67
+ca-a10           10   11/11     3.131   80.38
+ca-off-2        off   11/11     3.148   81.13
+
+four streams: off 2.889 tok/round, alpha 1 2.839. Greedy rows are untouched (req-test-x with it on: 3.278, the same).
+Best case +0.4 % (alpha 2), within the noise: at temperature 1 with top-p 0.95 the target's draw mostly equals its argmax,
+and where it does not, the drafter's runner-up distribution does not predict which other token it draws.

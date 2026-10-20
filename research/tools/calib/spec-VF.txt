@@ -1,0 +1,9 @@
+vf-nat|req-hc-nat.json|1|--round-rows 48|--round-rows 48|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=48|600
+vf-or0|req-hc-oracle.json|1|--round-rows 48 --oracle-miss 0 --oracle-seed 1|--round-rows 48|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=48|700
+vf-or50|req-hc-oracle.json|1|--round-rows 48 --oracle-miss 50 --oracle-seed 11|--round-rows 48|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=48|700
+vf-testx|req-test-x.json|1|--round-rows 48|--round-rows 48|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=48|600
+vf-testx-p4|req-test-x.json|4|--round-rows 48|--round-rows 48|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=48|600
+vf-s2|req-s2.json|1|--round-rows 48|--round-rows 48|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=48|400
+vf-test-s|req-test-s.json|1|--round-rows 48|--round-rows 48|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=48|600
+vf-long|req-long-x.json|1|--round-rows 48|--round-rows 48|TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_COPY_ROWS=48|1200
+vf-16-testx|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600

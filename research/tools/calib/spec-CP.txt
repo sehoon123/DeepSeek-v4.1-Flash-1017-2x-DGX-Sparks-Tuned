@@ -1,0 +1,9 @@
+cp-ser-s|req-test-s.json|1|--serial 1||TF_DS_CONF_FILE=/work/conf_head_f32.bin|900
+cp-off-s-1|req-test-s.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+cp-on-s-1|req-test-s.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_DRAFT_COUPLE=1|600
+cp-on-s2|req-s2.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_DRAFT_COUPLE=1|400
+cp-off-s-2|req-test-s.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+cp-on-s-2|req-test-s.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_DRAFT_COUPLE=1|600
+cp-on-x|req-test-x.json|1|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_DRAFT_COUPLE=1|600
+cp-off-s-p4|req-test-s.json|4|||TF_DS_CONF_FILE=/work/conf_head_f32.bin|600
+cp-on-s-p4|req-test-s.json|4|||TF_DS_CONF_FILE=/work/conf_head_f32.bin TF_DS_DRAFT_COUPLE=1|600

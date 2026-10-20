@@ -83,9 +83,41 @@ environment (`TF_EXL3_L2_DELAY_NS=3000 TF_DS_DRAFT_PF=0`), back to back: prose +
   measured effect on decode is nil so far (the pinned-memory round trip above is the same on both Sparks); clearing it needs
   a module reload or a reboot.
 
+## Round 6: copy windows of 48 rows (2026-10-21 03:00-04:41, `zig/patches/0021`, `results/wide-copy-windows.txt`)
+
+A lone stream's copy windows were capped at 16 rows by two things, both in the engine's constants rather than its
+arithmetic. The window rings keep model.py's RING_EXTRA of 16 rows beyond the 128-key window, so a wider window would
+overwrite keys it still reads; and the decode round's kernels are captured (`kit/aot`) for at most 16 rows wherever a
+row count becomes a compile-time constant. Earlier "ROUND_ROWS > 16 changes hashes" came from a third place: a prompt
+chunk of up to RING_EXTRA rows takes ring mode, and a 17-32-row chunk in ring mode has no captured variant
+(`MissingTritonVariant`), so the prompt pass must keep ring mode at 16 rows.
+
+- `_sparse_attn_part` takes the ring's size as a runtime argument and reads keys by position (slot = position % size), so
+  48 spare rows change no arithmetic: ring 160 at 16-row windows gave the same hashes as ring 144.
+- Of the decode kernels with a row-count constant (`_rowmm_parts` RB 1-16, `_rowmm2r` RB 3-16, `_hc_mix_part` RB up to 8,
+  `_hc_mix_pf` RB up to 8), only the router's `_rowmm_parts` (RB = rows) has no variant past 16; its chunk sums run in
+  launches of at most 16 rows now (a row's sums do not depend on the rows beside it). The others tile rows by grid.
+- Exactness: every run's token hashes equal serial decoding's: natural copies, oracle copies 0 / 25 / 50 / 90 % wrong,
+  three streams, temperature 1 (11 prompts against a serial run), 32K / 64K / 126K prompts, four streams at 48 rows.
+- Speed (one stream): perfect copies 212 -> 279 tok/s (+31.6 %; 15.4 -> 37.7 tokens a round), a quarter / half wrong
+  +13.8 / +17.4 %, nine in ten wrong +4.6 %, the natural mix +6.5 %; text without copies and four streams unchanged.
+  Arena +261 MB per 16 rows (48 rows: +522 MB a Spark). Served after the deploy: sparkDash's six cells unchanged (code
+  four streams +3.3 %, within that cell's spread); `tools/validate.py` 8 of 8 equal to the earlier replies.
+
+## Round 7: drafts coupled to the sampler's randomness (negative, `results/draft-coupling.txt`)
+
+The target samples with a Gumbel race keyed by (seed, position, token id) through splitmix64 (`sampling.zig`), so a
+draft can race the same draws over the drafter's own scores: identical distributions would then always agree. A research
+build replaced the Markov loop's `_score` with a kernel doing that for sampled streams (`patches/draft-coupling.diff`, off
+by default, not shipped). At temperature 1 (top-k 20, top-p 0.95) it lost 2.1 % tokens a round at the drafter's own
+scale; sharpening it (alpha 1.5-10) brought it back to the argmax drafts' rate but never above it (best +0.4 %, noise).
+After top-p the target's draw is mostly its argmax, and where it is not, the drafter's runner-ups do not predict which
+other token it draws. Every sampled run's hashes equalled serial decoding's.
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels
 (rewriting `grouped_cp` / `glinear` would need their exact reduction order), the gather's pinned-memory path (GPU-initiated
-RDMA), and the host's round trip between rounds (~0.35-0.45 ms: acceptance read on the host before the next graph). The
-larger lever is tokens a round: a better drafter (training), not kernels.
+RDMA), and the host's round trip between rounds (~0.35-0.45 ms: acceptance read on the host before the next graph).
+Copy windows past 48 rows would need the round buffers' max_rows (48) and more captured kernels. The larger lever for
+text without copies is tokens a round: a better drafter (training), not kernels.

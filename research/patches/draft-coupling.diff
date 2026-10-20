@@ -1,0 +1,373 @@
+--- a/zig/kernels/cuda/dsv41_ops.cu
++++ b/zig/kernels/cuda/dsv41_ops.cu
+@@ -511,3 +511,97 @@
+         out[i] = ty == 1 ? rows[(long long)row_of[t] * dim + c] : ty == 0 ? start[c] : ty == 2 ? newline[c] : end[c];
+     }
+ }
++
++// The DSpark drafter's Markov scores under the target sampler's randomness (this recipe: TF_DS_DRAFT_COUPLE=1; drafts
++// only, the target's tokens are untouched). markov.py's _score: program (t, s) takes columns t * 1024 .. of segment
++// s; score = logit + the token's widened bias row (cached, else staged); a row's best (value, index) into PV / PI
++// [rows, n_part] in markov._better's order (NaN first, then the larger value, ties to the lower index). A row whose
++// stream samples (SAMP[r].inv_t > 0) scores (logit + bias) * inv_t - log(-log(u)) instead, u being
++// exact_sampling.uniform(seed, position, id) (the splitmix64 chain the target sampler's Gumbel race draws, here in
++// float), position SAMP[r].pos + step: the draft is the token the target's race picks from the drafter's distribution,
++// so the same randomness makes it the target's own draw wherever the two distributions agree.
++struct TfDsCouple {
++    unsigned long long seed;
++    long long pos;
++    float inv_t;
++    int pad0;
++    long long pad1;
++};
++
++__device__ __forceinline__ unsigned long long tf_ds_mix(unsigned long long x) {
++    x ^= x >> 30;
++    x *= 0xBF58476D1CE4E5B9ull;
++    x ^= x >> 27;
++    x *= 0x94D049BB133111EBull;
++    return x ^ (x >> 31);
++}
++
++__device__ __forceinline__ bool tf_ds_better(float v1, int i1, float v2, int i2) {
++    const bool n1 = v1 != v1, n2 = v2 != v2;
++    const bool gt = (v1 > v2) || (v1 == v2 && i1 < i2);
++    return (n1 && (!n2 || i1 < i2)) || (!n1 && !n2 && gt);
++}
++
++extern "C" __global__ void __launch_bounds__(256) tf_ds_markov_couple_kernel(
++    const float* LG, long long l_seg, long long l_row, const long long* TOK, long long t_stride, const int* SLOT,
++    const __half* CACHE, long long c_row, const __half* STAGE, long long s_row, float* PV, int* PI, int n_rows,
++    int n_cols, int seg0, int n_part, const TfDsCouple* SAMP, int step) {
++    __shared__ float sv[8];
++    __shared__ int si[8];
++    const int t = blockIdx.x, s = blockIdx.y, p = s * gridDim.x + t;
++    for (int r = 0; r < n_rows; r++) {
++        const long long tok = TOK[(long long)r * t_stride];
++        const int slot = SLOT[tok];
++        const float inv_t = SAMP[r].inv_t;
++        unsigned long long h = 0;
++        if (inv_t > 0.f) {
++            const unsigned long long pos = (unsigned long long)(SAMP[r].pos + step);
++            h = tf_ds_mix(tf_ds_mix(SAMP[r].seed + 0x9E3779B97F4A7C15ull) ^ (pos * 0xD1B54A32D192ED03ull));
++        }
++        float bv = -INFINITY;
++        int bi = 1 << 30;
++        for (int k = threadIdx.x; k < 1024; k += blockDim.x) {
++            const int c = t * 1024 + k;
++            if (c >= n_cols) break;
++            const long long cc = (long long)s * n_cols + c;
++            const int v = (seg0 + s) * n_cols + c;
++            const float b = slot >= 0 ? __half2float(CACHE[(long long)slot * c_row + cc])
++                                      : __half2float(STAGE[(long long)r * s_row + cc]);
++            float sc = LG[(long long)s * l_seg + (long long)r * l_row + c] + b;
++            if (inv_t > 0.f) {
++                const unsigned long long x = tf_ds_mix(h ^ (unsigned long long)v);
++                const float u = (float)(x >> 40) * 0x1p-24f + 0x1p-25f;
++                sc = sc * inv_t - logf(-logf(u));
++            }
++            if (tf_ds_better(sc, v, bv, bi)) {
++                bv = sc;
++                bi = v;
++            }
++        }
++        for (int o = 16; o > 0; o >>= 1) {
++            const float ov = __shfl_down_sync(0xffffffffu, bv, o);
++            const int oi = __shfl_down_sync(0xffffffffu, bi, o);
++            if (tf_ds_better(ov, oi, bv, bi)) {
++                bv = ov;
++                bi = oi;
++            }
++        }
++        if ((threadIdx.x & 31) == 0) {
++            sv[threadIdx.x >> 5] = bv;
++            si[threadIdx.x >> 5] = bi;
++        }
++        __syncthreads();
++        if (threadIdx.x == 0) {
++            float b2 = sv[0];
++            int i2 = si[0];
++            for (int j = 1; j < (int)(blockDim.x >> 5); j++)
++                if (tf_ds_better(sv[j], si[j], b2, i2)) {
++                    b2 = sv[j];
++                    i2 = si[j];
++                }
++            PV[(long long)r * n_part + p] = b2;
++            PI[(long long)r * n_part + p] = i2;
++        }
++        __syncthreads();
++    }
++}
+--- a/zig/src/families/dsv41/ops.zig
++++ b/zig/src/families/dsv41/ops.zig
+@@ -35,6 +35,7 @@
+     cand_fast: cuda.Function,
+     iota_vis: cuda.Function,
+     l2_prefetch: cuda.Function,
++    markov_couple: cuda.Function,
+     block_max: cuda.Function,
+     pool_pick: cuda.Function,
+     apply_pool: cuda.Function,
+@@ -66,6 +67,7 @@
+             .cand_fast = try fm.function("tf_ds_cand_fast_kernel"),
+             .iota_vis = try fm.function("tf_ds_iota_vis_kernel"),
+             .l2_prefetch = try fm.function("tf_ds_l2_prefetch_kernel"),
++            .markov_couple = try fm.function("tf_ds_markov_couple_kernel"),
+             .block_max = try fm.function("tf_ds_block_max_kernel"),
+             .pool_pick = try fm.function("tf_ds_pool_pick_kernel"),
+             .apply_pool = try fm.function("tf_ds_apply_pool_kernel"),
+@@ -202,6 +204,31 @@
+ 
+     /// The indexer's selection of every scanned key (its top-k takes all nb): out [rows, nb] int64 = j where j <
+     /// vis[r], else -1 (vis [rows] int64), on the device.
++    /// tf_ds_markov_couple_kernel: markov._score's programs (s_tiles, segs) of 256 threads for draft.zig's coupled
++    /// Markov steps, a sampled stream's row raced with the target sampler's Gumbel draws (TfDsCouple rows in samp).
++    pub fn markovCouple(o: *const Ops, s: cuda.Stream, lg: u64, l_seg: usize, l_row: usize, tok: u64, t_stride: usize, slot: u64, cache: u64, c_row: usize, stage: u64, s_row: usize, pv: u64, pi: u64, n_rows: usize, n_cols: usize, seg0: usize, n_part: usize, samp: u64, step: usize, s_tiles: usize, segs: usize) !void {
++        var a: cuda.Args = .{};
++        a.add(lg);
++        a.add(@as(c_longlong, @intCast(l_seg)));
++        a.add(@as(c_longlong, @intCast(l_row)));
++        a.add(tok);
++        a.add(@as(c_longlong, @intCast(t_stride)));
++        a.add(slot);
++        a.add(cache);
++        a.add(@as(c_longlong, @intCast(c_row)));
++        a.add(stage);
++        a.add(@as(c_longlong, @intCast(s_row)));
++        a.add(pv);
++        a.add(pi);
++        a.add(@as(c_int, @intCast(n_rows)));
++        a.add(@as(c_int, @intCast(n_cols)));
++        a.add(@as(c_int, @intCast(seg0)));
++        a.add(@as(c_int, @intCast(n_part)));
++        a.add(samp);
++        a.add(@as(c_int, @intCast(step)));
++        try cuda.launch.launch(o.markov_couple, .{ .grid = .{ .x = @intCast(s_tiles), .y = @intCast(segs) }, .block = .{ .x = 256 } }, s, &a);
++    }
++
+     pub fn iotaVis(o: *const Ops, s: cuda.Stream, vis: u64, out: u64, nb: usize, rows: usize) !void {
+         if (rows == 0 or nb == 0) return;
+         var a: cuda.Args = .{};
+--- a/zig/src/families/dsv41/tri_markov.zig
++++ b/zig/src/families/dsv41/tri_markov.zig
+@@ -126,6 +126,16 @@
+         return if (m.split) sc.send else null;
+     }
+ 
++    /// _finish alone (local_best's second launch, after a caller's own scores into sc.pv / sc.pi): out[:, i + 1], or the
++    /// returned send [N, 4] (split).
++    pub fn finish(m: Markov, t: Tri, out: u64, ts: usize, n: usize, i: usize, sc: Scratch) !?u64 {
++        try t.run("_finish", .{ u(n), 1, 1 }, &.{
++            p("PV", "*fp32", sc.pv), p("PI", "*i32", sc.pi),      int("n_part", m.n_part),            p("OUT", "*i64", out + 8 * (i + 1)),
++            int("o_stride", ts),     p("SEND", "*fp32", sc.send), int("send", @intFromBool(m.split)),
++        }, &.{ ci("BP", m.bp), t.pdlConst() });
++        return if (m.split) sc.send else null;
++    }
++
+     /// Markov.pick: out[:, i + 1] (out [N, steps + 1] int64, row stride ts) from every rank's (value, index) bests g [world, N, 4] fp32.
+     pub fn pick(_: Markov, t: Tri, g: u64, world: usize, out: u64, ts: usize, n: usize, i: usize) !void {
+         try t.run("_pick", .{ u(n), 1, 1 }, &.{ p("G", "*fp32", g), int("n_rows", n), p("OUT", "*i64", out + 8 * (i + 1)), int("o_stride", ts) }, &.{ ci("WORLD", world), t.pdlConst() });
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -778,11 +778,12 @@
+ 
+     /// The drafter's batched pass for N streams: each one's pending token at position q0 in its slot (its rings hold
+     /// its positions below q0), `steps` drafts each (the drafter's drafts and confidences on the host).
+-    pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize) !void {
++    pub fn pass(m: *Model, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, samp: []const draft.DraftSample) !void {
+         if (m.dr == null) return error.NoDrafter;
+         const dr = &m.dr.?;
+         const pool = &m.dpool.?;
+         for (q0, slots) |q, s| pool.absorbed[@intCast(s)] = @intCast(q);
++        dr.setSampling(samp);
+         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
+     }
+ };
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -31,7 +31,7 @@
+ pub const window_rows = 6;
+ /// A lone stream's widest copy window (TF_DS_COPY_ROWS; the drafter's windows stay at window_rows): the row-invariant
+ /// round's rows (TF_DS_ROUND_ROWS) and the window rings' RING_EXTRA (32 here, the target's and the drafter's) bound it.
+-pub const max_window = 32;
++pub const max_window = 48;
+ 
+ /// The image rows a fill_images frame carries at most.
+ pub const image_piece = 32 << 10;
+@@ -935,6 +935,7 @@
+         var tokens: [max_streams]i64 = undefined;
+         var q0: [max_streams]i64 = undefined;
+         var slots: [max_streams]i64 = undefined;
++        var samp: [max_streams]draft.DraftSample = @splat(.{});
+         var depths: [max_streams]usize = undefined;
+         var asked: [max_streams]*Lane = undefined;
+         var n: usize = 0;
+@@ -950,6 +951,9 @@
+             tokens[n] = token;
+             q0[n] = @intCast(r.position - 1);
+             slots[n] = @intCast(l.slot);
++            if (r.stream.sampling) |sm| if (sm.temperature > 0) {
++                samp[n] = .{ .seed = sm.seed, .temperature = sm.temperature };
++            };
+             depths[n] = @min(r.depth, block);
+             asked[n] = l;
+             steps = @max(steps, depths[n]);
+@@ -963,11 +967,13 @@
+                 try self.wire.int(gpa, i64, tokens[i]);
+                 try self.wire.int(gpa, i64, q0[i]);
+                 try self.wire.int(gpa, i64, slots[i]);
++                try self.wire.int(gpa, u64, samp[i].seed);
++                try self.wire.int(gpa, u64, @bitCast(samp[i].temperature));
+             }
+             try self.flush();
+         }
+         const t0 = m.now();
+-        try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps);
++        try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps, samp[0..n]);
+         if (self.prof) |*p| {
+             p.pass += m.now() - t0;
+             p.passes += 1;
+@@ -1267,12 +1273,14 @@
+                 var tokens: [max_streams]i64 = undefined;
+                 var q0: [max_streams]i64 = undefined;
+                 var slots: [max_streams]i64 = undefined;
++                var samp: [max_streams]draft.DraftSample = @splat(.{});
+                 for (0..n) |i| {
+                     tokens[i] = try r.int(i64);
+                     q0[i] = try r.int(i64);
+                     slots[i] = try r.int(i64);
++                    samp[i] = .{ .seed = try r.int(u64), .temperature = @bitCast(try r.int(u64)) };
+                 }
+-                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(err);
++                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps, samp[0..n]) catch |err| refused(err);
+             },
+             .fill_images => {
+                 const count = try r.int(u32);
+--- a/zig/src/families/dsv41/draft.zig
++++ b/zig/src/families/dsv41/draft.zig
+@@ -40,7 +40,7 @@
+ /// sparse_attn's pick list of a single-split call: padded with -1 to a multiple of 16 entries.
+ const pick_pad = 16;
+ /// dspark.py: ring_size = window + 16.
+-pub const ring_extra = 32; // prompt.ring_extra's (the drafter's absorbs follow the target's copy windows)
++pub const ring_extra = 48; // prompt.ring_extra's (the drafter's absorbs follow the target's copy windows)
+ /// The stages (DSpark blocks) and a stream's block rows at most.
+ pub const max_stages = 4;
+ pub const max_block = 8;
+@@ -154,6 +154,12 @@
+     }
+ };
+ 
++/// A drafting stream's sampling for the coupled Markov steps (TF_DS_DRAFT_COUPLE=1): its seed and temperature (0:
++/// greedy), as the target's sampler draws its tokens.
++pub const DraftSample = struct { seed: u64 = 0, temperature: f64 = 0 };
++/// tf_ds_markov_couple_kernel's row (dsv41_ops.cu TfDsCouple, 32 bytes): seed, the first draft's position, 1 / T.
++const Couple = extern struct { seed: u64 = 0, pos: i64 = 0, inv_t: f32 = 0, pad0: i32 = 0, pad1: i64 = 0 };
++
+ pub const Drafter = struct {
+     ds: weights.DSpark,
+     n: usize, // a stream's block rows: [token, noise x (n - 1)]
+@@ -234,6 +240,12 @@
+     pf_fork: ?cuda.Event = null,
+     pf_join: ?cuda.Event = null,
+     pf_out: bool = false,
++    // the coupled Markov steps (TF_DS_DRAFT_COUPLE=1): the next pass's streams' sampling (setSampling), uploaded with
++    // its index rows into samp (Couple [max_streams])
++    couple: bool = false,
++    couple_scale: f64 = 1.0, // TF_DS_DRAFT_COUPLE_SCALE: the drafter's race at temperature T / scale (sharper above 1)
++    samp: u64 = 0,
++    hsamp: [max_streams]DraftSample = @splat(.{}),
+     // the last pass on the host: each stream's drafts and confidences (`steps` of them)
+     streams: usize = 0,
+     steps: usize = 0,
+@@ -365,6 +377,10 @@
+         dr.pf_fork = null;
+         dr.pf_join = null;
+         dr.pf_out = false;
++        dr.couple = coupleWanted();
++        dr.couple_scale = coupleScale();
++        dr.samp = try a.take(max_streams * @sizeOf(Couple));
++        dr.hsamp = @splat(.{});
+         if (draftPrefetchWanted()) {
+             dr.pf = try cuda.Stream.init(e.d, true);
+             dr.pf_fork = try cuda.Event.init(e.d, false);
+@@ -480,6 +496,15 @@
+         var ho: [max_streams * (max_block + 1)]i64 = @splat(0);
+         for (0..N) |i| ho[i * ts] = tokens[i];
+         try prompt.upload(e, dr.out, &ho, N * ts * 8);
++        if (dr.couple) {
++            var hs: [max_streams]Couple = @splat(.{});
++            for (0..N) |i| {
++                const sm = dr.hsamp[i];
++                hs[i] = .{ .seed = sm.seed, .pos = q0[i] + 1, .inv_t = if (sm.temperature > 0) @floatCast(dr.couple_scale / sm.temperature) else 0 };
++            }
++            try prompt.upload(e, dr.samp, &hs, N * @sizeOf(Couple));
++        }
++        dr.hsamp = @splat(.{});
+         if (dr.graphs != null and probe == null) try dr.graphs.?.run(dr, e, ch, pool, N, steps) else try dr.body(e, ch, pool, N, steps, probe);
+         // one host read: the drafts and the confidences
+         try e.s.synchronize();
+@@ -548,7 +573,9 @@
+         // the Markov loop: out [N, steps + 1], each stream's last token first
+         const ts = steps + 1;
+         var g: MarkovGather = .{ .e = e, .dst = dr.mg };
+-        try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run });
++        if (dr.couple) {
++            try dr.coupledSteps(e, dr.local, ts, N, steps, .{ .ctx = &g, .run = MarkovGather.run });
++        } else try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run });
+         try Probe.check(probe, .markov, S, dr.out);
+         // the confidence head: [xc (fp32), the embedding rows the steps read (fp32)] @ conf^T, a stream's first steps rows
+         const rank = c.markov_rank;
+@@ -587,6 +614,32 @@
+         dr.pf_out = true;
+     }
+ 
++    /// The next pass's streams' sampling (in its streams' order; unset streams draft greedily). pass() takes it.
++    pub fn setSampling(dr: *Drafter, samp: []const DraftSample) void {
++        for (samp, 0..) |x, i| if (i < max_streams) {
++            dr.hsamp[i] = x;
++        };
++    }
++
++    /// Markov.steps with tf_ds_markov_couple_kernel in _score's place (TF_DS_DRAFT_COUPLE=1): a sampled stream's drafts
++    /// are the target sampler's Gumbel race over the drafter's scores; greedy rows score as _score does.
++    fn coupledSteps(dr: *Drafter, e: *const Engine, lg: u64, ts: usize, N: usize, count: usize, gather: tri_markov.Gather) !void {
++        const m = dr.mk;
++        const t = e.t;
++        const sc = dr.msc;
++        if (N > tri_markov.np) return error.TooManyRows;
++        const nc = m.n_cols;
++        const lw = if (m.lg_w != 0) m.lg_w else nc;
++        const l_seg = if (m.lg_w != 0) nc else N * dr.n * nc;
++        for (0..count) |i| {
++            const tok = dr.out + 8 * i;
++            try m.bias(t, tok, ts, m.slot, sc.stage, m.cols, N);
++            try e.ops.markovCouple(e.s, lg + 4 * i * lw, l_seg, dr.n * lw, tok, ts, m.slot, m.cache, m.cols, sc.stage, m.cols, sc.pv, sc.pi, N, nc, m.seg0, m.n_part, dr.samp, i, m.s_tiles, m.segs);
++            const send = try m.finish(t, dr.out, ts, N, i, sc) orelse continue;
++            try m.pick(t, try gather.run(gather.ctx, send, N), m.world, dr.out, ts, N, i);
++        }
++    }
++
+     /// The main stream waits for the pass's prefetches (a captured pass ends joined: its graph's every stream).
+     fn joinPrefetch(dr: *Drafter, e: *const Engine) !void {
+         if (!dr.pf_out) return;
+@@ -704,6 +757,19 @@
+     return !std.mem.eql(u8, std.mem.span(v), "0");
+ }
+ 
++/// TF_DS_DRAFT_COUPLE=1: a sampled stream's drafts race the target sampler's Gumbel draws (drafts only; off by default).
++fn coupleWanted() bool {
++    const v = std.c.getenv("TF_DS_DRAFT_COUPLE") orelse return false;
++    return std.mem.eql(u8, std.mem.span(v), "1");
++}
++
++/// TF_DS_DRAFT_COUPLE_SCALE (0.25 to 64, default 1): the coupled race's logits scale over the stream's temperature.
++fn coupleScale() f64 {
++    const v = std.c.getenv("TF_DS_DRAFT_COUPLE_SCALE") orelse return 1.0;
++    const x = std.fmt.parseFloat(f64, std.mem.span(v)) catch return 1.0;
++    return if (x < 0.25 or x > 64) 1.0 else x;
++}
++
+ /// The bytes one of the pass's prefetches may touch into L2: `default`, or `name` in MiB (0 to 64; 0: none there).
+ fn dpfBudget(name: [*:0]const u8, default: u64) u64 {
+     const v = std.c.getenv(name) orelse return default;
