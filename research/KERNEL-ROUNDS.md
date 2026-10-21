@@ -229,6 +229,46 @@ started too late; the shipped read-ahead takes the next two chunks' rows onto ba
 chunks' Engram reads earlier on a ring of their own: -9.4 / -12.5 / -13.9 % prefill at 16K / 32K / 126K, served -11 to
 -12.5 % at 29K-144K tokens, every reply the same.
 
+## Round 17: what else bounds a prompt and a long context (2026-10-21 22:40 - 10-22 01:30)
+
+- **Decode deep in a context is the drafter, not the kernels.** On a 126K-token context a round takes 37.2 ms (a short
+  one's K3 round 38.9 ms): `topk` over the compressed keys, the longer index scores and the merge add ~1-1.5 ms; the MoE
+  and linears read the same. What drops is tokens a round, 2.57 against 3.28: the drafter attends to its last 128
+  positions only.
+- **Eight streams** (`--streams 8`, 16 prompts): 4 x 35.3 -> 8 x 19.4 tokens/s, +10 % aggregate for -45 % a stream, for
+  34 MB more arena. Every reply equal; four stays the recipe's setting.
+- **A chunk's first-layer Engram rows on two rings** (the back hosts' ring idle until they are read): no change on
+  single-chunk prompts (1.6K tokens 1.10 s either way) or two-chunk ones (4K 2.15 s). The reads are not what a short
+  prompt waits for.
+- **A follow-up turn's TTFT** is the prefill of its tokens since the last kept state: states are kept at 2,048-row chunk
+  ends before the replay (other ends would change the chunks a prompt is cut into, and its bits), so a turn redoes up to
+  ~2K of the last one's tokens: 1.5-2.3 s for turns of 2-4K tokens on a 30K conversation. Running the last encoder-only
+  chunk beside the final one would need the state kept between them, which the pair's shared layers overwrite.
+- **Graphs on or off with four mixed streams** (an earlier run had graphs off faster): on 10.03, off 9.94 tokens/s a
+  stream (69 captures); one stream 84.70 / 82.80. Not reproduced; captures cost nothing visible.
+- **Memory with 0025 / 0026** (served, floor 3 GiB): a full prompt cache (61 states, 465 MiB), a 290,187-token prompt
+  (140.0 s, before pairs 168.6-169.3 s) and three conversations at once kept MemAvailable >= 4,998 MiB on the head, 5,768
+  on the other Spark (134 turns, no errors).
+- Nsight Compute's kernel replay saves the device memory a kernel can write: with the model resident in the Spark's
+  unified memory that exhausted the host (the OOM killer took desktop services); profile kernels standalone, not in the
+  engine (and not beside a serving engine either: a standalone `--set full` run took the host under the memory guard's
+  floor).
+- **The prompt MoE kernels against the tensor cores.** GB10 sustains 110.3 TFLOPS of `mma.sync` m16n8k16 fp16 x fp16 ->
+  fp32 (1,021 FLOP a clock an SM at 2.22 GHz). The gate / up kernel (`grouped_mma_kernel<2, 2, 10, FOLD, KB 4>`, run
+  standalone on a pair's routing: 4,096 rows, 6 of 384 experts + the shared one) takes 18.9 ms, 35.9 TFLOPS of useful
+  work (33 %); 2,048 rows 13.0 ms, 25.9 TFLOPS. Its 64-row member blocks are 72.8 % full on a pair, 53.8 % on a single
+  chunk. Nsight Compute (standalone): 106 registers and 44.3 KB of shared memory a block hold it to 2 blocks (16 warps)
+  an SM (100 KB of shared memory an SM); no warp eligible 59 % of the time; stalls a issued instruction: barrier 1.91,
+  wait 1.71, math pipe 1.23, short scoreboard 0.96, long scoreboard 0.70; 64M shared-memory bank conflicts.
+- **Every bit-exact setting the kit has, and two it lacks, are slower** (16K / 32K prefill, every hash equal): the
+  served gate / up `KB 4` against `KB 2` (+6 / +10 %); the down kernel's (column tiles, prefetch, row tiles a group)
+  served `8,1,2` against `8,1,1` (+1 %), `8,2,1` (+2 %), `4,2,2` (+2.5 %) and, built for this (SASS of every kit kernel
+  unchanged), `4,1,4` (+2 %) and `4,2,4` (+3.5 %). A step's tiles and a group's rows do not change an output's mma chains
+  or their order; four warps keep the down kernel's K ranges. `__launch_bounds__(256, 3)` gives 80 registers (48 B
+  spilled) but still 2 blocks (shared memory), 4 % slower, the same bits. The kit's warp-decoding `mma2` (other bits; N
+  a multiple of 256, so not this model's 1,152) is only ~10 % faster at N 1,024. What is left there is a kernel without
+  the per-step barrier and with 3+ blocks an SM, keeping each output's 16 chains and their sum order.
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels
