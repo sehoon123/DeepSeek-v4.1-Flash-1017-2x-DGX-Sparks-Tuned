@@ -11,3 +11,5 @@ Research-only diffs, not in the image (`zig/patches/` holds what the image appli
 | `experts-stages.diff` | 10 | against the engine's `deepseek-v41-tp2` source (`src/tensorfold/cuda/exl3`), not this recipe: `grouped_cp_launch` also instantiating 4 and 5 cp.async stages, built as the engine's torch extension builds it (cpp_extension, `-O3 -lineinfo`, sm_121) |
 | `copy-multi.diff` | 13 | copies of the prompt growing beside other streams, rows shared evenly (`TF_DS_COPY_MULTI=N`): +29 % / +9 % when two / four streams all edit, a non-copying stream beside a copying one -21 %, the natural mix -1.6 % |
 | `pf-evict-last.diff` | 13 | the bulk L2 prefetch marking its lines `evict_last` (`TF_DS_PF_HINT=1`): -0.3 % one stream, -0.4 % four |
+| `draft-share.diff` | 15 | the drafter's block rows sharing one row's routed experts (`TF_DS_DRAFT_SHARE=1/2`): -5.0 % / -2.4 % one stream |
+| `hc-fused-post.diff` | 15 | a decode gather's collect fused with `_hc_post_only` (`TF_DS_HC_FUSED=1`): same replies, same speed |

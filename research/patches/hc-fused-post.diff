@@ -1,0 +1,246 @@
+--- a/zig/kernels/cuda/dsv41/rdma_gather.cu
++++ b/zig/kernels/cuda/dsv41/rdma_gather.cu
+@@ -7,6 +7,7 @@
+ // launches, sm_90+), so the pair does not break a chain of early launches.
+ 
+ #include <cstdint>
++#include <cuda_bf16.h>
+ #include <cuda_runtime.h>
+ 
+ namespace {
+@@ -169,6 +170,52 @@
+     }
+ }
+ 
++
++// TF_DS_HC_FUSED (this recipe): a gather's collect fused with the hc post that reads it (kernels.py _hc_post_only, op
++// for op): wait for every peer's flag at this sequence, then xo[r, s, :] = bf16(fma(post[r, s], bf16(g_0 + g_1 + ...),
++// fma(c3, x3, fma(c2, x2, fma(c0, x0, c1 * x1))))), c_j = comb[r, j, s], x_j = x[r, j, :], g_p rank p's fp32 partial (this
++// rank's own source, a peer's ring slot): the same roundings in the same order, so the same bits, and the gathered
++// partials are never written out.
++extern "C" __global__ void __launch_bounds__(COLLECT_THREADS) dsv41_rdma_collect_post(const float* __restrict__ own,
++        const char* recv_ring, const uint64_t* flags, const uint64_t* seq, int rank, int world, int slots,
++        uint64_t max_bytes, const uint64_t* abort_word, const __nv_bfloat16* __restrict__ x,
++        __nv_bfloat16* __restrict__ xo, const float* __restrict__ post, const float* __restrict__ comb, int rows, int D,
++        int pdl) {
++    pdl_enter(pdl);                              // the staging kernel's sequence and the post's coefficients are written
++    const uint64_t q = *seq;
++    const int slot = (int)(q % slots);
++    if (threadIdx.x < world && threadIdx.x != rank)
++        for (uint32_t i = 1; load_sys(flags + (size_t)slot * world + threadIdx.x) < q; ++i)
++            if ((i & 1023) == 0 && load_sys(abort_word)) break;
++    __syncthreads();
++    const size_t wide = (size_t)4 * D;
++    const size_t n = (size_t)rows * wide;
++    for (size_t e = (size_t)blockIdx.x * blockDim.x + threadIdx.x; e < n; e += (size_t)gridDim.x * blockDim.x) {
++        const size_t r = e / wide;
++        const int rem = (int)(e - r * wide);
++        const int s = rem / D;
++        const int d = rem - s * D;
++        const size_t gi = r * D + d;
++        float ya = 0.f;
++        for (int p = 0; p < world; ++p) {
++            const float g = p == rank ? own[gi]
++                                      : __ldcv(reinterpret_cast<const float*>(recv_ring + ((size_t)slot * world + p) * max_bytes) + gi);
++            ya = p == 0 ? g : __fadd_rn(ya, g);
++        }
++        const float y = __bfloat162float(__float2bfloat16_rn(ya));
++        const __nv_bfloat16* xr = x + r * wide + d;
++        const float x0 = __bfloat162float(xr[0]);
++        const float x1 = __bfloat162float(xr[D]);
++        const float x2 = __bfloat162float(xr[2 * D]);
++        const float x3 = __bfloat162float(xr[3 * D]);
++        const float* cr = comb + r * 16;
++        const float c0 = cr[0 * 4 + s], c1 = cr[1 * 4 + s], c2 = cr[2 * 4 + s], c3 = cr[3 * 4 + s];
++        const float ps = post[r * 4 + s];
++        const float v = __fmaf_rn(ps, y, __fmaf_rn(c3, x3, __fmaf_rn(c2, x2, __fmaf_rn(c0, x0, __fmul_rn(c1, x1)))));
++        xo[r * wide + (size_t)s * D + d] = __float2bfloat16_rn(v);
++    }
++}
++
+ 
+ constexpr int MAXW = 8;
+ 
+--- a/zig/src/families/dsv41/rdma.zig
++++ b/zig/src/families/dsv41/rdma.zig
+@@ -80,9 +80,10 @@
+     stage: cuda.Function,
+     collect: cuda.Function,
+     collect_into: cuda.Function,
++    collect_post: cuda.Function,
+ 
+     pub fn load(m: cuda.Module) cuda.Error!Kernels {
+-        return .{ .stage = try m.function("dsv41_rdma_stage"), .collect = try m.function("dsv41_rdma_collect"), .collect_into = try m.function("dsv41_rdma_collect_into") };
++        return .{ .collect_post = try m.function("dsv41_rdma_collect_post"), .stage = try m.function("dsv41_rdma_stage"), .collect = try m.function("dsv41_rdma_collect"), .collect_into = try m.function("dsv41_rdma_collect_into") };
+     }
+ };
+ 
+@@ -482,6 +483,38 @@
+         const blocks = std.math.clamp((@as(u64, n4) * r.world + per - 1) / per, 1, r.s.collect_blocks);
+         try cuda.launch.launch(r.k.collect, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
+     }
++    /// TF_DS_HC_FUSED: this rank's slice sent (the gather's first half); collectPost then reads every rank's slice.
++    pub fn stageOnly(r: *Ring, stream: cuda.Stream, send: DevicePtr, n4: u32) Error!void {
++        if (r.failure() != null) return error.Failed;
++        if (@as(usize, n4) * 16 > r.s.max_bytes) return error.TooLarge;
++        try r.stage(stream, send, n4, 0, n4, n4);
++    }
++    /// The gather staged last (stageOnly of `own`, [rows, d] fp32 a rank) collected straight into the hc post of the
++    /// streams x [rows, 4, d] bf16: xo, as kernels.py _hc_post_only computes it (rdma_gather.cu).
++    pub fn collectPost(r: *Ring, stream: cuda.Stream, own: DevicePtr, x: DevicePtr, xo: DevicePtr, post: DevicePtr, comb: DevicePtr, rows: u32, d: u32) Error!void {
++        if (r.failure() != null) return error.Failed;
++        var a: cuda.Args = .{};
++        a.add(own);
++        a.add(r.recv.dev);
++        a.add(r.metaDev(r.flags()));
++        a.add(r.scalar(0));
++        a.add(@as(c_int, @intCast(r.rank)));
++        a.add(@as(c_int, @intCast(r.world)));
++        a.add(@as(c_int, @intCast(r.s.slots)));
++        a.add(@as(u64, r.s.max_bytes));
++        a.add(r.metaDev(r.abortWord()));
++        a.add(x);
++        a.add(xo);
++        a.add(post);
++        a.add(comb);
++        a.add(@as(c_int, @intCast(rows)));
++        a.add(@as(c_int, @intCast(d)));
++        a.add(@as(c_int, @intFromBool(r.s.pdl)));
++        const n: u64 = @as(u64, rows) * 4 * d;
++        const per = collect_threads * 4;
++        const blocks = std.math.clamp((n + per - 1) / per, 1, @max(r.s.collect_blocks, 1) * 4);
++        try cuda.launch.launch(r.k.collect_post, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
++    }
+     /// A rank's slice in `dsts` (its rows `row4` float4 wide, `stride4` apart; ptr 0: not copied out).
+     pub const Dst = struct { ptr: DevicePtr = 0, row4: u32 = 0, stride4: u64 = 0 };
+     /// Every rank's [rows, w_p] fp32 slice straight into dsts[p]; `send` is this rank's slice, contiguous. Every rank
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -132,6 +132,15 @@
+ 
+     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
+     /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.
++    /// TF_DS_HC_FUSED: the ring's first half of a gather of `count` fp32 (this rank's slice sent), when the ring takes it.
++    pub fn gatherStage(e: *const Engine, src: u64, count: usize) !bool {
++        if (e.ring) |r| if (count % 4 == 0 and count * 4 <= r.s.max_bytes) {
++            try r.stageOnly(e.s, src, @intCast(count / 4));
++            return true;
++        };
++        return false;
++    }
++
+     pub fn gatherF32(e: *const Engine, src: u64, dst: u64, count: usize) !void {
+         if (e.ring) |r| if (count % 4 == 0 and count * 4 <= r.s.max_bytes) return r.gather(e.s, src, @intCast(count / 4), dst);
+         return e.comm.allGather(src, dst, count, .f32, e.s);
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -44,6 +44,16 @@
+ const raw_rows = prompt.raw_rows;
+ 
+ /// graph.py bucket_for: the context bucket of a round whose deepest row sees n positions, in a pool of `cap`.
++/// TF_DS_HC_FUSED=1 (this recipe): a decode round's attention and MoE gathers are collected by the hc post that reads them
++/// (rdma.Ring.collectPost: one kernel for the collect and _hc_post_only, the same bits), where the ring takes them.
++var fused_post: ?bool = null;
++fn fusedPost() bool {
++    if (fused_post) |f| return f;
++    const f = if (std.c.getenv("TF_DS_HC_FUSED")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
++    fused_post = f;
++    return f;
++}
++
+ /// TF_DS_GRAPH_CAP=N: Graphs keeps at most N captured stretches (unset, 0 or not a number: no cap).
+ fn graphCap() usize {
+     const v = std.c.getenv("TF_DS_GRAPH_CAP") orelse return 0;
+@@ -1011,6 +1021,8 @@
+     var pre_f = cy.pre_f;
+     var ntap = cy.ntap;
+     var pending: ?u64 = null;
++    var deferred: ?u64 = null; // TF_DS_HC_FUSED: the pending gather only staged, this rank's source still to collect
++    const fuse = fusedPost() and probe == null and e.two == null and e.ring != null and tri_hc.hcDotsOn(d);
+     for (li..end) |l| {
+         const lay = w.layers[l];
+         rd.cur_ratio = lay.ratio;
+@@ -1031,7 +1043,7 @@
+             try rd.mark(e, .engram);
+         }
+         // the attention mixes, the pending post fused in (pre_mix)
+-        h = try mix(e, rd, h, &spare, &pending, lay.hc_attn, pre, lay.attn_norm, rd.pre_a, R);
++        h = try mix(e, rd, h, &spare, &pending, &deferred, lay.hc_attn, pre, lay.attn_norm, rd.pre_a, R);
+         try rd.mark(e, .mix_attn);
+         if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(l)) != null) {
+             // one launch a tap, straight into its block of the taps buffer
+@@ -1042,17 +1054,23 @@
+         try attention(e, rd, ch, cs, rings, &sh, l);
+         try rd.mark(e, .attn);
+         try Probe.check(probe, .attn_out, l, rd.pa);
+-        if (e.two) |tw| try tw.quarters(e, rd.pa, rd.ga, R, tw.ow, 4) else try e.gatherF32(rd.pa, rd.ga, R * d);
++        if (e.two) |tw| try tw.quarters(e, rd.pa, rd.ga, R, tw.ow, 4) else if (fuse and try e.gatherStage(rd.pa, R * d)) {
++            deferred = rd.pa;
++        } else try e.gatherF32(rd.pa, rd.ga, R * d);
+         try rd.mark(e, .gather_a);
+         try Probe.check(probe, .attn_gather, l, rd.ga);
+         pending = rd.ga;
+-        h = try mix(e, rd, h, &spare, &pending, lay.hc_ffn, rd.pre_a, lay.ffn_norm, pre_f, R);
++        h = try mix(e, rd, h, &spare, &pending, &deferred, lay.hc_ffn, rd.pre_a, lay.ffn_norm, pre_f, R);
+         try rd.mark(e, .mix_ffn);
+         try Probe.check(probe, .moe_in, l, rd.x);
+         try moe(e, rd, ch, l);
+         try rd.mark(e, .moe);
+         try Probe.check(probe, .moe_out, l, rd.pm);
+-        if (e.two) |tw| try tw.quarters(e, rd.pm, rd.gm, R, tw.dw, 4) else try e.gatherF32(rd.pm, rd.gm, R * d);
++        // the MoE gather posts into the next layer's attention mixes, unless an Engram layer or the stretch's end comes first
++        const next_mix = l + 1 < end and w.layers[l + 1].engram_wkv == null;
++        if (e.two) |tw| try tw.quarters(e, rd.pm, rd.gm, R, tw.dw, 4) else if (fuse and next_mix and try e.gatherStage(rd.pm, R * d)) {
++            deferred = rd.pm;
++        } else try e.gatherF32(rd.pm, rd.gm, R * d);
+         try rd.mark(e, .gather_m);
+         if (rd.clk_layers) try rd.clock(e, @intCast(64 + l));
+         try Probe.check(probe, .moe_gather, l, rd.gm);
+@@ -1081,12 +1099,22 @@
+ 
+ /// rounds.py pre_mix: hc_pre2 of the streams h with the pending gathered partials posted in (into the spare buffer,
+ /// which becomes the streams), the Sinkhorn half deferred to the side stream (this one); returns the streams.
+-fn mix(e: *const Engine, rd: *Round, h: u64, spare: *u64, pending: *?u64, params: [3]u64, pre_in: u64, norm: u64, pre_out: u64, R: usize) !u64 {
++fn mix(e: *const Engine, rd: *Round, h: u64, spare: *u64, pending: *?u64, deferred: *?u64, params: [3]u64, pre_in: u64, norm: u64, pre_out: u64, R: usize) !u64 {
+     const c = e.c;
+     try rd.joinSide(e);
+     defer if (rd.side) |s| if (rd.join.?.record(s)) {
+         rd.side_out = true;
+     } else |_| {};
++    if (deferred.*) |own| {
++        // TF_DS_HC_FUSED: the staged gather collected into the post (the side work joined above wrote post and comb)
++        const gp = pending.* orelse return error.BadRound;
++        try e.ring.?.collectPost(e.s, own, h, spare.*, rd.post, rd.comb, @intCast(R), @intCast(c.hidden));
++        deferred.* = null;
++        const out = try tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, .{ .gathered = gp, .world = e.world, .h_out = spare.*, .done = true }, rd.sink, R, c.hidden);
++        pending.* = null;
++        spare.* = h;
++        return out;
++    }
+     if (pending.*) |gp| {
+         const out = try tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, .{ .gathered = gp, .world = e.world, .h_out = spare.* }, rd.sink, R, c.hidden);
+         pending.* = null;
+--- a/zig/src/families/dsv41/tri_hc.zig
++++ b/zig/src/families/dsv41/tri_hc.zig
+@@ -48,7 +48,7 @@
+ }
+ 
+ /// The previous sublayer's post to fuse in (Python's gathered, h_out): partials [world, R, D] fp32, into h_out (not h).
+-pub const Posted = struct { gathered: u64, world: usize, h_out: u64 };
++pub const Posted = struct { gathered: u64, world: usize, h_out: u64, done: bool = false }; // done: h_out already posted (TF_DS_HC_FUSED)
+ 
+ /// hc_pre2's `sink` (only if hcDeferOn(d)): a side stream and the event forking it; the caller joins it (rounds.py).
+ pub const Sink = struct { s: cuda.Stream, fork: cuda.Event };
+@@ -119,10 +119,11 @@
+ /// hc_pre2: hc_pre's outputs for a decode window (the same bits), the last post fused in if `posted`; returns the src.
+ pub fn hcPre2(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, norm_w: u64, eps: f32, hc_eps: f32, iters: usize, out: u64, pre_out: u64, post: u64, comb: u64, part: u64, posted: ?Posted, sink: ?Sink, rows: usize, d: usize) !u64 {
+     if (posted) |ps| std.debug.assert(ps.h_out != h);
++    if (posted) |ps| if (ps.done and !(sink != null and hcDotsOn(d))) return error.FusedPostWithoutDots;
+     if (sink != null and posted != null and hcDotsOn(d)) {
+         // hc_dots: the post alone and the finish here, the mixes of the stored streams and the Sinkhorn on the side one
+         const ps = posted.?;
+-        try t.run("_hc_post_only", .{ u(rows), hc_blocks, 1 }, &.{
++        if (!ps.done) try t.run("_hc_post_only", .{ u(rows), hc_blocks, 1 }, &.{
+             p("X", "*bf16", h),       p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered), aot.int("RS", @intCast(rows * d)),
+             p("POST", "*fp32", post), p("COMB", "*fp32", comb),
+         }, &.{ ci("WIDE", 4 * d), ci("D", d), ci("KB", 4 * d / hc_blocks), ci("WORLD", ps.world), t.pdlConst() });

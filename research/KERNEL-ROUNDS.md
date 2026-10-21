@@ -202,6 +202,21 @@ rounds' CUDA graphs, one per (rows, context bucket, stretch), were never release
 afternoon's checks. `zig/patches/0024` keeps 128 (`TF_DS_GRAPH_CAP`), destroying the least recently replayed first; even
 a cap of 32 under a 102-graph load ran as fast. Served, the same checks left 6.7 GiB free at the lowest instead of 4.0.
 
+## Round 15: the drafter's experts, a fused hc post, the prompt pass's timeline (2026-10-21 17:00-18:46, negative)
+
+- **Fewer drafter experts** (`research/patches/draft-share.diff`, `TF_DS_DRAFT_SHARE`): a block's rows sharing row 0's routed
+  experts (3 a block instead of up to 15) or its noise rows sharing row 1's: one stream 85.21 -> 80.96 / 83.14 tok/s,
+  tokens a round 3.280 -> 2.994 / 3.133. The noise rows' routing matters more than the bytes it saves.
+- **A gather's collect fused with the hc post that reads it** (`research/patches/hc-fused-post.diff`, `TF_DS_HC_FUSED`):
+  `_hc_post_only`'s fp32 sum, bf16 rounding and fma chain op for op in the RDMA collect kernel, the gathered partials never
+  written out. Every reply equal (one stream, four, copies, temperature 1, 32K), and the same speed: the post's 1.5 ms a
+  round in the trace was its programmatic-dependent-launch wait for the collect, not work.
+- **The prompt pass**: on a 16K prompt the GPU spends 28 % in the MoE's tensor-core GEMM, 14 % in its row kernel, 12 % in
+  NCCL's all-gathers, 11 % in the attention's GEMMs. NCCL's default already takes its fastest protocol (`NCCL_PROTO=Simple`
+  the same, LL128 +7 %, LL +19 % prefill time). A host log shows a 2,048-row chunk's Engram reads (both layers, ~370 ms,
+  ~133K reads/s) running while the GPU works through the chunk before; the gaps a trace shows at the first Engram layer
+  come from the profiler on the host. `TF_DS_ENGRAM_LANES=2` (two readers) prefills 1.5 % slower.
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels

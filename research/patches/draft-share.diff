@@ -1,0 +1,37 @@
+--- a/zig/src/families/dsv41/draft.zig
++++ b/zig/src/families/dsv41/draft.zig
+@@ -197,6 +197,7 @@
+     xf: u64, // fp32 [R, D]: a wide pass's rows for the gate's cuBLAS matmul
+     gate_f: [max_stages]u64, // fp32 [experts, D]: each stage's gate widened (gate_w.float())
+     pick: u64,
++    share: u8, // research TF_DS_DRAFT_SHARE: 1 a block's rows take row 0's experts, 2 its noise rows take row 1's
+     mw: u64,
+     pm: u64,
+     gm: u64,
+@@ -258,6 +259,7 @@
+         dr.noise = c.dspark_noise;
+         dr.topk = c.draft_top_k;
+         dr.slots_moe = c.draft_top_k + 1;
++        dr.share = if (std.c.getenv("TF_DS_DRAFT_SHARE")) |v| (std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0) else 0;
+         dr.taps_w = c.dspark_taps.slice().len * d;
+         dr.streams = 0;
+         dr.steps = 0;
+@@ -691,6 +693,18 @@
+             try e.blas.xwT(dr.xf, dr.gate_f[j], dr.gl, R, c.hidden, ne);
+         }
+         try tri_norm.route(e.t, dr.gl, kc, lay.gate_b, dr.topk, c.routed_scaling, lay.experts.count - 1, dr.pick, dr.mw, R, ne, dr.slots_moe);
++        if (dr.share == 1 or dr.share == 2) {
++            // research: a block's rows share one row's routed experts (and weights), so the pass reads fewer experts
++            const rb = dr.slots_moe * 4;
++            const from: usize = if (dr.share == 1) 0 else 1;
++            for (0..R / dr.n) |i| {
++                const base = i * dr.n;
++                for (from + 1..dr.n) |r| {
++                    try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dr.pick + (base + r) * rb, dr.pick + (base + from) * rb, rb, e.s.handle), "cuMemcpyDtoDAsync");
++                    try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dr.mw + (base + r) * rb, dr.mw + (base + from) * rb, rb, e.s.handle), "cuMemcpyDtoDAsync");
++                }
++            }
++        }
+         // routed(): fewer than EXACT_ROWS rows take the decode window's fused path, more the chunk's (13+ streams)
+         if (R < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, dr.xsd, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);
+         try exl3_experts.prompt(e.ex, e.s, lay.experts, dr.xs, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);
