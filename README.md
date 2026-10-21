@@ -76,22 +76,23 @@ so the first `./start.sh` builds it on the head (two Zig builds, ~6 minutes) and
 
 <!-- MEASURED -->
 Measured on our pair with this commit, run as our production (`ABLIT=1`, `CONTEXT=1048576`, the defaults above; sparkDash's
-decode bench, the streams together, median of two waves, 2026-10-21 09:10-09:15, a dashboard polling `nvidia-smi` every 10 s):
+decode bench, the streams together, median of two waves, 2026-10-21 12:18-12:22, a dashboard polling `nvidia-smi` every 10 s):
 
 | Decode, tok/s | 1 stream | 2 streams | 4 streams |
 | --- | --- | --- | --- |
-| Prose, greedy | 67.4 | 102.0 | 136.2 |
-| Code, greedy | 115.8 | 150.1 | 166.9 |
-| Prose, temperature 1 (the served default) | 70.3 | 94.1 | 122.0 |
-| Code, temperature 1 | 108.0 | 135.4 | 163.7 |
+| Prose, greedy | 68.2 | 102.4 | 137.4 |
+| Code, greedy | 116.3 | 152.3 | 166.1 |
+| Prose, temperature 1 (the served default) | 70.8 | 94.8 | 123.2 |
+| Code, temperature 1 | 108.4 | 137.1 | 163.5 |
 
 Against the same pair on 2026-10-20 before this recipe's later patches (greedy: Mia's AI Lab's hotfix image with 0010-0016;
-temperature 1: that morning's run): +10.2 % and +9.8 % geomean (`research/results/decode-final-*.json`, `decode-table.txt`).
+temperature 1: that morning's run): +10.9 % and +10.5 % geomean (`research/results/decode-final-*.json`, `decode-table.txt`).
 sparkDash's prompts copy little; replies that copy go further: four files written out with a scattered edit +14 %
-(temperature 0) and +13 % (temperature 1) over 16-row copy windows (`research/results/wide-copy-windows.txt`,
-`copy-policy.txt`). `tools/validate.py` found the replies equal to the earlier images' (8 of 8). Polling `nvidia-smi` every
-2 s instead of 10 s cost 1 %: keep GPU monitoring sparse while serving. The stock checkpoint (`ABLIT=0`) was not measured
-with these changes; for it, see Mia's AI Lab's numbers under Status.
+(temperature 0) and +13 % (temperature 1) over 16-row copy windows, two such edits at a time +29 % with 0023
+(`research/results/wide-copy-windows.txt`, `copy-policy.txt`, `copy-multi.txt`). `tools/validate.py` found the replies
+equal to the earlier images' (8 of 8). Polling `nvidia-smi` every 2 s instead of 10 s cost 1 %: keep GPU monitoring sparse
+while serving. The stock checkpoint (`ABLIT=0`) was not measured with these changes; for it, see Mia's AI Lab's numbers
+under Status.
 <!-- /MEASURED -->
 
 ## Status
