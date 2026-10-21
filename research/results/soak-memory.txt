@@ -12,3 +12,8 @@ prompts, one 258K prompt (144 s), 2-4 concurrent mixed requests (13, no errors).
   ~0.5 GiB of a 4 GiB floor; Mia's AI Lab's issue #4 saw a kill at 4.085 GiB on a head with more beside the server.
 - So the recipe's default is 32 rows (realistic edits +14 % instead of +20 % at 48, 0.18 GiB a Spark less); 48 where the
   head has the room. Mia's AI Lab's default floor is 2.5 GiB (MEMGUARD_GIB); this pair runs 4.
+
+Worst case at 32 rows (patches 0019-0022, served, 2026-10-21 09:53-10:02): 58 distinct 11K-token prompts filled the prompt
+cache (67 states, 510 MiB of 512, evicting), then one 290,480-token prompt (168.6 s prefill). Head MemAvailable at least
+4,778 MiB (sampled every 2 s): 0.67 GiB above MEMGUARD_GIB 4. 48 rows take 0.18 GiB more (0.49 GiB left in this case), so
+48 suits a head that keeps its other processes small, or a lower MEMGUARD_GIB (Mia's AI Lab's default is 2.5).
