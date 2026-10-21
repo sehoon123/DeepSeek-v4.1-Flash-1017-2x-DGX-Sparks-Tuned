@@ -217,6 +217,15 @@ a cap of 32 under a 102-graph load ran as fast. Served, the same checks left 6.7
   ~133K reads/s) running while the GPU works through the chunk before; the gaps a trace shows at the first Engram layer
   come from the profiler on the host. `TF_DS_ENGRAM_LANES=2` (two readers) prefills 1.5 % slower.
 
+## Round 16: prompt chunks two at a time (`zig/patches/0025`, `results/prefill-pairs.txt`)
+
+A long prompt's chunks before the decoder's replay run only the encoder layers, and there the MoE's routed experts read
+every expert's weights for ~32 rows each. Running two such chunks side by side, layer by layer, with their routed experts
+in one call (the first chunk's steps of a layer before the second's, the gates one per chunk) keeps every reply and cuts
+prefill by 4.5 % at 16K tokens, 8.8 % at 32K and 12.2 % at 126K, for ~1.0 GiB more arena. The gain is less than the
+weights alone suggest (the gate / up GEMM takes 1.68x as long for twice the rows) and was first lost to Engram reads
+started too late; the shipped read-ahead takes the next two chunks' rows onto back buffers from the first Engram layer.
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels

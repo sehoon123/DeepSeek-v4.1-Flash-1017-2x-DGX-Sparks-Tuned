@@ -1,0 +1,29 @@
+Prompt chunks two at a time (patch 0025, TF_DS_PAIR=1), the harness, 48-row rounds, one load a run, 2026-10-21 20:24-21:14.
+A long prompt's chunks before the decoder's replay (prompt length - window) run only the encoder layers 0-19 (and layer
+20's kv-source update); patch 0025 runs two of them side by side: at each layer the first chunk's Engram, mixes,
+attention, gather and gate, then the second's, then the routed experts of both chunks' rows in one call, each chunk's own
+gather after. The routing gate stays one cuBLAS GEMM a chunk (cuBLAS picks its algorithm by the rows); exl3_experts'
+tiles depend on the matrices only, so a row's bytes are the same in a call of 2,048 rows or 4,096.
+
+Prefill time (s), the same prompts (tokens hashed; every one equal on and off):
+                  off      first version   + pass's first chunk alone   + back Engram hosts (shipped)
+16,384 tokens     8.42     8.66            8.31                         8.09  (-4.5 % against 8.47 that run)
+32,063 tokens    15.97    15.58           15.40                        14.56  (-8.8 % against 15.96)
+125,540 tokens   65.80    63.49           60.94                        57.61  (-12.2 % against 65.58)
+
+The kernels (rank 1, 16K, nsys): the gate / up GEMM 12.2 ms a 2,048-row call, ~20.5 ms a 4,096-row one (-16 % a token),
+the down rows -12 %, the rest per row; kernel time 7.79 -> 7.23 s. The first version lost it to Engram waits: a pair's
+two chunks' rows (~740 ms of reads) were read ahead only from the pair before's last Engram layer, and the pass's first
+pair read its own before layer 1. Shipped: the pass's first chunk runs alone; the next two chunks' rows go to back host
+buffers from the first Engram layer on, swapped to the front by the next step.
+
+Every reply equal: prefill token hashes at 16K / 32K / 126K, req-long-x (32K / 64K / 126K prompts, 400-token decodes)
+against its expected hashes, twelve mixed prompts at four streams against the run without pairs, one-stream decode
+(84.71 tok/s, all equal). Arena 5,060 -> 6,070 MB a Spark (the second chunk's carried state, the pair's MoE rows, twice
+the experts' scratch).
+
+Served (2026-10-21 21:25-21:31, image f33ace7b9214, a fresh start each, the same prompts, temperature 0, a 32-token reply):
+28,853 tokens   pairs 13.86 s, one chunk at a time 15.08 s (-8.1 %)
+70,014 tokens   32.12 s against 35.63 s (-9.9 %)
+144,159 tokens  68.34 s against 74.86 s (-8.7 %)
+Every reply the same. Head MemAvailable after the load 6,918 MiB (7,645 before), worker 8,526 (9,562).
