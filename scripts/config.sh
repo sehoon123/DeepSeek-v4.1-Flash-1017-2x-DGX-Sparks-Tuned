@@ -137,6 +137,10 @@ export TF_DS_COPY_SELF_CAP="${TF_DS_COPY_SELF_CAP:-15}"
 # When every live stream copies (agents writing out the files they edit), their copies of the prompt keep growing beside each
 # other, up to 15 tokens and an even share of a round's rows (zig/patches/0023; 0: off). A stream that drafts is never slowed.
 export TF_DS_COPY_MULTI="${TF_DS_COPY_MULTI:-15}"
+# NCCL carries only the prompt passes' all-gathers here (a decode round's exchanges take the RDMA ring), and its default
+# channels hold ~1.2 GiB of pinned host buffers on each Spark: 8 channels hold 0.2 GiB and prefill as fast (32K-126K
+# prompts within noise; an all-gather copies, so the replies are the same). Every exported NCCL_* reaches both ranks.
+export NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-8}"
 # The engine's settings as BertholomusAI's served two-node launch has them: CUDA graphs, the mixes' side stream, the
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
 # NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).
