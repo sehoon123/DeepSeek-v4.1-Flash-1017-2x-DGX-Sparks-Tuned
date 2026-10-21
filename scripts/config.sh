@@ -145,6 +145,10 @@ export NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-8}"
 # pile up with every new shape (1.6 GiB after a day's mixed load). 128 at most, the least recently replayed destroyed first
 # (zig/patches/0024; 0: no cap): a recapture costs a few ms, the replies are the same.
 export TF_DS_GRAPH_CAP="${TF_DS_GRAPH_CAP:-128}"
+# A long prompt's chunks before the decoder's replay run only the encoder layers: two of them side by side, their routed
+# experts in one call (zig/patches/0025; 0: one chunk at a time). Prefill 5-14 % faster (more on longer prompts) for
+# ~1.0 GiB more arena a Spark; the replies are the same.
+export TF_DS_PAIR="${TF_DS_PAIR:-1}"
 # The engine's settings as BertholomusAI's served two-node launch has them: CUDA graphs, the mixes' side stream, the
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
 # NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).

@@ -5,6 +5,12 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **Prefill 5-14 % faster** (`zig/patches/0025`, `TF_DS_PAIR=1` by default): a long prompt's chunks before the decoder's
+  replay (encoder-only, the bulk of it) go through the encoder layers two at a time, the first chunk's steps before the
+  second's at every layer and their routed experts in one call (twice the rows per expert for the same weight reads);
+  the gates stay one per chunk. The next two chunks' Engram rows are read on back host buffers from the first Engram
+  layer on. 16K / 32K / 126K-token prompts -4.5 / -8.8 / -12.2 % prefill time, ~1.0 GiB more arena a Spark. Replies
+  unchanged.
 - **Less memory, the same speed**: `NCCL_MAX_NCHANNELS=8` (`scripts/config.sh`): NCCL carries only the prompt passes'
   all-gathers, and its default channels held ~1.2 GiB of pinned host buffers on each Spark; 8 hold 0.2 GiB, prefill within
   noise (32K-126K). The CUDA graphs of the rounds kept at most 128 (`zig/patches/0024`, `TF_DS_GRAPH_CAP=128`, the least

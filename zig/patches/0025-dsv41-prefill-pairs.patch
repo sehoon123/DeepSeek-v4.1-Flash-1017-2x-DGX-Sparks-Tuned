@@ -1,0 +1,481 @@
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 367cfa5..26930dd 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -55,7 +55,7 @@ pub const image_piece = 32 << 10;
+ pub var logits_sha = false;
+ 
+ /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
+-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9 };
++pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_pair = 10 };
+ 
+ /// A frame being written.
+ pub const Wire = struct {
+@@ -772,17 +772,37 @@ pub const Lanes = struct {
+             m.joinAhead();
+             m.fill_seq = &.{};
+         }
++        const pass_first = start; // TF_DS_PAIR: a pass's first chunk alone (it reads the next two chunks' Engram rows ahead)
+         while (start < len) {
+             if (start > 0 and s.isCancelled()) return error.Cancelled;
+             const n = @min(model.chunk_rows, len - start);
+-            if (try self.begin(.fill_chunk)) {
+-                try self.wire.int(gpa, u64, start);
+-                try self.wire.int(gpa, u32, @intCast(n));
+-                try self.wire.int(gpa, u64, replay);
+-                try self.flush();
++            // TF_DS_PAIR: this chunk and the next through the encoder layers together (Model.fillPair) when both are
++            // whole and before the replay (encoder-only), no state is kept and no other stream's round is wanted between
++            // them, and the prompt has no images
++            const cr = model.chunk_rows;
++            const mid = start + cr;
++            const pair = m.pair_on and start != pass_first and n == cr and mid + cr <= len and mid + cr <= replay and s.images.len == 0 and
++                mid != last_end and !markEnds(s.reuse.marks, mid) and !(if (s.between) |b| b.wanted(b.ptr) else false);
++            if (pair) {
++                if (try self.begin(.fill_pair)) {
++                    try self.wire.int(gpa, u64, start);
++                    try self.wire.int(gpa, u32, @intCast(cr));
++                    try self.wire.int(gpa, u32, @intCast(cr));
++                    try self.wire.int(gpa, u64, replay);
++                    try self.flush();
++                }
++                try m.fillPair(seq.items[0 .. start + 2 * cr], start, cr, cr, replay);
++                start += 2 * cr;
++            } else {
++                if (try self.begin(.fill_chunk)) {
++                    try self.wire.int(gpa, u64, start);
++                    try self.wire.int(gpa, u32, @intCast(n));
++                    try self.wire.int(gpa, u64, replay);
++                    try self.flush();
++                }
++                head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
++                start += n;
+             }
+-            head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
+-            start += n;
+             if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
+             // prefill interleave: the other streams' rounds between this pass's chunks (verify frames go to rank 1 in
+             // order; every state a pass carries from chunk to chunk is the slot's, except the Engram read-ahead, which
+@@ -1229,12 +1249,13 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+             7 => .snap_drop,
+             8 => .fill_images,
+             9 => .done,
++            10 => .fill_pair,
+             else => return error.BadFrame,
+         };
+         if (try r.int(u64) != step) return error.OutOfStep;
+         step += 1;
+         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
+-        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images) {
++        if (kind != .fill_chunk and kind != .fill_pair and kind != .snap_save and kind != .snap_restore and kind != .fill_images) {
+             m.joinAhead();
+             m.fill_seq = &.{};
+         }
+@@ -1256,6 +1277,15 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 m.fill_seq = seqs[slot].items; // (a round between two chunks cleared it: the next chunk's read-ahead again)
+                 _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
+             },
++            .fill_pair => {
++                const start: usize = @intCast(try r.int(u64));
++                const n1: usize = try r.int(u32);
++                const n2: usize = try r.int(u32);
++                const replay: usize = @intCast(try r.int(u64));
++                if (start + n1 + n2 > seqs[slot].items.len) return error.BadChunk;
++                m.fill_seq = seqs[slot].items;
++                m.fillPair(seqs[slot].items[0 .. start + n1 + n2], start, n1, n2, replay) catch |err| refused(err);
++            },
+             .verify => {
+                 const nw = try r.int(u32);
+                 if (nw == 0 or nw > max_streams) return error.BadFrame;
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index ee13c9f..5911852 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -27,6 +27,7 @@ const comm_mod = @import("comm.zig");
+ const link = @import("link.zig");
+ const ring2d = @import("ring2d.zig");
+ const rdma = @import("rdma.zig");
++const tri = @import("tri.zig");
+ 
+ /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
+ pub const chunk_rows = 2048;
+@@ -121,6 +122,18 @@ pub const Model = struct {
+     // Engram rows during this one (fillChunk), joined before the prompt can change (joinAhead)
+     fill_seq: []const i32 = &.{},
+     ahead: ?std.Thread = null,
++    // TF_DS_PAIR (this recipe): two whole encoder-only prompt chunks through the encoder layers side by side, their routed
++    // experts in one call (fillPair); the second chunk's own state (prompt.partner), the pair's MoE rows and a second
++    // Engram host for the second chunk's rows
++    pair_on: bool = false,
++    ch2: ?prompt.Chunk = null,
++    pair: ?prompt.PairMoe = null,
++    eh2: ?prompt.EngramHost = null,
++    eh3: ?prompt.EngramHost = null, // the back hosts: the next step's rows read ahead while eh / eh2 serve this one
++    eh4: ?prompt.EngramHost = null,
++    back_spawned: bool = false,
++    host_pos2: []i64 = &.{},
++    ids64_2: []i64 = &.{},
+     view: prompt.Caches = undefined,
+     // the filling prompt's image spans and their rows (setImages; cleared by fillBegin)
+     spans: std.ArrayList(prompt.Span) = .empty,
+@@ -180,6 +193,16 @@ pub const Model = struct {
+         m.paio = null;
+         m.paio2 = null;
+         m.eh = null;
++        m.ahead = null;
++        m.pair_on = false;
++        m.ch2 = null;
++        m.pair = null;
++        m.eh2 = null;
++        m.eh3 = null;
++        m.eh4 = null;
++        m.back_spawned = false;
++        m.host_pos2 = &.{};
++        m.ids64_2 = &.{};
+         m.rdma_mod = null;
+         m.ring = null;
+         m.graphs = null;
+@@ -278,7 +301,13 @@ pub const Model = struct {
+         }
+         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
+         m.eng.round_rows = o.round_rows;
++        m.pair_on = sp.pair == null and (if (std.c.getenv("TF_DS_PAIR")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false); // every rank alike
++        if (m.pair_on) prompt.pair_rows = 2 * chunk_rows;
+         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, o.pool);
++        if (m.pair_on) {
++            m.ch2 = try prompt.partner(&m.ch, &m.eng, &m.arena);
++            m.pair = try prompt.PairMoe.init(&m.eng, &m.arena, chunk_rows);
++        }
+         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
+         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
+         errdefer m.blas.close();
+@@ -339,6 +368,20 @@ pub const Model = struct {
+                     if (m.paio2 != null) std.debug.print("{{\"engram_lanes\": 2}}\n", .{});
+                 }
+             }
++            if (m.pair_on) {
++                // TF_DS_PAIR: a pair's second chunk's rows on host buffers of their own (the same tables and rings)
++                m.eh2 = try prompt.EngramHost.init(a, c, engram.Hasher.init(c.*, map, mult), &m.tables.?, m.epool.?, sp.rank, sp.world, chunk_rows);
++                m.eh2.?.aio = m.aio;
++                m.eh2.?.paio = m.paio;
++                m.eh2.?.paio2 = m.paio2;
++                m.eh3 = try prompt.EngramHost.init(a, c, engram.Hasher.init(c.*, map, mult), &m.tables.?, m.epool.?, sp.rank, sp.world, chunk_rows);
++                m.eh4 = try prompt.EngramHost.init(a, c, engram.Hasher.init(c.*, map, mult), &m.tables.?, m.epool.?, sp.rank, sp.world, chunk_rows);
++                inline for (.{ &m.eh3, &m.eh4 }) |hp| {
++                    hp.*.?.aio = m.aio;
++                    hp.*.?.paio = m.paio;
++                    hp.*.?.paio2 = m.paio2;
++                }
++            }
+         } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
+ 
+         // a vision checkpoint's image routing bias (without it a prompt with images is refused; text runs as ever)
+@@ -349,6 +392,10 @@ pub const Model = struct {
+ 
+         m.host_pos = try a.alloc(i64, chunk_rows);
+         m.ids64 = try a.alloc(i64, chunk_rows);
++        if (m.pair_on) {
++            m.host_pos2 = try a.alloc(i64, chunk_rows);
++            m.ids64_2 = try a.alloc(i64, chunk_rows);
++        }
+         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
+         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
+         return m;
+@@ -553,6 +600,15 @@ pub const Model = struct {
+ 
+     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
+         if (slot >= m.streams) return error.BadSlot;
++        if (m.pair_on) {
++            // TF_DS_PAIR: no Engram rows read ahead for another prompt stay ready (the back hosts read two chunks, a
++            // single chunk next leaves the second's)
++            m.joinAhead();
++            m.back_spawned = false;
++            inline for (.{ &m.eh, &m.eh2, &m.eh3, &m.eh4 }) |hp| if (hp.*) |*x| {
++                x.ahead_ready = .{ false, false };
++            };
++        }
+         m.spans.clearRetainingCapacity();
+         m.ch.spans = &.{};
+         m.view = try m.caches.view(&m.eng, slot, base);
+@@ -585,6 +641,7 @@ pub const Model = struct {
+         // Engram rows read ahead on a thread while the GPU runs the layers before them (the served reader pool's
+         // overlap): this chunk's both layers' during the chunk before it (m.ahead), else the first layer's from the
+         // chunk's start and the next's once the first is applied
++        if (m.pair_on) m.takeBack(start);
+         var ahead: ?std.Thread = m.ahead;
+         m.ahead = null;
+         defer if (ahead) |th| th.join();
+@@ -628,8 +685,15 @@ pub const Model = struct {
+                 const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
+                 const ne = @min(2, c.engram_layers.slice().len);
+                 if (j + 1 < ne) {
+-                    if (!eh.ahead_ready[j + 1])
++                    if (!eh.ahead_ready[j + 1]) {
+                         ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
++                    } else if (m.pair_on and m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
++                        m.spawnBack(start + n); // TF_DS_PAIR: the next two chunks' rows from here, onto the back hosts
++                    }
++                } else if (m.pair_on and m.back_spawned) {
++                    // (the next chunks' rows went out at the first Engram layer)
++                } else if (m.pair_on and m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
++                    m.spawnBack(start + n);
+                 } else if (m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
+                     // the next chunk's rows while this one's layers run
+                     const nn = @min(chunk_rows, m.fill_seq.len - start - n);
+@@ -675,6 +739,143 @@ pub const Model = struct {
+         return true;
+     }
+ 
++    /// TF_DS_PAIR: the Engram rows of the two chunks from `at` (the fill's sequence) read ahead on one thread, the first
++    /// chunk's into eh, the second's into eh2 (a single chunk next uses only the first).
++    fn spawnAheadTwo(m: *Model, at: usize) ?std.Thread {
++        const eh = if (m.eh) |*x| x else return null;
++        const total = m.fill_seq.len;
++        if (total <= at) return null;
++        const n1 = @min(chunk_rows, total - at);
++        eh.ahead_start = at;
++        eh.ahead_n = n1;
++        eh.ahead_ready = .{ false, false };
++        eh.ahead_err = null;
++        var n2: usize = 0;
++        if (m.eh2) |*x| if (total > at + n1) {
++            n2 = @min(chunk_rows, total - at - n1);
++            x.ahead_start = at + n1;
++            x.ahead_n = n2;
++            x.ahead_ready = .{ false, false };
++            x.ahead_err = null;
++        };
++        return std.Thread.spawn(.{}, prompt.engramReadAheadTwo, .{ eh, if (m.eh2) |*x| x else null, &m.cfg, m.fill_seq, at, n1, n2 }) catch null;
++    }
++
++    /// TF_DS_PAIR: the next two chunks' Engram rows (from `at`) onto the back hosts eh3 / eh4 on a thread, while the front
++    /// ones (eh, eh2) serve the step in flight.
++    fn spawnBack(m: *Model, at: usize) void {
++        const b1 = if (m.eh3) |*x| x else return;
++        const total = m.fill_seq.len;
++        if (total <= at or m.ahead != null) return;
++        const n1 = @min(chunk_rows, total - at);
++        b1.ahead_start = at;
++        b1.ahead_n = n1;
++        b1.ahead_ready = .{ false, false };
++        b1.ahead_err = null;
++        var n2: usize = 0;
++        if (m.eh4) |*x| if (total > at + n1) {
++            n2 = @min(chunk_rows, total - at - n1);
++            x.ahead_start = at + n1;
++            x.ahead_n = n2;
++            x.ahead_ready = .{ false, false };
++            x.ahead_err = null;
++        };
++        m.ahead = std.Thread.spawn(.{}, prompt.engramReadAheadTwo, .{ b1, if (m.eh4) |*x| x else null, &m.cfg, m.fill_seq, at, n1, n2 }) catch null;
++        m.back_spawned = m.ahead != null;
++    }
++
++    /// TF_DS_PAIR: a step at `start` joins the back hosts' thread and, when they hold its rows, swaps them to the front.
++    fn takeBack(m: *Model, start: usize) void {
++        if (!m.back_spawned) return;
++        m.joinAhead();
++        m.back_spawned = false;
++        const b1 = if (m.eh3) |*x| x else return;
++        if (b1.ahead_start != start or !b1.ahead_ready[0] or b1.ahead_err != null) return;
++        std.mem.swap(prompt.EngramHost, &m.eh.?, b1);
++        std.mem.swap(prompt.EngramHost, &m.eh2.?, &m.eh4.?);
++    }
++
++    /// TF_DS_PAIR: the whole chunks [start, start + n1) and [start + n1, start + n1 + n2), both before the replay (so the
++    /// decoder's first layer cuts them, encoder-only), through the encoder layers side by side: at each layer the first
++    /// chunk's Engram, mixes, attention, gather and gate, then the second's, then the routed experts of both chunks' rows
++    /// in one call (exl3_experts' tiles are the matrices', not the rows': a row's bytes are the same in any call) and
++    /// each chunk's own gather. A layer's caches take the first chunk's rows before the second reads them, as two chunks
++    /// one after the other; nothing else a chunk reads comes from a later layer. The gates stay one a chunk (cuBLAS picks
++    /// its algorithm by the rows).
++    pub fn fillPair(m: *Model, seq: []const i32, start: usize, n1: usize, n2: usize, replay: usize) !void {
++        if (!m.pair_on) return error.NoPair;
++        if (n1 != chunk_rows or n2 <= tri.decode_rows or n2 > chunk_rows or seq.len != start + n1 + n2) return error.BadChunk;
++        if (start + n1 + n2 > replay) return error.BadChunk;
++        const e = &m.eng;
++        const c = e.c;
++        for (c.dspark_taps.slice()) |tl| if (tl < c.layers / 2) return error.BadChunk;
++        const ch1 = &m.ch;
++        const ch2 = &m.ch2.?;
++        const pr = &m.pair.?;
++        const image_id: i64 = if (c.image_token) |t| t else 0;
++        for (0..n1) |j| m.ids64[j] = if (seq[start + j] < 0) image_id else seq[start + j];
++        for (0..n2) |j| m.ids64_2[j] = if (seq[start + n1 + j] < 0) image_id else seq[start + n1 + j];
++        try prompt.begin(e, ch1, m.ids64[0..n1], start, m.host_pos);
++        try prompt.begin(e, ch2, m.ids64_2[0..n2], start + n1, m.host_pos2);
++        var sh1: prompt.Shared = .{};
++        var sh2: prompt.Shared = .{};
++        const seq1 = seq[0 .. start + n1];
++        const d = c.hidden;
++        const sl = e.slots();
++        m.takeBack(start);
++        var ahead: ?std.Thread = null;
++        defer if (ahead) |th| th.join();
++        if (m.eh) |*eh| {
++            const ready = eh.ahead_start == start and eh.ahead_n == n1 and eh.ahead_ready[0] and (if (m.eh2) |*x| x.ahead_start == start + n1 and x.ahead_n == n2 and x.ahead_ready[0] else false);
++            if (!ready) {
++                if (ahead) |th| th.join();
++                ahead = null;
++                const saved = m.fill_seq;
++                m.fill_seq = seq;
++                ahead = m.spawnAheadTwo(start);
++                m.fill_seq = saved;
++                m.ahead = null;
++            }
++        }
++        for (0..c.layers / 2) |li| {
++            if (e.w.layers[li].engram_wkv != null) {
++                const eh = if (m.eh) |*x| x else return error.NoEngramTables;
++                const eh2 = if (m.eh2) |*x| x else return error.NoEngramTables;
++                if (ahead) |th| {
++                    th.join();
++                    ahead = null;
++                }
++                if (eh.ahead_err) |err| return err;
++                if (eh2.ahead_err) |err| return err;
++                try prompt.engramApply(e, ch1, eh, li, seq1);
++                try prompt.engramApply(e, ch2, eh2, li, seq);
++                // the next two chunks' rows onto the back hosts from the first Engram layer on (this pair's second
++                // layer's rows are in by now: the thread that read them was joined above)
++                if (!m.back_spawned and m.fill_seq.len > start + n1 + n2 and m.fill_seq.ptr == seq.ptr) m.spawnBack(start + n1 + n2);
++            }
++            try prompt.attnMixes(e, ch1, li);
++            try prompt.attention(e, ch1, &m.view, &sh1, li, m.ring_view[li], 0, false);
++            try prompt.gather(e, ch1, ch1.pa, ch1.ga);
++            try prompt.ffnMixes(e, ch1, li);
++            try prompt.moeGate(e, ch1, li, pr.pick, pr.wts);
++            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(pr.x, ch1.x, n1 * d * 2, e.s.handle), "cuMemcpyDtoDAsync");
++            try prompt.attnMixes(e, ch2, li);
++            try prompt.attention(e, ch2, &m.view, &sh2, li, m.ring_view[li], 0, false);
++            try prompt.gather(e, ch2, ch2.pa, ch2.ga);
++            try prompt.ffnMixes(e, ch2, li);
++            try prompt.moeGate(e, ch2, li, pr.pick + n1 * sl * 4, pr.wts + n1 * sl * 4);
++            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(pr.x + n1 * d * 2, ch2.x, n2 * d * 2, e.s.handle), "cuMemcpyDtoDAsync");
++            try prompt.pairExperts(e, ch1, pr, li, n1 + n2);
++            try prompt.gather(e, ch1, pr.pm, ch1.gm);
++            try prompt.gather(e, ch2, pr.pm + n1 * d * 4, ch2.gm);
++            prompt.endLayer(ch1);
++            prompt.endLayer(ch2);
++        }
++        // the decoder's first layer: each chunk's mixes and kv-source update, and the cut that ends an encoder-only chunk
++        if (try prompt.replayCut(e, ch1, &m.view, &sh1, c.layers / 2, replay, m.host_pos)) return error.BadChunk;
++        if (try prompt.replayCut(e, ch2, &m.view, &sh2, c.layers / 2, replay, m.host_pos2)) return error.BadChunk;
++    }
++
+     /// The prompt's logits (its last row's, the ranks' columns in rank order) after a fill's last chunk.
+     pub fn promptLogits(m: *const Model) u64 {
+         return m.ch.head_g;
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 7c22d1f..25d38a8 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -382,9 +382,10 @@ pub const Chunk = struct {
+             ch.kv = try a.take(cap * en * 2);
+             break;
+         }
+-        const sz = exl3_experts.Scratch.sizes(cap, sl, ex.dims, ex.width, ex.count);
++        const xs_rows = @max(cap, pair_rows);
++        const sz = exl3_experts.Scratch.sizes(xs_rows, sl, ex.dims, ex.width, ex.count);
+         var xs: exl3_experts.Scratch = undefined;
+-        xs.rows = cap;
++        xs.rows = xs_rows;
+         xs.slots = sl;
+         inline for (.{ "xg", "xu", "xd", "z", "no_y", "ids", "count", "counts", "members", "work_gu", "work_d" }, 0..) |f, j| {
+             @field(xs, f) = try a.take(sz[j]);
+@@ -688,6 +689,71 @@ fn swapStreams(ch: *Chunk, src: u64) void {
+ 
+ /// Layer `li`'s attention mixes: x = RMSNorm of the streams mixed by pre, pre_a / post / comb from their own mixes;
+ /// with a pending MoE gather, hc_pre_pf posts it into the streams first.
++/// TF_DS_PAIR: the second chunk of a pair, `ch`'s buffers but its own for what a chunk carries from layer to layer
++/// (its ids and positions, the streams and their second buffer, the hc coefficients, the pending MoE gather and the index
++/// selection the layers after an index layer read); a layer runs the first chunk's steps before the second's, so every
++/// other buffer serves one chunk at a time.
++pub fn partner(ch: *const Chunk, e: *const Engine, a: *Arena) !Chunk {
++    const c = e.c;
++    const cap = ch.cap;
++    const d = c.hidden;
++    const hc = c.hc;
++    var p = ch.*;
++    p.spans = &.{};
++    p.img_rows = 0;
++    p.n = 0;
++    p.start = 0;
++    p.pending = false;
++    p.ids = try a.take(cap * 8);
++    p.pos0 = try a.take(cap * 8);
++    p.pos = p.pos0;
++    p.h = try a.take(cap * hc * d * 2);
++    p.h_alt = try a.take(cap * hc * d * 2);
++    p.pre = try a.take(cap * hc * 4);
++    p.pre_a = try a.take(cap * hc * 4);
++    p.pre_f = try a.take(cap * hc * 4);
++    p.post = try a.take(cap * hc * 4);
++    p.comb = try a.take(cap * hc * hc * 4);
++    p.gm = try a.take(e.world * cap * d * 4);
++    if (ch.cidx != 0) p.cidx = try a.take(cap * c.index_topk * 8);
++    return p;
++}
++
++/// TF_DS_PAIR: a pair's routed experts in one call: both chunks' MoE input rows, picks and weights side by side, the
++/// experts' partial [2 cap, D] (the first chunk's scratch holds twice its rows, pair_rows).
++pub const PairMoe = struct {
++    x: u64, // bf16 [2 cap, D]
++    pick: u64, // int32 [2 cap, slots]
++    wts: u64, // fp32 [2 cap, slots]
++    pm: u64, // fp32 [2 cap, D]
++
++    pub fn init(e: *const Engine, a: *Arena, cap: usize) !PairMoe {
++        const d = e.c.hidden;
++        const sl = e.slots();
++        return .{ .x = try a.take(2 * cap * d * 2), .pick = try a.take(2 * cap * sl * 4), .wts = try a.take(2 * cap * sl * 4), .pm = try a.take(2 * cap * d * 4) };
++    }
++};
++
++/// TF_DS_PAIR: moe()'s gate and routing of a prompt chunk's rows (more than decode_rows, no image spans) into `pick` /
++/// `wts`: the same fp32 cuBLAS GEMM of the chunk's own rows and the same routing.
++pub fn moeGate(e: *const Engine, ch: *Chunk, li: usize, pick: u64, wts: u64) !void {
++    const lay = e.w.layers[li];
++    const c = e.c;
++    const n = ch.n;
++    const d = c.hidden;
++    if (ch.spans.len != 0 or n <= tri.decode_rows) return error.NotAPairChunk;
++    try e.ops.toF32(e.s, ch.x, ch.xf, n * d);
++    try e.ops.f16ToF32(e.s, lay.gate_w, ch.gate_f, c.experts * d);
++    try e.blas.xwT(ch.xf, ch.gate_f, ch.logits, n, d, c.experts);
++    try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, pick, wts, n, c.experts, e.slots());
++}
++
++/// TF_DS_PAIR: the routed experts of a pair's `rows` rows (PairMoe's x, pick, wts) into its pm, on the first chunk's
++/// scratch.
++pub fn pairExperts(e: *const Engine, ch: *const Chunk, pr: *const PairMoe, li: usize, rows: usize) !void {
++    try exl3_experts.prompt(e.ex, e.s, e.w.layers[li].experts, ch.xs, pr.x, e.c.hidden, pr.pick, pr.wts, pr.pm, rows, e.c.swiglu_limit);
++}
++
+ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
+     const lay = e.w.layers[li];
+     const c = e.c;
+@@ -719,6 +785,10 @@ pub fn mm(e: *const Engine, ch: *const Chunk, l: weights.Linear, x: u64, ldx: us
+ /// by the gather path (off: ring mode, as the served lane reads, the slot's previous request's keys below the floor).
+ pub var replay_floor = false;
+ 
++/// TF_DS_PAIR (model.zig sets it before the chunk is made): the routed experts' scratch for this many rows (a pair of
++/// chunks), when more than the chunk's.
++pub var pair_rows: usize = 0;
++
+ /// TF_DS_IDX_SPLIT (model.zig reads it on every rank; off unless "1"): TP2 splits a prompt chunk's prompt_keys row
+ /// blocks between the two ranks and all-gathers their selections (indexer). Both ranks must agree, or their gathers
+ /// pair up wrongly: start.sh passes every TF_DS_* variable to both.
+@@ -1204,6 +1274,12 @@ pub fn engramReadAheadAll(eh: *EngramHost, c: *const Config, seq: []const i32, s
+     }
+ }
+ 
++/// TF_DS_PAIR: the next two chunks' rows of both Engram layers, the first's into `eh`, the second's into `eh2`.
++pub fn engramReadAheadTwo(eh: *EngramHost, eh2: ?*EngramHost, c: *const Config, seq: []const i32, start: usize, n1: usize, n2: usize) void {
++    engramReadAheadAll(eh, c, seq[0 .. start + n1], start, n1);
++    if (n2 > 0) if (eh2) |x| engramReadAheadAll(x, c, seq[0 .. start + n1 + n2], start + n1, n2);
++}
++
+ fn engramAhead1(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, n: usize, j: usize) !void {
+     const li = c.engram_layers.slice()[j];
+     const t = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
