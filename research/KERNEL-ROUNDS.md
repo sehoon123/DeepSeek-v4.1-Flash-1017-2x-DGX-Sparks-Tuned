@@ -155,6 +155,17 @@ Rounds past 16 rows cost the engine 0.44 GiB at 32 and 0.62 GiB at 48 (its load 
 that showed 4.83-4.87 GiB idle after the load and 4.94 GiB at a 258K prefill's lowest, against a 4 GiB memguard floor. The
 recipe's default is therefore 32 rows (edits +14 % instead of +20 %); 48 where the head has the room.
 
+## Round 12: sampled self-repeats copied 15 tokens at most (`zig/patches/0022`, `results/copy-self-cap.txt`)
+
+The server samples at temperature 1 by default and clients that set nothing (Pi) get it. There sparkDash's one-stream
+cells lost 4-7 % with 32-row copy windows against 16 (same seeds, same replies): repeats of the reply's own text grow
+windows that sampling then leaves, while copies of the prompt (a file being edited) stay on track. Capping a copy by its
+match length (`TF_DS_COPY_MATCH_CAP`) changed nothing, since those repeats match long. Capping a sampling stream's copy
+of its own reply, the proposer's source position past the prompt, at 15 tokens (`TF_DS_COPY_SELF_CAP=15`) checks 397
+instead of 437 tokens on the costly prompt (111.8 -> 119.5 tok/s, its 16-row figure), keeps the edits' 32-row gain
+(17.917 tokens a round either way) and leaves greedy decoding alone. Every reply equal to its reference (VF2: copies,
+edits, T=1 against known and serial hashes, 32K-126K prompts, four streams).
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels

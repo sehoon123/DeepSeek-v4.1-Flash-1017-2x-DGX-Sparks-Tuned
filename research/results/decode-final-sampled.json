@@ -1,0 +1,226 @@
+{
+  "label": "selfcap-s",
+  "started": "2026-10-21T00:10:29.047Z",
+  "reps": 2,
+  "types": [
+    "prose",
+    "code"
+  ],
+  "concs": [
+    1,
+    2,
+    4
+  ],
+  "maxTokens": 400,
+  "waves": [
+    {
+      "type": "prose",
+      "n": 1,
+      "ok": 1,
+      "failed": 0,
+      "aggregateTps": 71.56,
+      "perRequestMedianTps": 71.56,
+      "ttftMedianMs": 156,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "055bbc294e"
+      ],
+      "errors": []
+    },
+    {
+      "type": "prose",
+      "n": 1,
+      "ok": 1,
+      "failed": 0,
+      "aggregateTps": 69.13,
+      "perRequestMedianTps": 69.13,
+      "ttftMedianMs": 131,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "f6e282b6fd"
+      ],
+      "errors": []
+    },
+    {
+      "type": "prose",
+      "n": 2,
+      "ok": 2,
+      "failed": 0,
+      "aggregateTps": 97.85,
+      "perRequestMedianTps": 49.93,
+      "ttftMedianMs": 235,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "7c48c7b4de",
+        "87b2e65153"
+      ],
+      "errors": []
+    },
+    {
+      "type": "prose",
+      "n": 2,
+      "ok": 2,
+      "failed": 0,
+      "aggregateTps": 90.39,
+      "perRequestMedianTps": 47.84,
+      "ttftMedianMs": 237,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "d75d56abb5",
+        "28731063e8"
+      ],
+      "errors": []
+    },
+    {
+      "type": "prose",
+      "n": 4,
+      "ok": 4,
+      "failed": 0,
+      "aggregateTps": 117.76,
+      "perRequestMedianTps": 31.2,
+      "ttftMedianMs": 394,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "027eac75f3",
+        "bb2d588974",
+        "6226a08fd5",
+        "f992c907bf"
+      ],
+      "errors": []
+    },
+    {
+      "type": "prose",
+      "n": 4,
+      "ok": 4,
+      "failed": 0,
+      "aggregateTps": 126.15,
+      "perRequestMedianTps": 32.5,
+      "ttftMedianMs": 394,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "a9912d0513",
+        "7fdb5c558a",
+        "4f3380b551",
+        "625f01a078"
+      ],
+      "errors": []
+    },
+    {
+      "type": "code",
+      "n": 1,
+      "ok": 1,
+      "failed": 0,
+      "aggregateTps": 117.75,
+      "perRequestMedianTps": 117.75,
+      "ttftMedianMs": 198,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "916f4d8b1e"
+      ],
+      "errors": []
+    },
+    {
+      "type": "code",
+      "n": 1,
+      "ok": 1,
+      "failed": 0,
+      "aggregateTps": 98.24,
+      "perRequestMedianTps": 98.24,
+      "ttftMedianMs": 198,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "5137e7d157"
+      ],
+      "errors": []
+    },
+    {
+      "type": "code",
+      "n": 2,
+      "ok": 2,
+      "failed": 0,
+      "aggregateTps": 130.26,
+      "perRequestMedianTps": 70.02,
+      "ttftMedianMs": 294,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "443a59f71b",
+        "9d7317e001"
+      ],
+      "errors": []
+    },
+    {
+      "type": "code",
+      "n": 2,
+      "ok": 2,
+      "failed": 0,
+      "aggregateTps": 140.53,
+      "perRequestMedianTps": 72.29,
+      "ttftMedianMs": 292,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "7bbd115469",
+        "a9aa9918a5"
+      ],
+      "errors": []
+    },
+    {
+      "type": "code",
+      "n": 4,
+      "ok": 4,
+      "failed": 0,
+      "aggregateTps": 160.11,
+      "perRequestMedianTps": 42.07,
+      "ttftMedianMs": 510,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "be3eb67dfa",
+        "0aa1362a2f",
+        "9c77e3a0e3",
+        "48937dee11"
+      ],
+      "errors": []
+    },
+    {
+      "type": "code",
+      "n": 4,
+      "ok": 4,
+      "failed": 0,
+      "aggregateTps": 167.21,
+      "perRequestMedianTps": 43.93,
+      "ttftMedianMs": 509,
+      "rounds": null,
+      "drafted": null,
+      "accepted": null,
+      "outputs": [
+        "18b4fafda7",
+        "b638b8d98e",
+        "d35114ce75",
+        "9f1668ea6f"
+      ],
+      "errors": []
+    }
+  ],
+  "passed": true
+}

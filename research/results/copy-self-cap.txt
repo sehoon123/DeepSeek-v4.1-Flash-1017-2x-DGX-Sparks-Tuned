@@ -1,0 +1,12 @@
+Copies of the reply's own text at temperature 1 (the harness, one stream, 32-row rounds, 2026-10-21 08:20-08:45).
+TF_DS_COPY_SELF_CAP=15: a sampling stream's copy window over its own earlier reply (the copy proposer's source position
+past the prompt) at most 15 tokens; copies of the prompt keep 32 rows. TF_DS_COPY_MATCH_CAP (copy no more than already
+matches) was tried first and changed nothing: the costly repeats match long.
+
+natural mix T=1, no cap              6.796 tok/round   129.04 tok/s  equal True  (c1code_s: 437 checked, 111.8 tok/s)
+natural mix T=1, self cap 15         6.796 tok/round   131.34 tok/s  equal True  (c1code_s: 397 checked, 119.5 tok/s)
+edits T=1, no cap                   17.917 tok/round   197.48 tok/s  equal True
+edits T=1, self cap 15              17.917 tok/round   198.79 tok/s  equal True
+repetitive code T=1, no cap          5.209 tok/round   110.22 tok/s  equal True
+repetitive code T=1, self cap 15     5.209 tok/round   110.62 tok/s  equal True
+plain text T=0, self cap 15          3.280 tok/round    84.58 tok/s  equal True
