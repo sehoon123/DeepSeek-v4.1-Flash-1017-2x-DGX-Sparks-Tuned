@@ -225,6 +225,9 @@ in one call (the first chunk's steps of a layer before the second's, the gates o
 prefill by 4.5 % at 16K tokens, 8.8 % at 32K and 12.2 % at 126K, for ~1.0 GiB more arena. The gain is less than the
 weights alone suggest (the gate / up GEMM takes 1.68x as long for twice the rows) and was first lost to Engram reads
 started too late; the shipped read-ahead takes the next two chunks' rows onto back buffers from the first Engram layer.
+`zig/patches/0026` then puts a pair's NCCL gathers on a side stream beside the other chunk's work and starts the next
+chunks' Engram reads earlier on a ring of their own: -9.4 / -12.5 / -13.9 % prefill at 16K / 32K / 126K, served -11 to
+-12.5 % at 29K-144K tokens, every reply the same.
 
 ## What is left
 

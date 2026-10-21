@@ -29,3 +29,11 @@ Served (2026-10-21 21:25-21:31, image f33ace7b9214, a fresh start each, the same
 Every reply the same. Head MemAvailable after the load 6,918 MiB (7,645 before), worker 8,526 (9,562).
 A conversation through the prompt cache (served, pairs on against off, a fresh start each, temperature 0): a 30,168-token
 first turn (15.58 s against 16.88), then two turns resumed from the state kept at 28,672: all three replies the same.
+
+Patch 0026 (with 0025): a pair's NCCL gathers on a side stream beside the other chunk's work (three of a layer's four
+gathers hidden, every NCCL call of a pass on one stream at a time), and the next two chunks' Engram rows read from the
+pass's first Engram layer and each pair's start on a ring of their own (the pass's first pair waited 724 ms for them,
+now 288). Harness: 16K / 32K / 126K-token prompts 7.53-7.57 / 13.90-14.01 / 56.46 s, -9.4 / -12.5 / -13.9 % against no
+pairs. Served (2026-10-21 23:47-23:49, the same three prompts as above): 13.39 / 31.18 / 65.87 s, -11.2 / -12.5 / -12.0 %
+against one chunk at a time; every reply the same. Verified: req-long-x all equal, four mixed streams equal, one and four
+streams, copies and temperature 1 against their hashes.
