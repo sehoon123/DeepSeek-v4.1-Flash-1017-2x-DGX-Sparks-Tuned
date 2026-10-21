@@ -1,0 +1,15 @@
+32-row against 48-row rounds, both with TF_DS_COPY_SELF_CAP=15 (patches 0019-0022, image eb5c456dfa3b), served, one restart
+each, 2026-10-21 09:08-09:27. sparkDash's decode bench (median of two waves a cell) and the edit / copy / repetitive-code
+probe through the API (one round each, temperature 0 and 1); every reply identical between the two.
+
+cell        T1 32   T1 48  greedy 32  greedy 48
+prose/1     70.34   70.21      67.41      67.78
+prose/2     94.12   94.00     102.00     102.16
+prose/4    121.96  121.99     136.16     137.75
+code/1     108.00  108.09     115.81     115.92
+code/2     135.39  137.28     150.06     150.58
+code/4     163.66  163.18     166.88     165.75
+48 vs 32 geomean: sparkDash T=1 +0.15 %, greedy +0.27 %; edits and copies +6.75 % (T=0) and +5.53 % (T=1); repetitive code +0.4 %.
+
+The engine's load line: 105.40 GiB at 32 rows, 105.58 at 48 (0.18 GiB a Spark). With the self cap, 48 rows lose nothing; take
+them where the head keeps room above MEMGUARD_GIB (results/soak-memory.txt).

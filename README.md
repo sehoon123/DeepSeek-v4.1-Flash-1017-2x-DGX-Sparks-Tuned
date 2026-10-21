@@ -36,7 +36,8 @@ their repository's.
   (0021, one stream): writing out four Python files whole with a scattered edit each (a rename, print -> log, ...) +14 %
   at 32 rows and +20 % at 48 (180.7 -> 206.3 / 216.9 tok/s; at temperature 1 +13 / +18 %), copies of the reply +21 / +32 %;
   text without copies unchanged. Each 16 rows past 16 cost ~0.26 GiB of each Spark's memory (the wider rounds' buffers),
-  so 32 is the default: set `ROUND_ROWS=48` where the head has the room ("Memory and safety"). At temperature > 0 a copy of
+  so 32 is the default: set `ROUND_ROWS=48` where the head has the room ("Memory and safety"; with 0022 below, 48 rows
+  copy 5.5-6.8 % faster again and lose nothing elsewhere, `research/results/rows-32-48.txt`). At temperature > 0 a copy of
   the reply's own earlier text takes at most 15 tokens a round (`zig/patches/0022`, `TF_DS_COPY_SELF_CAP=15`): sampled
   repeats leave their copy sooner, and full-width windows over them cost one-stream sampled decode 4-7 %; copies of the
   prompt keep the full width.
