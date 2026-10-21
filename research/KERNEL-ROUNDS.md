@@ -193,6 +193,15 @@ edits, T=1 against known and serial hashes, 32K-126K prompts, four streams).
 - **The copy's source**: the suffix lookup already takes the latest of the equally long matches (it walks back from the
   newest), the right one when a conversation has printed the same file more than once.
 
+## Round 14: memory outside the engine's own count (`results/memory-savings.txt`)
+
+The head's free memory fell by 2-3 GiB under mixed load and stayed down. Two causes, both cut with the replies and the
+speed unchanged. NCCL, which here carries only the prompt passes' all-gathers, held ~1.2 GiB of pinned host buffers for
+its default channels on each Spark; `NCCL_MAX_NCHANNELS=8` holds 0.2 GiB and prefills 32K-126K prompts as fast. And the
+rounds' CUDA graphs, one per (rows, context bucket, stretch), were never released, ~3.6 MiB each: 453 of them in one
+afternoon's checks. `zig/patches/0024` keeps 128 (`TF_DS_GRAPH_CAP`), destroying the least recently replayed first; even
+a cap of 32 under a 102-graph load ran as fast. Served, the same checks left 6.7 GiB free at the lowest instead of 4.0.
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels

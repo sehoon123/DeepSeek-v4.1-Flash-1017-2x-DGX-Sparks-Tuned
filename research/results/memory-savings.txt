@@ -1,0 +1,23 @@
+Memory the engine held outside its own count, found and cut without changing a reply or the speed (2026-10-21 14:45-16:50).
+Per rank on the head; MemAvailable from /proc/meminfo; the harness = tools/calib, one load a run.
+
+1. NCCL's pinned host buffers. NCCL carries only the prompt passes' all-gathers (a decode round's exchanges take the RDMA
+   ring; NCCL here never reduces, an all-gather copies). Its default channels held 149 shared mappings, 1,225 MiB:
+
+   NCCL_MAX_NCHANNELS   pinned   prefill 32K / 64K / 126K (s)
+   default              1,225    16.18, 16.25 / 31.90, 32.27 / 64.92, 64.95, 68.53
+   8                      195    16.29 / 31.98 / 69.25, 64.47
+   4                      122    16.24, 16.37 / 32.07, 32.30 / 66.94, 66.61, 64.38
+   2                       85    16.48 / 32.44 / -
+   (126K varies 64-69 s run to run whatever the setting; replies identical in every run; NCCL_PROTO=Simple: no change.)
+   Served with 8: a 48,664-token prompt 25.6 s against 25.7, decode within 0.02 %.
+
+2. The rounds' CUDA graphs. A round runs as graphs, one per (rows, context bucket, stretch), kept for good; each holds
+   ~3.6 MiB of the driver's memory (twelve prompts of 1.5K-50K at four streams: 102 graphs; graphs off: 280 MiB less
+   taken). Destroying the least recently replayed one past a cap (patch 0024) gives back ~3 MiB a graph and costs nothing
+   measurable: cap 32 under that load (73 evicted) and cap 64 (56 evicted) ran as fast with the same replies.
+
+Served, 48 rows, the same checks as before the changes (bench, edit probes, two edits at a time, three conversations at
+once, a 295,182-token prompt): 453 graphs captured, 128 kept, 325 evicted; head MemAvailable at least 6,690 MiB (before:
+3,973 in the three-conversation run, 4,430 in the long prompt) and 7,118 MiB idle afterwards (before: ~4,000, a plateau);
+bench greedy +0.08 %, temperature 1 -0.13 % (same outputs), edits -0.05 % (same replies), the long prompt 169.3 s.
