@@ -134,6 +134,9 @@ export TF_DS_COPY_ROWS="${TF_DS_COPY_ROWS:-$ROUND_ROWS}" TF_DS_COPY_SKIP="${TF_D
 # At temperature > 0 a copy of the reply's own earlier text (not of the prompt) takes at most 15 tokens a round (zig/patches/0022;
 # 0: no cap): sampled repeats leave their copy sooner, and wide windows over them cost more than they land.
 export TF_DS_COPY_SELF_CAP="${TF_DS_COPY_SELF_CAP:-15}"
+# When every live stream copies (agents writing out the files they edit), their copies of the prompt keep growing beside each
+# other, up to 15 tokens and an even share of a round's rows (zig/patches/0023; 0: off). A stream that drafts is never slowed.
+export TF_DS_COPY_MULTI="${TF_DS_COPY_MULTI:-15}"
 # The engine's settings as BertholomusAI's served two-node launch has them: CUDA graphs, the mixes' side stream, the
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
 # NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).

@@ -75,6 +75,7 @@ for v in THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_K
 [[ "$TF_DS_COPY_ROWS" =~ ^[0-9]+$ ]] && (( TF_DS_COPY_ROWS >= 6 && TF_DS_COPY_ROWS <= ${ROUND_ROWS:-16} )) || die "TF_DS_COPY_ROWS is 6 (the engine's own copy windows) to ROUND_ROWS (${ROUND_ROWS:-16}; 48 at most), not '$TF_DS_COPY_ROWS'"
 [[ "$TF_DS_COPY_SKIP" =~ ^[01]$ ]] || die "TF_DS_COPY_SKIP is 0 or 1, not '$TF_DS_COPY_SKIP'"
 [[ "$TF_DS_COPY_SELF_CAP" =~ ^[0-9]+$ ]] && (( TF_DS_COPY_SELF_CAP <= 47 )) || die "TF_DS_COPY_SELF_CAP is 0 (no cap) to 47, not '$TF_DS_COPY_SELF_CAP'"
+[[ "$TF_DS_COPY_MULTI" =~ ^[0-9]+$ ]] && (( TF_DS_COPY_MULTI <= 47 )) || die "TF_DS_COPY_MULTI is 0 (off) to 47, not '$TF_DS_COPY_MULTI'"
 nccl_extra_collect
 check_workers
 

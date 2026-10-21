@@ -5,6 +5,10 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **Copies beside other streams** (`zig/patches/0023`; `TF_DS_COPY_MULTI=15` by default): when every live stream's last
+  round was a copy, their copies of the prompt keep growing beside each other, up to 15 tokens and an even share of a
+  round's rows (never past `ROUND_ROWS`). Two streams that both edit +28 %, four +9 %, sparkDash-like mixes +3 %, no stream
+  slower (an unguarded version slowed a drafting stream beside a copy by 21 %). Replies unchanged.
 - **Sampled self-repeats copied 15 tokens at most** (`zig/patches/0022`; `TF_DS_COPY_SELF_CAP=15` by default): at
   temperature > 0 a copy window over the reply's own earlier text (not the prompt) takes at most 15 tokens; the copy
   proposer now says where its copy starts. Recovers the 4-7 % that 32-row windows cost one-stream sampled decode on

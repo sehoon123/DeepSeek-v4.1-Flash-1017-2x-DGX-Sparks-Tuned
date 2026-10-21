@@ -40,7 +40,9 @@ their repository's.
   copy 5.5-6.8 % faster again and lose nothing elsewhere, `research/results/rows-32-48.txt`). At temperature > 0 a copy of
   the reply's own earlier text takes at most 15 tokens a round (`zig/patches/0022`, `TF_DS_COPY_SELF_CAP=15`): sampled
   repeats leave their copy sooner, and full-width windows over them cost one-stream sampled decode 4-7 %; copies of the
-  prompt keep the full width.
+  prompt keep the full width. When every live stream copies (agents writing out the files they edit), their copies keep
+  growing beside each other, up to 15 tokens and an even share of a round's rows (`zig/patches/0023`,
+  `TF_DS_COPY_MULTI=15`): two streams that both edit +28 %, four +9 %, and no stream that drafts is slowed.
 - **The drafter's confidence head when the stock shards are gone.** Mia's AI Lab's recipe gives the overlay's F32 copy of
   `mtp.2.confidence_head.proj.weight` stock's F16 bytes back (`scripts/ablit_stock_dtypes.py`), which needs the stock
   shards. When they are gone, preparation checks the head and writes it to `conf_head_f32.bin`, and both ranks load it
@@ -69,7 +71,7 @@ hashes: 62 of 62 copy-window runs (copies 0-90 % wrong, three streams at once, t
 611 decodes of the later offline runs, up to 125K-token prompts, and every run of the kernel rounds (patch 0019), none
 different ([research/](research/README.md)).
 
-The image is Mia's AI Lab's with these thirteen patches added (`tensorfold-dsv41:exl3-tp2-eb5c456dfa3b`). None is published,
+The image is Mia's AI Lab's with these fourteen patches added (`tensorfold-dsv41:exl3-tp2-5635b597cc22`). None is published,
 so the first `./start.sh` builds it on the head (two Zig builds, ~6 minutes) and copies it to the worker.
 
 <!-- MEASURED -->
