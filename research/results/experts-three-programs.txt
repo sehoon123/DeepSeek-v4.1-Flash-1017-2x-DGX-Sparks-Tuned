@@ -27,3 +27,9 @@ Served (TTFT, a fresh server each, same prompts and replies):
   28,853           12.92 / 13.41      13.73    -4.1 %
   70,014           31.92 / 31.03      31.83    -1.1 %
   144,159          65.05 / 65.53      66.28    -1.5 %
+
+Served with the image (2026-10-22 06:08-06:36): a 289,975-token prompt alone 136.6 s (before pairs a 290K one took
+168.6-169.3 s); then three conversations for 25 min, 138 turns, no errors, and the 20 edit-probe replies (copies,
+temperature 0 and 1) beside them equal, each, to the 0024 build's alone; MemAvailable at least 5,360 MiB on the head and
+7,670 MiB on the other Spark. Decode (sparkDash-like greedy bench, prose / code at 1 / 2 / 4 streams) -0.03 % geomean
+against the 0026 build: the kernel runs on prompt chunks only.
