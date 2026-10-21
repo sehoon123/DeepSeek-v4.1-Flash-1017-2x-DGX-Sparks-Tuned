@@ -49,8 +49,9 @@ their repository's.
   passes' all-gathers; its default channels held ~1.2 GiB, prefill as fast with 8), and at most 128 of the rounds' CUDA
   graphs kept (`zig/patches/0024`, `TF_DS_GRAPH_CAP=128`; each new (rows, context bucket) shape added ~3.6 MiB for good,
   1.6 GiB after a day's mixed load).
-- **Prefill 5-14 % faster on long prompts**: `zig/patches/0025`, `TF_DS_PAIR=1`. Chunks before the decoder's replay (only
-  the encoder layers) go two at a time, their routed experts in one call; ~1.0 GiB more arena a Spark.
+- **Prefill 9-14 % faster on long prompts**: `zig/patches/0025`-`0026`, `TF_DS_PAIR=1`. Chunks before the decoder's replay
+  (only the encoder layers) go two at a time, their routed experts in one call, their gathers beside the other chunk's
+  work; ~1.1 GiB more arena a Spark.
 - **The drafter's confidence head when the stock shards are gone.** Mia's AI Lab's recipe gives the overlay's F32 copy of
   `mtp.2.confidence_head.proj.weight` stock's F16 bytes back (`scripts/ablit_stock_dtypes.py`), which needs the stock
   shards. When they are gone, preparation checks the head and writes it to `conf_head_f32.bin`, and both ranks load it
@@ -79,7 +80,7 @@ hashes: 62 of 62 copy-window runs (copies 0-90 % wrong, three streams at once, t
 611 decodes of the later offline runs, up to 125K-token prompts, and every run of the kernel rounds (patch 0019), none
 different ([research/](research/README.md)).
 
-The image is Mia's AI Lab's with these sixteen patches added (`tensorfold-dsv41:exl3-tp2-f33ace7b9214`). None is published,
+The image is Mia's AI Lab's with these seventeen patches added (`tensorfold-dsv41:exl3-tp2-81a696e2cc44`). None is published,
 so the first `./start.sh` builds it on the head (two Zig builds, ~6 minutes) and copies it to the worker.
 
 <!-- MEASURED -->

@@ -1,0 +1,219 @@
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 5911852..763dbcc 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -109,6 +109,7 @@ pub const Model = struct {
+     aio: ?*engram_aio.Aio = null,
+     paio: ?*engram_aio.Aio = null, // the prompt chunks' Engram reads, on a ring of their own
+     paio2: ?*engram_aio.Aio = null, // TF_DS_ENGRAM_LANES=2: half of each prompt chunk's reads, on a second ring
++    baio: ?*engram_aio.Aio = null, // TF_DS_PAIR: the back hosts' reads on a ring of their own (they run beside the front's)
+     eh: ?prompt.EngramHost = null,
+     host_pos: []i64,
+     ids64: []i64,
+@@ -132,6 +133,10 @@ pub const Model = struct {
+     eh3: ?prompt.EngramHost = null, // the back hosts: the next step's rows read ahead while eh / eh2 serve this one
+     eh4: ?prompt.EngramHost = null,
+     back_spawned: bool = false,
++    // TF_DS_PAIR_OVERLAP (on with pairs unless 0): a pair's gathers on a side stream beside the other chunk's work, every
++    // NCCL call of a pass on one stream at a time (the main one waits the side before its own)
++    gs: ?cuda.Stream = null,
++    gev: [7]cuda.Event = undefined, // a1, a2, x (main to side); ga1, ga2, gm1, gm2 (side to main)
+     host_pos2: []i64 = &.{},
+     ids64_2: []i64 = &.{},
+     view: prompt.Caches = undefined,
+@@ -192,6 +197,7 @@ pub const Model = struct {
+         m.aio = null;
+         m.paio = null;
+         m.paio2 = null;
++        m.baio = null;
+         m.eh = null;
+         m.ahead = null;
+         m.pair_on = false;
+@@ -201,6 +207,7 @@ pub const Model = struct {
+         m.eh3 = null;
+         m.eh4 = null;
+         m.back_spawned = false;
++        m.gs = null;
+         m.host_pos2 = &.{};
+         m.ids64_2 = &.{};
+         m.rdma_mod = null;
+@@ -307,6 +314,11 @@ pub const Model = struct {
+         if (m.pair_on) {
+             m.ch2 = try prompt.partner(&m.ch, &m.eng, &m.arena);
+             m.pair = try prompt.PairMoe.init(&m.eng, &m.arena, chunk_rows);
++            const ov = if (std.c.getenv("TF_DS_PAIR_OVERLAP")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true; // every rank alike
++            if (ov) {
++                m.gs = try cuda.Stream.init(d, true);
++                for (&m.gev) |*ev| ev.* = try cuda.Event.init(d, false);
++            }
+         }
+         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
+         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
+@@ -376,10 +388,11 @@ pub const Model = struct {
+                 m.eh2.?.paio2 = m.paio2;
+                 m.eh3 = try prompt.EngramHost.init(a, c, engram.Hasher.init(c.*, map, mult), &m.tables.?, m.epool.?, sp.rank, sp.world, chunk_rows);
+                 m.eh4 = try prompt.EngramHost.init(a, c, engram.Hasher.init(c.*, map, mult), &m.tables.?, m.epool.?, sp.rank, sp.world, chunk_rows);
++                if (m.paio != null) m.baio = try engram_aio.Aio.init(gpa, io, 4096);
+                 inline for (.{ &m.eh3, &m.eh4 }) |hp| {
+                     hp.*.?.aio = m.aio;
+-                    hp.*.?.paio = m.paio;
+-                    hp.*.?.paio2 = m.paio2;
++                    hp.*.?.paio = if (m.baio) |x| x else m.paio;
++                    hp.*.?.paio2 = null;
+                 }
+             }
+         } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
+@@ -420,6 +433,7 @@ pub const Model = struct {
+         m.rd.dropPrefetch();
+         if (m.aio) |x| x.deinit();
+         if (m.paio) |x| x.deinit();
++        if (m.baio) |x| x.deinit();
+         if (m.paio2) |x| x.deinit();
+         if (m.epool) |p| p.deinit(m.gpa);
+         if (m.tables) |*t| t.close();
+@@ -685,11 +699,10 @@ pub const Model = struct {
+                 const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
+                 const ne = @min(2, c.engram_layers.slice().len);
+                 if (j + 1 < ne) {
+-                    if (!eh.ahead_ready[j + 1]) {
++                    if (!eh.ahead_ready[j + 1])
+                         ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
+-                    } else if (m.pair_on and m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
+-                        m.spawnBack(start + n); // TF_DS_PAIR: the next two chunks' rows from here, onto the back hosts
+-                    }
++                    // TF_DS_PAIR: the next two chunks' rows from here, onto the back hosts (their own ring)
++                    if (m.pair_on and !m.back_spawned and m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) m.spawnBack(start + n);
+                 } else if (m.pair_on and m.back_spawned) {
+                     // (the next chunks' rows went out at the first Engram layer)
+                 } else if (m.pair_on and m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
+@@ -837,7 +850,23 @@ pub const Model = struct {
+                 m.ahead = null;
+             }
+         }
++        // the next two chunks' rows onto the back hosts from the start (their own ring, beside a front read)
++        if (!m.back_spawned and m.fill_seq.len > start + n1 + n2 and m.fill_seq.ptr == seq.ptr) m.spawnBack(start + n1 + n2);
++        const ms = m.stream;
++        const ev_a1 = m.gev[0];
++        const ev_a2 = m.gev[1];
++        const ev_x = m.gev[2];
++        const ev_ga1 = m.gev[3];
++        const ev_ga2 = m.gev[4];
++        const ev_gm1 = m.gev[5];
++        const ev_gm2 = m.gev[6];
+         for (0..c.layers / 2) |li| {
++            // the side's MoE gathers of the layer before: the pending posts read them, and an NCCL call on this stream
++            // (an Engram layer's) runs only with the side idle
++            if (m.gs != null and li > 0 and e.w.layers[li].engram_wkv != null) {
++                try ms.wait(ev_gm1);
++                try ms.wait(ev_gm2);
++            }
+             if (e.w.layers[li].engram_wkv != null) {
+                 const eh = if (m.eh) |*x| x else return error.NoEngramTables;
+                 const eh2 = if (m.eh2) |*x| x else return error.NoEngramTables;
+@@ -853,24 +882,64 @@ pub const Model = struct {
+                 // layer's rows are in by now: the thread that read them was joined above)
+                 if (!m.back_spawned and m.fill_seq.len > start + n1 + n2 and m.fill_seq.ptr == seq.ptr) m.spawnBack(start + n1 + n2);
+             }
+-            try prompt.attnMixes(e, ch1, li);
+-            try prompt.attention(e, ch1, &m.view, &sh1, li, m.ring_view[li], 0, false);
+-            try prompt.gather(e, ch1, ch1.pa, ch1.ga);
+-            try prompt.ffnMixes(e, ch1, li);
+-            try prompt.moeGate(e, ch1, li, pr.pick, pr.wts);
+-            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(pr.x, ch1.x, n1 * d * 2, e.s.handle), "cuMemcpyDtoDAsync");
+-            try prompt.attnMixes(e, ch2, li);
+-            try prompt.attention(e, ch2, &m.view, &sh2, li, m.ring_view[li], 0, false);
+-            try prompt.gather(e, ch2, ch2.pa, ch2.ga);
+-            try prompt.ffnMixes(e, ch2, li);
+-            try prompt.moeGate(e, ch2, li, pr.pick + n1 * sl * 4, pr.wts + n1 * sl * 4);
+-            try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(pr.x + n1 * d * 2, ch2.x, n2 * d * 2, e.s.handle), "cuMemcpyDtoDAsync");
+-            try prompt.pairExperts(e, ch1, pr, li, n1 + n2);
+-            try prompt.gather(e, ch1, pr.pm, ch1.gm);
+-            try prompt.gather(e, ch2, pr.pm + n1 * d * 4, ch2.gm);
++            if (m.gs) |gs| {
++                // overlapped: the first chunk's attention gather beside the second's attention, the second's beside the
++                // first's FFN mixes and gate, the second's MoE gather beside the next layer's first attention (each
++                // chunk's own steps in their order, the shared buffers one chunk at a time on this stream)
++                if (li > 0) try ms.wait(ev_gm1);
++                try prompt.attnMixes(e, ch1, li);
++                try prompt.attention(e, ch1, &m.view, &sh1, li, m.ring_view[li], 0, false);
++                try ev_a1.record(ms);
++                try gs.wait(ev_a1);
++                try prompt.gatherOn(e, ch1, ch1.pa, ch1.ga, gs);
++                try ev_ga1.record(gs);
++                if (li > 0) try ms.wait(ev_gm2);
++                try prompt.attnMixes(e, ch2, li);
++                try prompt.attention(e, ch2, &m.view, &sh2, li, m.ring_view[li], 0, false);
++                try ev_a2.record(ms);
++                try gs.wait(ev_a2);
++                try prompt.gatherOn(e, ch2, ch2.pa, ch2.ga, gs);
++                try ev_ga2.record(gs);
++                try ms.wait(ev_ga1);
++                try prompt.ffnMixes(e, ch1, li);
++                try prompt.moeGate(e, ch1, li, pr.pick, pr.wts);
++                try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(pr.x, ch1.x, n1 * d * 2, e.s.handle), "cuMemcpyDtoDAsync");
++                try ms.wait(ev_ga2);
++                try prompt.ffnMixes(e, ch2, li);
++                try prompt.moeGate(e, ch2, li, pr.pick + n1 * sl * 4, pr.wts + n1 * sl * 4);
++                try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(pr.x + n1 * d * 2, ch2.x, n2 * d * 2, e.s.handle), "cuMemcpyDtoDAsync");
++                try prompt.pairExperts(e, ch1, pr, li, n1 + n2);
++                try ev_x.record(ms);
++                try gs.wait(ev_x);
++                try prompt.gatherOn(e, ch1, pr.pm, ch1.gm, gs);
++                try ev_gm1.record(gs);
++                try prompt.gatherOn(e, ch2, pr.pm + n1 * d * 4, ch2.gm, gs);
++                try ev_gm2.record(gs);
++            } else {
++                try prompt.attnMixes(e, ch1, li);
++                try prompt.attention(e, ch1, &m.view, &sh1, li, m.ring_view[li], 0, false);
++                try prompt.gather(e, ch1, ch1.pa, ch1.ga);
++                try prompt.ffnMixes(e, ch1, li);
++                try prompt.moeGate(e, ch1, li, pr.pick, pr.wts);
++                try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(pr.x, ch1.x, n1 * d * 2, e.s.handle), "cuMemcpyDtoDAsync");
++                try prompt.attnMixes(e, ch2, li);
++                try prompt.attention(e, ch2, &m.view, &sh2, li, m.ring_view[li], 0, false);
++                try prompt.gather(e, ch2, ch2.pa, ch2.ga);
++                try prompt.ffnMixes(e, ch2, li);
++                try prompt.moeGate(e, ch2, li, pr.pick + n1 * sl * 4, pr.wts + n1 * sl * 4);
++                try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(pr.x + n1 * d * 2, ch2.x, n2 * d * 2, e.s.handle), "cuMemcpyDtoDAsync");
++                try prompt.pairExperts(e, ch1, pr, li, n1 + n2);
++                try prompt.gather(e, ch1, pr.pm, ch1.gm);
++                try prompt.gather(e, ch2, pr.pm + n1 * d * 4, ch2.gm);
++            }
+             prompt.endLayer(ch1);
+             prompt.endLayer(ch2);
+         }
++        if (m.gs != null) {
++            // the side done before this stream reads the posts or calls NCCL itself
++            try ms.wait(ev_gm1);
++            try ms.wait(ev_gm2);
++        }
+         // the decoder's first layer: each chunk's mixes and kv-source update, and the cut that ends an encoder-only chunk
+         if (try prompt.replayCut(e, ch1, &m.view, &sh1, c.layers / 2, replay, m.host_pos)) return error.BadChunk;
+         if (try prompt.replayCut(e, ch2, &m.view, &sh2, c.layers / 2, replay, m.host_pos2)) return error.BadChunk;
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 25d38a8..1b57cb7 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -716,6 +716,9 @@ pub fn partner(ch: *const Chunk, e: *const Engine, a: *Arena) !Chunk {
+     p.comb = try a.take(cap * hc * hc * 4);
+     p.gm = try a.take(e.world * cap * d * 4);
+     if (ch.cidx != 0) p.cidx = try a.take(cap * c.index_topk * 8);
++    // its own attention partial and gather (TF_DS_PAIR_OVERLAP: the first chunk's gather runs beside the second's attention)
++    p.pa = try a.take(cap * d * 4);
++    p.ga = try a.take(e.world * cap * d * 4);
+     return p;
+ }
+ 
+@@ -1115,6 +1118,12 @@ pub fn scale(hd: usize) f32 {
+ }
+ 
+ /// Comm.gather: [world, n, D] fp32 of every rank's partial, in rank order.
++/// TF_DS_PAIR_OVERLAP: gather() of the chunk's rows on `stream` (a pair's side stream; one rank the same as the other).
++pub fn gatherOn(e: *const Engine, ch: *const Chunk, src: u64, dst: u64, stream: cuda.Stream) !void {
++    if (e.two != null) return error.NotPorted;
++    try e.comm.allGather(src, dst, ch.n * e.c.hidden, .f32, stream);
++}
++
+ pub fn gather(e: *const Engine, ch: *const Chunk, src: u64, dst: u64) !void {
+     if (e.two) |t| return t.quarters(e, src, dst, ch.n, t.ow, 4); // 2D: the same [2, n, D] from the four quarters
+     try e.comm.allGather(src, dst, ch.n * e.c.hidden, .f32, e.s);

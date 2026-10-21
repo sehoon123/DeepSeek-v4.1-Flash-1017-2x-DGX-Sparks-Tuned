@@ -5,6 +5,11 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **Prefill pairs, faster still** (`zig/patches/0026`, with 0025; `TF_DS_PAIR_OVERLAP=0` turns it off): a pair's NCCL
+  gathers on a side stream beside the other chunk's work (the main stream waits it before an NCCL call of its own), and
+  the next two chunks' Engram rows read from the pass's first Engram layer on, on a ring of their own. 16K / 32K /
+  126K-token prompts -9.4 / -12.5 / -13.9 % prefill time against no pairs (0025 alone: -4.5 / -8.8 / -12.2 %); ~0.13 GiB
+  more. Replies unchanged.
 - **Prefill 5-14 % faster** (`zig/patches/0025`, `TF_DS_PAIR=1` by default): a long prompt's chunks before the decoder's
   replay (encoder-only, the bulk of it) go through the encoder layers two at a time, the first chunk's steps before the
   second's at every layer and their routed experts in one call (twice the rows per expert for the same weight reads);
