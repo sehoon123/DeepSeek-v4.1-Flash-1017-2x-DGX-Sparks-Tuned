@@ -266,8 +266,16 @@ chunks' Engram reads earlier on a ring of their own: -9.4 / -12.5 / -13.9 % pref
   unchanged), `4,1,4` (+2 %) and `4,2,4` (+3.5 %). A step's tiles and a group's rows do not change an output's mma chains
   or their order; four warps keep the down kernel's K ranges. `__launch_bounds__(256, 3)` gives 80 registers (48 B
   spilled) but still 2 blocks (shared memory), 4 % slower, the same bits. The kit's warp-decoding `mma2` (other bits; N
-  a multiple of 256, so not this model's 1,152) is only ~10 % faster at N 1,024. What is left there is a kernel without
-  the per-step barrier and with 3+ blocks an SM, keeping each output's 16 chains and their sum order.
+  a multiple of 256, so not this model's 1,152) is only ~10 % faster at N 1,024.
+- **Where its time goes**: with every routed expert at exactly 64 rows a pair takes 17.4 ms (448 programs), at random
+  routing 18.9 ms (615); a program of 32 rows takes 85 % of one of 64, so a program's cost is its weight decode and
+  pipeline, not its mma work. A variant decoding each tile once for up to 128 rows (16 warps, each warp's rows, columns,
+  k tiles and chains unchanged) gives the same Z bit for bit and decodes 32 % fewer tiles on a pair, but is 18 % slower
+  (2,048 rows +59 %): one 16-warp barrier domain an SM instead of two of 8 hides less (the kit's own note: 128 rows a
+  program were slower on GB10). The decode saved would need a pipeline without the step barrier (asynchronous barriers,
+  warps that decode for others) to show.
+- What is left there is such a kernel, keeping each output's 16 chains and their sum order; the kit is fetched and
+  checked by sha256 (prepare.sh), so it would ship as a built overlay of the kit's experts cubin.
 
 ## What is left
 
