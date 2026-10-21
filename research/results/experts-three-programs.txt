@@ -1,0 +1,29 @@
+The prompt MoE's gate / up kernel (grouped_mma_kernel<2, 2, 10, FOLD, KB 4>), three programs an SM (zig/kit-patches/0001).
+2026-10-22, GB10 pair, GPU clocks capped at 2,250 MHz.
+
+Standalone (the kernel alone; a pair's routing: 4,096 rows x 6 of 384 experts + the shared one, seed 1234; a chunk's: 2,048
+rows), 20 launches each, Z hashed (FNV-1a over every fp32 output):
+  kit's kernel        4,096 rows 19.07 / 19.02 / 19.08 ms   Z 3adb566b05979f56;  2,048 rows 13.04 / 12.94 / 12.95 ms   Z be352b6bdd2d4c6b
+  three programs      4,096 rows 17.70 / 17.71 / 17.66 / 17.58 ms   the same Z;  2,048 rows 12.48 / 12.59 / 12.49 / 12.42 ms   the same Z
+  occupancy           kit 2 programs an SM (106 registers, 44,288 B shared); this 3 (80 registers + 48 B spilled, 33,024 B)
+Tried before it, all the same Z, all slower: __launch_bounds__(256, 3) alone (still 2 programs: shared memory) +4 %;
+128 rows a program (16 warps, 32 % fewer tile decodes on a pair) +18 % / +59 %.
+
+The rebuilt cubin (the kit's source at deepseek-v41-tp2 af26d42 + the patch, built as zig/Dockerfile builds it): every
+function's SASS against the kit's cubins/experts_cb.cubin: 1,744 the same, the 18 grouped_mma_kernel variants differ (and
+equal, function for function, the build measured below).
+
+Engine (harness, one stream, prompts of 16,384 / 32,063 / 125,540 tokens, prefill seconds; kit = the kit's cubin):
+  run             16K             32K              126K
+  kit  (wb-a/b)   7.45 / 7.62     15.46 / 14.69    57.02
+  this (w3-a/b)   7.26 / 8.98     14.37 / 13.81    54.97
+  this (w3-c/d)   7.40 / 7.46     13.55 / 13.64    54.59 / 54.71
+  kit  (wb-c/d)   7.55 / 7.58     14.00 / 13.94    56.13 / 55.90
+  (interleaved c/d: -1.8 / -2.8 / -2.4 %)  every prefill hash equal (99fcde8c8ac0, 4717b62673d8, 2d320409c803);
+  req-long-x with this cubin: all equal, 68.67 tokens/s.
+
+Served (TTFT, a fresh server each, same prompts and replies):
+  prompt tokens    this (two runs)    kit
+  28,853           12.92 / 13.41      13.73    -4.1 %
+  70,014           31.92 / 31.03      31.83    -1.1 %
+  144,159          65.05 / 65.53      66.28    -1.5 %

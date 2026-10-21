@@ -274,8 +274,16 @@ chunks' Engram reads earlier on a ring of their own: -9.4 / -12.5 / -13.9 % pref
   (2,048 rows +59 %): one 16-warp barrier domain an SM instead of two of 8 hides less (the kit's own note: 128 rows a
   program were slower on GB10). The decode saved would need a pipeline without the step barrier (asynchronous barriers,
   warps that decode for others) to show.
-- What is left there is such a kernel, keeping each output's 16 chains and their sum order; the kit is fetched and
-  checked by sha256 (prepare.sh), so it would ship as a built overlay of the kit's experts cubin.
+- **Three programs an SM instead** (shipped: `zig/kit-patches`, `zig/patches/0027`, `results/experts-three-programs.txt`):
+  two row stages instead of three, the staged rows unpadded with their 16-byte chunks XOR-swizzled by row (ldmatrix
+  still conflict-free), `__launch_bounds__(256, 3)`: 33,024 B and 80 registers (48 B spilled), three programs an SM. The
+  same Z bit for bit; 4,096 rows 19.0 -> 17.7 ms (-7 %), 2,048 rows 13.0 -> 12.5 ms (-4 %). In the engine, the kit's
+  experts cubin rebuilt from its source with this one change (the other 1,744 kernels with the kit's SASS): prefill
+  -1.8 / -2.8 / -2.4 % at 16K / 32K / 126K tokens (four interleaved runs, every hash equal), served TTFT -4.1 / -1.1 /
+  -1.5 % at 29K / 70K / 144K tokens (replies the same). The kit is still fetched and checked by sha256; the image builds
+  the cubin and the engine reads it in the kit's one's place.
+- What is left there is a kernel without the per-step barrier (asynchronous barriers, warps that decode for others),
+  keeping each output's 16 chains and their sum order, and the down kernel's 255 registers (two 4-warp programs an SM).
 
 ## What is left
 

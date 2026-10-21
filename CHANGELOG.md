@@ -5,6 +5,16 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **The prompt MoE's gate / up kernel three programs an SM** (`zig/kit-patches`, `zig/patches/0027`; `TF_DS_EXPERTS_CUBIN`
+  set empty turns it off): the image now rebuilds the kit's `cubins/experts_cb.cubin` from its source (BertholomusAI's
+  TensorFold, branch `deepseek-v41-tp2`, at `TF_PY_REF`) with one change to `grouped_mma_kernel`: two row stages instead
+  of three, the staged rows unpadded with their 16-byte chunks swizzled, and `__launch_bounds__(256, 3)`, so three programs
+  fit an SM (they were two: 44.3 KB of shared memory and 106 registers each). Every output's mma chains and their order
+  are unchanged: the kernel's output is the same bit for bit (standalone, on a pair's and a chunk's routing) and so are
+  the prefill hashes; the cubin's other 1,744 kernels have the kit's SASS. The kernel -7 % on a pair, -4 % on a single
+  chunk; prefill -1.8 / -2.8 / -2.4 % at 16K / 32K / 126K tokens (four interleaved runs), served TTFT -1 to -4 %. The
+  kit itself is still fetched and checked as before; the engine reads the rebuilt cubin from
+  `/opt/tensorfold/kit-overlay/` in its place.
 - **Prefill pairs, faster still** (`zig/patches/0026`, with 0025; `TF_DS_PAIR_OVERLAP=0` turns it off): a pair's NCCL
   gathers on a side stream beside the other chunk's work (the main stream waits it before an NCCL call of its own), and
   the next two chunks' Engram rows read from the pass's first Engram layer on, on a ring of their own. 16K / 32K /

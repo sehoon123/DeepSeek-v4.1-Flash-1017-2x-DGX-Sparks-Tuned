@@ -86,7 +86,7 @@ BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 image_hash() {
   ( cd "$_cfg_root" || exit 1
     cat zig/patches/*.patch 2>/dev/null
-    cat zig/kit-patches/* 2>/dev/null
+    cat zig/kit-patches/*.patch zig/kit-patches/*.py 2>/dev/null   # (not its README)
     cat zig/Dockerfile
     echo "$TF_REPO $TF_REF $INPUTS_REF $TF_PY_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE"
   ) | sha256sum | cut -c1-12
