@@ -166,6 +166,19 @@ instead of 437 tokens on the costly prompt (111.8 -> 119.5 tok/s, its 16-row fig
 (17.917 tokens a round either way) and leaves greedy decoding alone. Every reply equal to its reference (VF2: copies,
 edits, T=1 against known and serial hashes, 32K-126K prompts, four streams).
 
+## Round 13: negative results around the final configuration (2026-10-21 09:30-10:20)
+
+- **The auth proxy** (`8888`, the key check in front of the engine) costs nothing: one 1,200-token reply streamed at
+  237.5-238.1 tok/s through it against 238.0-238.5 straight from `8000` (the engine sends a round's tokens as one event).
+- **CPU idle states**: with LPI-2 and LPI-3 (231 and 433 us to wake) disabled on both Sparks, one stream 84.73 / 84.37 tok/s
+  against 84.63 / 84.68 with them, four streams 38.02 against 37.96: the engine's threads on the round's path spin. The
+  governor is `performance` on both already.
+- **Calibrating the confidence head for temperature 1**: on 45,094 drafts dumped at temperature 1 the head is already close
+  (position 0 lands 0.707 against 0.727 predicted, positions 1-4 a little above their predictions); refitting it per
+  position (Platt) gains +0.2 % in the round simulation (bootstrap 5-95 %: +0.08 .. +0.24 %).
+- **The copy's source**: the suffix lookup already takes the latest of the equally long matches (it walks back from the
+  newest), the right one when a conversation has printed the same file more than once.
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels
