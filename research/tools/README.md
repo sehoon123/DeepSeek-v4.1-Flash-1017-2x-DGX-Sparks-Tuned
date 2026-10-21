@@ -31,3 +31,5 @@ local sparkDash checkout (not included). Nothing here is needed to run the recip
 - `profile/`: the lane profiler run (`--profile`) on sparkDash's prompts.
 - `bench/`: sparkDash-based decode and prefill probes (`conc-probe-dsv.mjs`, `conc-probe-sampled.mjs`, `idle-probe.mjs`,
   the prompt-interleave canaries, `prefill-sparkdash.mjs`) and `bwprobe.py` (GPU read bandwidth).
+- `multiturn.py URL`: three eight-turn conversations at the served default sampling, each reply appended; prints prompt, tokens,
+  TTFT and decode tok/s a turn (`results/multiturn-t1.txt`).

@@ -1,0 +1,30 @@
+Three conversations of eight turns at the served default (temperature 1, thinking off), each turn's reply appended (tools/
+multiturn.py: a Python module edited and ported, prose, a shell script reworked), one stream, served, 2026-10-21 09:35-09:51,
+patches 0019-0022 at 32 rows. No errors; TTFT includes the prompt cache's reuse of the conversation so far. Head
+MemAvailable at least 5,588 MiB throughout (MEMGUARD_GIB 4).
+
+conv turn  prompt tokens  TTFT s decode tok/s
+   0    0      38    950    0.19         95.7
+   1    0      18   1399    0.10         73.2
+   2    0      28   1187    0.13         87.7
+   0    1    1014   1362    0.80        120.3
+   1    1    1438   1500    0.99         63.6
+   2    1    1244   1500    0.92        125.6
+   0    2    2391   1500    1.55         94.6
+   1    2    2960    361    1.80         54.7
+   2    2    2765   1500    1.72        130.9
+   0    3    3916   1251    1.17        206.3
+   1    3    3338    413    0.94         55.6
+   2    3    4281   1500    1.52         78.1
+   0    4    5181    324    1.88         68.3
+   1    4    3767    270    1.13         60.5
+   2    4    5793   1500    1.13         68.5
+   0    5    5521   1500    0.99        120.9
+   1    5    4052    731    1.27         60.7
+   2    5    7310   1500    2.15        101.3
+   0    6    7036   1500    1.80        104.0
+   1    6    4797   1500    1.70         63.6
+   2    6    8822   1500    1.75         88.5
+   0    7    8554    803    1.62         71.5
+   1    7    6312     73    1.49         50.6
+   2    7   10338   1500    1.52         67.4
