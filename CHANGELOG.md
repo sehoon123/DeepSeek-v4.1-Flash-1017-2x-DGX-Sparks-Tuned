@@ -5,6 +5,11 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **Less memory, the same speed**: `NCCL_MAX_NCHANNELS=8` (`scripts/config.sh`): NCCL carries only the prompt passes'
+  all-gathers, and its default channels held ~1.2 GiB of pinned host buffers on each Spark; 8 hold 0.2 GiB, prefill within
+  noise (32K-126K). The CUDA graphs of the rounds kept at most 128 (`zig/patches/0024`, `TF_DS_GRAPH_CAP=128`, the least
+  recently replayed destroyed first): they piled up with every new (rows, context bucket) shape, ~3.6 MiB each, 1.6 GiB
+  after a day's mixed load. Replies unchanged (an all-gather copies; a recaptured graph runs the same launches).
 - **Copies beside other streams** (`zig/patches/0023`; `TF_DS_COPY_MULTI=15` by default): when every live stream's last
   round was a copy, their copies of the prompt keep growing beside each other, up to 15 tokens and an even share of a
   round's rows (never past `ROUND_ROWS`). Two streams that both edit +28 %, four +9 %, sparkDash-like mixes +3 %, no stream

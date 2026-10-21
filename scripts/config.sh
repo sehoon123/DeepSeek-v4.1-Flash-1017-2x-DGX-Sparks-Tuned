@@ -141,6 +141,10 @@ export TF_DS_COPY_MULTI="${TF_DS_COPY_MULTI:-15}"
 # channels hold ~1.2 GiB of pinned host buffers on each Spark: 8 channels hold 0.2 GiB and prefill as fast (32K-126K
 # prompts within noise; an all-gather copies, so the replies are the same). Every exported NCCL_* reaches both ranks.
 export NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-8}"
+# A round runs as CUDA graphs, one per (rows, context bucket, stretch), each holding ~3.6 MiB of the driver's memory; they
+# pile up with every new shape (1.6 GiB after a day's mixed load). 128 at most, the least recently replayed destroyed first
+# (zig/patches/0024; 0: no cap): a recapture costs a few ms, the replies are the same.
+export TF_DS_GRAPH_CAP="${TF_DS_GRAPH_CAP:-128}"
 # The engine's settings as BertholomusAI's served two-node launch has them: CUDA graphs, the mixes' side stream, the
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
 # NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).

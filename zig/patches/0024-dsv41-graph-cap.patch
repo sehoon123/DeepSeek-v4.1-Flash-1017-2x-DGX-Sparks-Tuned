@@ -1,0 +1,76 @@
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index dead408..6610f64 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -44,6 +44,12 @@ const ring_extra = prompt.ring_extra;
+ const raw_rows = prompt.raw_rows;
+ 
+ /// graph.py bucket_for: the context bucket of a round whose deepest row sees n positions, in a pool of `cap`.
++/// TF_DS_GRAPH_CAP=N: Graphs keeps at most N captured stretches (unset, 0 or not a number: no cap).
++fn graphCap() usize {
++    const v = std.c.getenv("TF_DS_GRAPH_CAP") orelse return 0;
++    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
++}
++
+ pub fn bucketFor(n: usize, cap: usize) usize {
+     var b: usize = bucket_min;
+     while (b < n) b *= 2;
+@@ -858,12 +864,34 @@ const Carry = struct {
+ pub const Graphs = struct {
+     gpa: std.mem.Allocator,
+     map: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
++    // TF_DS_GRAPH_CAP (this recipe; unset or 0: no cap): the most stretches kept captured. Every (rows, bucket, stretch) a
++    // server meets stays captured otherwise, each holding ~3.6 MiB of the driver's memory on GB10 (hundreds of them after
++    // a day of mixed contexts and streams); at the cap a new capture first destroys the least recently replayed one (one
++    // still in flight is freed when it completes). A replay and a fresh capture run the same launches: the same bytes.
++    cap: usize = 0,
++    tick: u64 = 0,
++    evicted: u64 = 0,
+ 
+     pub const Key = struct { rows: u32, bucket: u64, stretch: u32 };
+-    const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry };
++    const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry, used: u64 = 0 };
+ 
+     pub fn init(gpa: std.mem.Allocator) Graphs {
+-        return .{ .gpa = gpa };
++        return .{ .gpa = gpa, .cap = graphCap() };
++    }
++
++    fn evictOldest(g: *Graphs) void {
++        var oldest: ?Key = null;
++        var at: u64 = std.math.maxInt(u64);
++        var it = g.map.iterator();
++        while (it.next()) |kv| if (kv.value_ptr.used < at) {
++            at = kv.value_ptr.used;
++            oldest = kv.key_ptr.*;
++        };
++        if (oldest) |k| if (g.map.fetchRemove(k)) |kv| {
++            var x = kv.value.exec;
++            x.deinit();
++            g.evicted += 1;
++        };
+     }
+ 
+     pub fn deinit(g: *Graphs) void {
+@@ -879,8 +907,10 @@ pub const Graphs = struct {
+     }
+ 
+     fn run(g: *Graphs, key: Key, e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, cy: *Carry, li: usize, end: usize) !void {
++        g.tick += 1;
+         if (g.map.getPtr(key)) |en| {
+             if (!std.meta.eql(en.start, cy.*)) return error.GraphStateMismatch;
++            en.used = g.tick;
+             try en.exec.launchOn(e.s);
+             cy.* = en.end;
+             rd.kk = cy.kk;
+@@ -901,7 +931,9 @@ pub const Graphs = struct {
+         defer graph.deinit();
+         var exec = try graph.instantiate();
+         errdefer exec.deinit();
+-        try g.map.put(g.gpa, key, .{ .exec = exec, .start = start, .end = cy.* });
++        if (g.cap > 0 and g.map.count() >= g.cap) g.evictOldest();
++        try g.map.put(g.gpa, key, .{ .exec = exec, .start = start, .end = cy.*, .used = g.tick });
++        if (std.c.getenv("TF_DS_GRAPH_LOG") != null) std.log.info("graph captured: rows {d} bucket {d} stretch {d}; {d} graphs, {d} evicted", .{ key.rows, key.bucket, key.stretch, g.map.count(), g.evicted });
+         try exec.launchOn(e.s);
+     }
+ };

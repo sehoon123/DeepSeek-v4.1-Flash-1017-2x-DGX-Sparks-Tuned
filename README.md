@@ -45,6 +45,10 @@ their repository's.
   prompt keep the full width. When every live stream copies (agents writing out the files they edit), their copies keep
   growing beside each other, up to 15 tokens and an even share of a round's rows (`zig/patches/0023`,
   `TF_DS_COPY_MULTI=15`): two streams that both edit +28 %, four +9 %, and no stream that drafts is slowed.
+- **1.0 GiB less pinned host memory on each Spark, and no slow creep**: `NCCL_MAX_NCHANNELS=8` (NCCL carries only the prompt
+  passes' all-gathers; its default channels held ~1.2 GiB, prefill as fast with 8), and at most 128 of the rounds' CUDA
+  graphs kept (`zig/patches/0024`, `TF_DS_GRAPH_CAP=128`; each new (rows, context bucket) shape added ~3.6 MiB for good,
+  1.6 GiB after a day's mixed load).
 - **The drafter's confidence head when the stock shards are gone.** Mia's AI Lab's recipe gives the overlay's F32 copy of
   `mtp.2.confidence_head.proj.weight` stock's F16 bytes back (`scripts/ablit_stock_dtypes.py`), which needs the stock
   shards. When they are gone, preparation checks the head and writes it to `conf_head_f32.bin`, and both ranks load it
@@ -73,7 +77,7 @@ hashes: 62 of 62 copy-window runs (copies 0-90 % wrong, three streams at once, t
 611 decodes of the later offline runs, up to 125K-token prompts, and every run of the kernel rounds (patch 0019), none
 different ([research/](research/README.md)).
 
-The image is Mia's AI Lab's with these fourteen patches added (`tensorfold-dsv41:exl3-tp2-5635b597cc22`). None is published,
+The image is Mia's AI Lab's with these fifteen patches added (`tensorfold-dsv41:exl3-tp2-09a2daedd221`). None is published,
 so the first `./start.sh` builds it on the head (two Zig builds, ~6 minutes) and copies it to the worker.
 
 <!-- MEASURED -->
