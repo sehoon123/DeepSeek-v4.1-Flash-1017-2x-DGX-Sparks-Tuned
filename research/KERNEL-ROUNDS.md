@@ -178,6 +178,12 @@ edits, T=1 against known and serial hashes, 32K-126K prompts, four streams).
   position (Platt) gains +0.2 % in the round simulation (bootstrap 5-95 %: +0.08 .. +0.24 %).
 - **Prefetched lines kept in L2 longer** (`evict_last` on the bulk prefetch, `research/patches/pf-evict-last.diff`): one stream
   84.39 / 84.47 tok/s against 84.75 / 84.65, four streams 37.85 against 38.01: they then crowd out the next prefetch.
+- **Copies growing beside other streams** (`TF_DS_COPY_MULTI=15`, `research/patches/copy-multi.diff`: a copy of the prompt keeps
+  its ramp with two to four streams, the round's rows shared out evenly so the windows never pass `ROUND_ROWS`; copies of
+  the reply's own text stay at five): every reply equal. Streams that all edit go faster (two: 75.6 -> 97.6 tok/s a
+  stream, +29 %; four: 47.1 -> 51.3, +9 %), but a stream that does not copy, sharing rounds with one that does, slows down
+  (one pair: prose 34.5 -> 27.3 tok/s while the copy beside it went 84.5 -> 149.5), and the natural mix averages -1.6 %. A
+  trade between streams, not a gain, so it stays out of the recipe.
 - **The copy's source**: the suffix lookup already takes the latest of the equally long matches (it walks back from the
   newest), the right one when a conversation has printed the same file more than once.
 

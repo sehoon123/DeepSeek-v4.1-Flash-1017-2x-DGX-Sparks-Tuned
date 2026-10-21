@@ -1,5 +1,5 @@
---- a/zig/kernels/cuda/dsv41_ops.cu	2026-10-20 08:27:55.742180077 +0900
-+++ b/zig/kernels/cuda/dsv41_ops.cu	2026-10-21 11:15:22.821963221 +0900
+--- a/zig/kernels/cuda/dsv41_ops.cu
++++ b/zig/kernels/cuda/dsv41_ops.cu
 @@ -209,6 +209,11 @@
  extern "C" __global__ void __launch_bounds__(128) tf_ds_l2_prefetch_kernel(TfDsPrefetch a, long long delay_ns, long long wave_ns) {
  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -24,8 +24,8 @@
      }
  #else
      const unsigned long long step = (unsigned long long)blockDim.x * gridDim.x * 128ull;
---- a/zig/src/families/dsv41/ops.zig	2026-10-21 01:51:28.442496931 +0900
-+++ b/zig/src/families/dsv41/ops.zig	2026-10-21 11:15:22.822175587 +0900
+--- a/zig/src/families/dsv41/ops.zig
++++ b/zig/src/families/dsv41/ops.zig
 @@ -192,7 +192,9 @@
          const nblk: u32 = @intCast(pfEnv("TF_DS_PF_BLOCKS", 1, 1, 48));
          const rate = pfEnv("TF_EXL3_L2_RATE_GBPS", 230, 0, 1000);

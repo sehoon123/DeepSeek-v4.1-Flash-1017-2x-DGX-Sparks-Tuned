@@ -1,0 +1,98 @@
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -134,9 +134,16 @@
+ pub fn copyProposal(e: *Engine, s: *Stream) ![]const u32 {
+     const p = s.proposer orelse return &.{};
+     if (e.cfg.max_copy == 0 or s.force.items.len > 0) return &.{};
+-    const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
++    // Config.copy_multi (research): beside other streams a copy keeps its ramp up to copy_multi tokens and an even share
++    // of the round's rows (so the windows together never pass batch_rows); a copy of the reply's own text stays narrow
++    const multi = !e.alone and e.cfg.copy_multi > 0;
++    const share: u32 = @intCast(@max(@as(usize, 2), e.cfg.batch_rows / @max(@as(usize, 1), e.live_n)) - 1);
++    const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.first_copy) else if (multi) @min(@min(s.copy_width orelse e.cfg.first_copy, e.cfg.copy_multi), share) else e.cfg.first_copy;
+     const copied = p.propose(s.context.items, @min(@as(i64, width), s.draftRoom() - 1)) catch return &.{};
+     if (copied.len < 2 or p.lastMatch() < e.cfg.enter_match) return &.{};
++    if (multi) if (p.lastFrom()) |from| {
++        if (from >= @as(i64, @intCast(s.prompt_len)) and copied.len > e.cfg.first_copy) return copied[0..e.cfg.first_copy];
++    };
+     // Config.copy_self_cap (this recipe): a sampling stream's copy of its own reply, not of its prompt, at most this many
+     // tokens: a reply repeating itself at temperature > 0 leaves the copy sooner than one copying its prompt does
+     if (e.cfg.copy_self_cap > 0) if (s.sampling) |sm| if (sm.temperature > 0) if (p.lastFrom()) |from| {
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -35,6 +35,7 @@
+     accepted: u64 = 0,
+     shared_rounds: u64 = 0,
+     alone: bool = true, // this step has one live stream: its copies may take their ramp
++    live_n: usize = 1, // this step's live streams (Config.copy_multi shares the rows out by them)
+     steps: u64 = 0,
+     arena: std.heap.ArenaAllocator, // a round's temporaries
+     unread: std.ArrayList(Unread) = .empty, // queued draws the log reads at the step's end
+@@ -174,6 +175,7 @@
+             live.shrinkRetainingCapacity(kept);
+         }
+         e.alone = live.items.len == 1;
++        e.live_n = live.items.len;
+         if (live.items.len > 1 and e.cfg.family_streams) {
+             const chosen = try e.takeTurns(live.items);
+             e.shared_rounds += 1;
+@@ -369,7 +371,7 @@
+                 s.accepted += kept;
+                 if (p.kind == .copy) {
+                     if (s.proposer) |pr| pr.observe(@intCast(rows - 1), @intCast(kept));
+-                    if (e.alone) {
++                    if (e.alone or e.cfg.copy_multi > 0) {
+                         const width = s.copy_width orelse e.cfg.first_copy;
+                         s.copy_width = if (kept == rows - 1) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
+                     }
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -34,6 +34,7 @@
+     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
+     copy_skips_head: bool = false, // a lone stream's fully accepted copy window skips the head's next pass
+     copy_self_cap: u32 = 0, // a sampling stream's copy of its own reply at most this many tokens (0: no cap)
++    copy_multi: u32 = 0, // research: copies of the prompt take their ramp beside other streams, at most this many tokens
+     enter_match: i64 = 8, // matching tokens a copy window needs
+ };
+ 
+@@ -68,6 +69,7 @@
+     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
+     copy_skips_head: bool = false, // Model.copy_skips_head
+     copy_self_cap: u32 = 0, // Model.copy_self_cap
++    copy_multi: u32 = 0, // Model.copy_multi
+     k: Constants = .{},
+ 
+     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
+@@ -123,6 +125,7 @@
+             .mtp_step_ms = m.mtp_step_ms,
+             .copy_skips_head = m.copy_skips_head,
+             .copy_self_cap = m.copy_self_cap,
++            .copy_multi = m.copy_multi,
+             .enter_match = m.enter_match,
+         };
+     }
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -34,6 +34,14 @@
+ pub const max_window = 48;
+ 
+ /// TF_DS_COPY_SELF_CAP=N (1 to 47; unset: no cap): a sampling stream's copy windows over its own reply at most N tokens.
++/// TF_DS_COPY_MULTI=N (research, 1 to 47): beside other streams, a copy of the prompt grows up to N tokens (a round's rows
++/// shared out evenly), a copy of the reply's own text stays at first_copy.
++fn copyMulti() u32 {
++    const v = std.c.getenv("TF_DS_COPY_MULTI") orelse return 0;
++    const x = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return 0;
++    return if (x < 1 or x > 47) 0 else x;
++}
++
+ fn copySelfCap() u32 {
+     const v = std.c.getenv("TF_DS_COPY_SELF_CAP") orelse return 0;
+     const x = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return 0;
+@@ -561,6 +569,7 @@
+             .first_copy_rows = if (self.copy_rows > window_rows) @as(u32, window_rows) else 0,
+             .copy_skips_head = self.copy_skip,
+             .copy_self_cap = copySelfCap(),
++            .copy_multi = copyMulti(),
+             .enter_match = self.enter_match,
+             .gpu_tokens = false,
+             .mtp = drafting,
