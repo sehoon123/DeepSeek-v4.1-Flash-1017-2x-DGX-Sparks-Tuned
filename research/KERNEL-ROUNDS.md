@@ -284,6 +284,11 @@ chunks' Engram reads earlier on a ring of their own: -9.4 / -12.5 / -13.9 % pref
   the cubin and the engine reads it in the kit's one's place.
 - What is left there is a kernel without the per-step barrier (asynchronous barriers, warps that decode for others),
   keeping each output's 16 chains and their sum order, and the down kernel's 255 registers (two 4-warp programs an SM).
+- **The decode MoE kernel is already where it should be**: `grouped_cp_kernel` runs four 4-warp programs an SM at 128
+  registers (`__launch_bounds__(128, 4)`); five (96 registers, 112-120 B spilled) decode 82.4 / 82.6 tokens/s against
+  84.9 / 84.7, six (80 registers, 208-224 B spilled) 75.2 / 74.8 (one stream, every hash equal). It streams the weights;
+  spills cost more than the extra programs hide. Four streams' round rows (16 / 24 / 32 / 48) decode the same (~38.1 a
+  stream); with copies 48 rows +7.0 % against 32.
 
 ## What is left
 
