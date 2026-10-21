@@ -176,6 +176,8 @@ edits, T=1 against known and serial hashes, 32K-126K prompts, four streams).
 - **Calibrating the confidence head for temperature 1**: on 45,094 drafts dumped at temperature 1 the head is already close
   (position 0 lands 0.707 against 0.727 predicted, positions 1-4 a little above their predictions); refitting it per
   position (Platt) gains +0.2 % in the round simulation (bootstrap 5-95 %: +0.08 .. +0.24 %).
+- **Prefetched lines kept in L2 longer** (`evict_last` on the bulk prefetch, `research/patches/pf-evict-last.diff`): one stream
+  84.39 / 84.47 tok/s against 84.75 / 84.65, four streams 37.85 against 38.01: they then crowd out the next prefetch.
 - **The copy's source**: the suffix lookup already takes the latest of the equally long matches (it walks back from the
   newest), the right one when a conversation has printed the same file more than once.
 

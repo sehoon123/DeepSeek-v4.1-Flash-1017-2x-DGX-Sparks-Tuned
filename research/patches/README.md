@@ -9,3 +9,4 @@ Research-only diffs, not in the image (`zig/patches/` holds what the image appli
 | `copy-restart.diff` | 8 | a missed copy window restarts at the tokens it kept (`TF_DS_COPY_RESTART`; the core lanes engine and config) |
 | `copy-ev.diff` | 8 | copy windows capped at the most expected tokens a millisecond from each stream's copy record (`TF_DS_COPY_EV`) |
 | `experts-stages.diff` | 10 | against the engine's `deepseek-v41-tp2` source (`src/tensorfold/cuda/exl3`), not this recipe: `grouped_cp_launch` also instantiating 4 and 5 cp.async stages, built as the engine's torch extension builds it (cpp_extension, `-O3 -lineinfo`, sm_121) |
+| `pf-evict-last.diff` | 13 | the bulk L2 prefetch marking its lines `evict_last` (`TF_DS_PF_HINT=1`): -0.3 % one stream, -0.4 % four |

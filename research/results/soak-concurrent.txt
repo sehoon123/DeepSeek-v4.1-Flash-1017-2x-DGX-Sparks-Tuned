@@ -1,0 +1,14 @@
+Three conversations at a time for 50 minutes (2026-10-21 10:22-11:12): each session runs eight-turn conversations at the
+served default sampling (temperature 1, thinking off), its replies appended, then starts a fresh one (tools/multiturn.py's
+topics, a session tag on the first turn). Patches 0019-0022 at 32 rows, served, one restart before.
+
+turns 296, errors 0, conversations 39, longest prompt 10659 tokens
+decode a stream (three sharing rounds): median 37.2 tok/s, 10-90 %: 22.3 .. 59.0
+TTFT: median 1.36 s, max 4.25 s
+head MemAvailable (every 10 s, 10:22-11:12): start 6204 MiB, least 4792 MiB, end 4865 MiB; the prompt cache filled (512 MiB) and evicted
+
+sparkDash's greedy bench right after, against the same at 09:14: geomean +0.16 % (prose 68.30/102.03/137.73,
+code 115.84/152.53/161.64): no slowdown after the load.
+
+Idle afterwards, the prompt cache still full and the bench's four-stream buckets still held: 4,724 MiB (11:16), the least
+seen in normal service at 32 rows, 0.72 GiB above MEMGUARD_GIB 4 (48 rows: about 0.18 GiB less).
