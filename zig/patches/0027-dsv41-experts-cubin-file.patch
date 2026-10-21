@@ -1,0 +1,34 @@
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 763dbcc..712d689 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -260,7 +260,7 @@ pub const Model = struct {
+         errdefer m.pf.unload();
+         m.lg = try exl3_linear.Kernels.load(d, try readKit(a, io, o.kit_dir, "linear_grouped.cubin"));
+         errdefer m.lg.unload();
+-        m.exk = try exl3_experts.Kernels.load(d, try readKit(a, io, o.kit_dir, "experts.cubin"), try readKit(a, io, o.kit_dir, "experts_cb.cubin"), exl3_linear.codebook_mul1);
++        m.exk = try exl3_experts.Kernels.load(d, try readKit(a, io, o.kit_dir, "experts.cubin"), try readExpertsCb(a, io, o.kit_dir), exl3_linear.codebook_mul1);
+         errdefer m.exk.unload();
+         if (!cuda.kernels.available) return error.NoKernelImages;
+         m.ops = try ops_mod.Ops.load(d, cuda.kernels.torch_pointwise, cuda.kernels.torch_movement, cuda.kernels.dsv41_ops);
+@@ -490,6 +490,20 @@ pub const Model = struct {
+         return std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ kit, "cubins", name }), a, .limited(1 << 28), .@"16", null);
+     }
+ 
++    /// TF_DS_EXPERTS_CUBIN (this recipe; unset or empty: the kit's cubins/experts_cb.cubin): the codebook experts cubin
++    /// read from this file instead, the recipe image's rebuild of the kit's source with its kit-patches (zig/kit-patches:
++    /// the prompt gate / up kernel three programs an SM, every output's mma chains and their order unchanged).
++    fn readExpertsCb(a: std.mem.Allocator, io: std.Io, kit: []const u8) ![]const u8 {
++        if (std.c.getenv("TF_DS_EXPERTS_CUBIN")) |v| {
++            const path = std.mem.span(v);
++            if (path.len > 0) {
++                std.log.info("experts cubin: {s} (TF_DS_EXPERTS_CUBIN)", .{path});
++                return std.Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(1 << 28), .@"16", null);
++            }
++        }
++        return readKit(a, io, kit, "experts_cb.cubin");
++    }
++
+     /// The link to the other rank (rank 0's to rank 1, rank 1's to rank 0).
+     pub fn peer(m: *const Model) link.Link {
+         return m.fan.links[0].?;

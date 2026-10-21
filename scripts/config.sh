@@ -68,6 +68,9 @@ declare -A ENGRAM_SHARD_SIZE=([model-00047-of-00048.safetensors]=101535150936 [m
 # native Zig engine, two nodes), at the head of that branch; it serves both ranks.
 TF_REPO="${TF_REPO:-https://github.com/bertholomus/TensorFold.git}"
 TF_REF="${TF_REF:-629c524a0ea57512a5342abb498d1b7c25353343}"   # the branch tip of 2026-10-19 (was 3ff3b2ac; docs/zig-engine.md, "The pin")
+# The kit's experts cubin is rebuilt (zig/Dockerfile) from the same fork's branch deepseek-v41-tp2, whose Python engine's
+# torch extension the kit's cubins/experts_cb.cubin was extracted from, at this commit, with zig/kit-patches applied.
+TF_PY_REF="${TF_PY_REF:-af26d42b1f618e9e653903a6c043448b52729c64}"
 # The inputs' tools: the same fork's branch deepseek-v41-zig-tp4, at the commit of the four-node recipe v0.1.1. It adds
 # what the two-node branch lacks: tf-dsv41-rank-cache (a rank's weight file from the checkpoint alone, no GPU, no
 # Python) and the standalone token-map and RoPE-table scripts. Only those are taken; it does not serve here.
@@ -83,8 +86,9 @@ BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
 image_hash() {
   ( cd "$_cfg_root" || exit 1
     cat zig/patches/*.patch 2>/dev/null
+    cat zig/kit-patches/* 2>/dev/null
     cat zig/Dockerfile
-    echo "$TF_REPO $TF_REF $INPUTS_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE"
+    echo "$TF_REPO $TF_REF $INPUTS_REF $TF_PY_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE"
   ) | sha256sum | cut -c1-12
 }
 TAG_BASE="exl3-tp2"             # the image tag's prefix: <TAG_BASE>-<image hash>
@@ -149,6 +153,9 @@ export TF_DS_GRAPH_CAP="${TF_DS_GRAPH_CAP:-128}"
 # experts in one call (zig/patches/0025; 0: one chunk at a time). Prefill 5-14 % faster (more on longer prompts) for
 # ~1.0 GiB more arena a Spark; the replies are the same.
 export TF_DS_PAIR="${TF_DS_PAIR:-1}"
+# The codebook experts cubin the engine loads (zig/patches/0027): the image's rebuild with zig/kit-patches (the prompt
+# gate / up kernel three programs an SM; every output the same bits). Set it empty for the kit's cubins/experts_cb.cubin.
+export TF_DS_EXPERTS_CUBIN="${TF_DS_EXPERTS_CUBIN-/opt/tensorfold/kit-overlay/experts_cb.cubin}"
 # The engine's settings as BertholomusAI's served two-node launch has them: CUDA graphs, the mixes' side stream, the
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
 # NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).

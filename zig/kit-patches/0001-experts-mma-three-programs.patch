@@ -1,0 +1,84 @@
+--- a/src/tensorfold/cuda/exl3/experts_grouped.cuh
++++ b/src/tensorfold/cuda/exl3/experts_grouped.cuh
+@@ -533,8 +533,12 @@
+ constexpr int MMA_COLS = 64;        // columns a program
+ constexpr int MMA_KB = 4;           // k tiles a step (it divides every chain: 24 for GLM's gate/up, 8 for its down);
+                                     // chains it does not divide (a TP2 DeepSeek-V4.1 rank's down: 18) take 2 a step
+-constexpr int MMA_STAGES = 3;       // row stages in flight
+-constexpr int MMA_LD = MMA_KB * 16 + 8;     // halfs a staged row (padded: ldmatrix rows fall in distinct banks)
++constexpr int MMA_STAGES = 2;       // row stages in flight (2: three programs fit an SM's 100 KB of shared memory)
++constexpr int MMA_LD = MMA_KB * 16;         // halfs a staged row (MMA_KB 4: unpadded, its 16-byte chunks XOR-swizzled by row)
++// a staged row's length and its 16-byte chunk c of row r: at 4 k tiles a step unpadded with the chunks swizzled (eight
++// rows an ldmatrix reads fall in distinct banks), otherwise padded by 8 halfs as before
++template <int KB> __host__ __device__ constexpr int mma_ld() { return KB == 4 ? KB * 16 : KB * 16 + 8; }
++template <int KB> __device__ __forceinline__ int mma_chunk(int r, int c) { return KB == 4 ? c ^ (r & 7) : c; }
+ constexpr int MMA_DEC = MMA_KB / 2;         // weight tiles a warp decodes a step (8 warps, 4 n16 tiles a k tile)
+ 
+ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool ok) {
+@@ -555,7 +559,7 @@
+ template <int CB, int K2, bool FOLD, int KB>
+ __device__ __forceinline__ void mma_slice(const uint32_t* __restrict__ T, int NTILES, int KT, int per_range, int WK,
+                                           int nt0, const half* __restrict__ X, int K, const int* rows_sh, bool live,
+-                                          int warp, int lane, half (&As)[MMA_STAGES][MMA_ROWS][KB * 16 + 8],
++                                          int warp, int lane, half (&As)[MMA_STAGES][MMA_ROWS][mma_ld<KB>()],
+                                           uint4 (&bsh)[2][KB][4][32], float (&tot)[4][4]) {
+     constexpr int MMA_DEC_ = KB / 2;                       // weight tiles a warp decodes a step
+     constexpr int LW = Fmt<K2>::LW;
+@@ -578,7 +582,7 @@
+         if (st < NS)
+ #pragma unroll
+             for (int c = 0; c < CPR; ++c)
+-                cp_async16(&As[st][crow][(cpart + 4 * c) * 8], src + st * KB * 16 + 32 * c, cr >= 0);
++                cp_async16(&As[st][crow][mma_chunk<KB>(crow, cpart + 4 * c) * 8], src + st * KB * 16 + 32 * c, cr >= 0);
+         cp_async_commit();
+     }
+     uint32_t words[MMA_DEC_][LW];
+@@ -610,7 +614,7 @@
+             if (ahead < NS)
+ #pragma unroll
+                 for (int c = 0; c < CPR; ++c)
+-                    cp_async16(&As[ahead % MMA_STAGES][crow][(cpart + 4 * c) * 8],
++                    cp_async16(&As[ahead % MMA_STAGES][crow][mma_chunk<KB>(crow, cpart + 4 * c) * 8],
+                                src + (size_t)ahead * KB * 16 + 32 * c, cr >= 0);
+             cp_async_commit();
+         }
+@@ -631,7 +635,7 @@
+ #pragma unroll
+             for (int kk = 0; kk < KB; ++kk) {
+                 uint32_t a[4];
+-                ldmatrix_x4(a, &As[stage][lrow][kk * 16 + lcol]);
++                ldmatrix_x4(a, &As[stage][lrow][mma_chunk<KB>(lrow, 2 * kk + (lcol >> 3)) * 8]);
+ #pragma unroll
+                 for (int j = 0; j < 2; ++j) {
+                     const uint4 b = bsh[buf][kk][2 * cg + j][lane];
+@@ -669,7 +673,7 @@
+ }
+ 
+ template <int CB, int LO, int HI, bool FOLD, int KB>
+-__global__ void __launch_bounds__(256) grouped_mma_kernel(
++__global__ void __launch_bounds__(256, 3) grouped_mma_kernel(
+     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
+@@ -693,10 +697,10 @@
+     __shared__ int rows_sh[MMA_ROWS];
+     // the staged rows and two steps' B fragments ([step][k tile][n16][lane]): static up to 4 k tiles a step, dynamic
+     // at 6 (64.5 KB, past the 48 KB of static shared memory; the launcher sets the attribute)
+-    using AsT = half[MMA_STAGES][MMA_ROWS][KB * 16 + 8];
++    using AsT = half[MMA_STAGES][MMA_ROWS][mma_ld<KB>()];
+     using BsT = uint4[2][KB][4][32];
+     constexpr bool DYN = KB > 4;
+-    __shared__ __align__(16) half As_s[DYN ? 1 : MMA_STAGES][DYN ? 1 : MMA_ROWS][DYN ? 8 : KB * 16 + 8];
++    __shared__ __align__(16) half As_s[DYN ? 1 : MMA_STAGES][DYN ? 1 : MMA_ROWS][DYN ? 8 : mma_ld<KB>()];
+     __shared__ uint4 bsh_s[DYN ? 1 : 2][DYN ? 1 : KB][4][32];
+     extern __shared__ __align__(16) unsigned char mma_dyn[];
+     AsT& As = DYN ? *reinterpret_cast<AsT*>(mma_dyn) : *reinterpret_cast<AsT*>(&As_s[0][0][0]);
+@@ -1820,7 +1824,7 @@
+ #define TF_LAUNCH_K(LO_, HI_, F_, KB_)                                                                         \
+     do {                                                                                                        \
+         auto fn = grouped_mma_kernel<CB, LO_, HI_, F_, KB_>;                                                     \
+-        const size_t dyn = KB_ > 4 ? sizeof(half) * MMA_STAGES * MMA_ROWS * (KB_ * 16 + 8) +                    \
++        const size_t dyn = KB_ > 4 ? sizeof(half) * MMA_STAGES * MMA_ROWS * mma_ld<KB_>() +                    \
+                                          sizeof(uint4) * 2 * KB_ * 4 * 32 : 0;                                  \
+         if (dyn) C10_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn)); \
+         fn<<<grid, 256, dyn, stream>>>(a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members,  \

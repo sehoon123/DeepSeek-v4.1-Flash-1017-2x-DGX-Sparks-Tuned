@@ -9,8 +9,8 @@
 # So a second checkout, the fork's branch deepseek-v41-zig-tp4 at INPUTS_REF, is built only for what it adds, and only
 # that is kept: tf-dsv41-rank-cache (the weight file from the checkpoint alone, no GPU, no Python; the same file format,
 # which both engines read) and the standalone make_token_map.py and make_rope.py.
-# Built by scripts/prepare.sh, never by hand: it passes the build arguments and a build context of this file and
-# zig/patches only.
+# Built by scripts/prepare.sh, never by hand: it passes the build arguments and a build context of this file,
+# zig/patches and zig/kit-patches only.
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
 FROM ${BASE_IMAGE}
 # Optional ABLIT preparation uses the image's PyTorch and safetensors on CPU.
@@ -56,7 +56,21 @@ RUN cd /tf-inputs && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${S
     cp LICENSE /opt/tensorfold/share/doc/tensorfold/LICENSE-inputs-branch && \
     rm -rf /tf-inputs /opt/inputs /root/.cache/zig
 
+# the kit's experts cubin rebuilt from source (this recipe): the same fork's branch deepseek-v41-tp2 (its Python engine,
+# whose torch extension the kit's cubins/experts_cb.cubin comes from) at TF_PY_REF, with zig/kit-patches/*.patch, compiled
+# as that engine compiles it (zig/kit-patches/build_experts.py); kept at /opt/tensorfold/kit-overlay/experts_cb.cubin,
+# which the engine reads in place of the kit's when TF_DS_EXPERTS_CUBIN names it (scripts/config.sh)
+ARG TF_PY_REF
+COPY zig/kit-patches /opt/tf-kit-patches
+RUN git init -q /tf-py && cd /tf-py && git remote add origin "${TF_REPO}" && \
+    git fetch -q --depth 1 origin "${TF_PY_REF}" && git checkout -q --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${TF_PY_REF}" && \
+    for p in /opt/tf-kit-patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done && \
+    python3 /opt/tf-kit-patches/build_experts.py /tf-py/src/tensorfold/cuda/exl3 /tf-kit-build /opt/tensorfold/kit-overlay/experts_cb.cubin && \
+    cp LICENSE /opt/tensorfold/share/doc/tensorfold/LICENSE-kit-source-branch && \
+    rm -rf /tf-py /tf-kit-build /root/.cache/torch_extensions
+
 ARG PATCHES_HASH
-LABEL tf.patches=${PATCHES_HASH} tf.engine=zig tf.ref=${TF_REF} tf.inputs=${INPUTS_REF}
+LABEL tf.patches=${PATCHES_HASH} tf.engine=zig tf.ref=${TF_REF} tf.inputs=${INPUTS_REF} tf.kit_source=${TF_PY_REF}
 ENV PATH=/opt/tensorfold/native/bin:/opt/tensorfold/bin:${PATH}
 WORKDIR /workspace
