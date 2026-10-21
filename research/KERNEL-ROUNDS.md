@@ -183,7 +183,9 @@ edits, T=1 against known and serial hashes, 32K-126K prompts, four streams).
   the reply's own text stay at five): every reply equal. Streams that all edit go faster (two: 75.6 -> 97.6 tok/s a
   stream, +29 %; four: 47.1 -> 51.3, +9 %), but a stream that does not copy, sharing rounds with one that does, slows down
   (one pair: prose 34.5 -> 27.3 tok/s while the copy beside it went 84.5 -> 149.5), and the natural mix averages -1.6 %. A
-  trade between streams, not a gain, so it stays out of the recipe.
+  trade between streams as it stands. Allowing it only when every live stream's last round was a copy (`zig/patches/0023`)
+  keeps the gains and slows no one: two streams that both edit +28 %, four +9 %, the natural mix +3.0 % with the prose
+  beside a copy unchanged (34.7 against 33.8); served, two edits at a time +29 % (`results/copy-multi.txt`).
 - **The copy's source**: the suffix lookup already takes the latest of the equally long matches (it walks back from the
   newest), the right one when a conversation has printed the same file more than once.
 
