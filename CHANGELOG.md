@@ -5,6 +5,10 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **Sampled self-repeats copied 15 tokens at most** (`zig/patches/0022`; `TF_DS_COPY_SELF_CAP=15` by default): at
+  temperature > 0 a copy window over the reply's own earlier text (not the prompt) takes at most 15 tokens; the copy
+  proposer now says where its copy starts. Recovers the 4-7 % that 32-row windows cost one-stream sampled decode on
+  repetitive text, keeps the edits' gain (copies of the prompt). Replies unchanged.
 - **Copy windows of up to 48 rows** (`zig/patches/0021`; `ROUND_ROWS=32` by default, `TF_DS_COPY_ROWS` following it; 48 for
   ~0.26 GiB more a Spark: realistic edits +14 % at 32 rows, +20 % at 48): the window
   rings get 48 spare rows (model.py's RING_EXTRA is 16; keys are read by position, so the ring's size changes no

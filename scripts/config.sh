@@ -131,6 +131,9 @@ DRAFTS="${DRAFTS:-1}"                  # the checkpoint's own DSpark draft block
 # copy. Replies do not change: the model still checks every token. TF_DS_COPY_ROWS=6 TF_DS_COPY_SKIP=0 give the engine's
 # own behaviour. Both ranks read them (start.sh checks them).
 export TF_DS_COPY_ROWS="${TF_DS_COPY_ROWS:-$ROUND_ROWS}" TF_DS_COPY_SKIP="${TF_DS_COPY_SKIP:-1}"
+# At temperature > 0 a copy of the reply's own earlier text (not of the prompt) takes at most 15 tokens a round (zig/patches/0022;
+# 0: no cap): sampled repeats leave their copy sooner, and wide windows over them cost more than they land.
+export TF_DS_COPY_SELF_CAP="${TF_DS_COPY_SELF_CAP:-15}"
 # The engine's settings as BertholomusAI's served two-node launch has them: CUDA graphs, the mixes' side stream, the
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
 # NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).

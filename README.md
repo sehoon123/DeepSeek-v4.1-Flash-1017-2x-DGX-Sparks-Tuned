@@ -36,7 +36,10 @@ their repository's.
   (0021, one stream): writing out four Python files whole with a scattered edit each (a rename, print -> log, ...) +14 %
   at 32 rows and +20 % at 48 (180.7 -> 206.3 / 216.9 tok/s; at temperature 1 +13 / +18 %), copies of the reply +21 / +32 %;
   text without copies unchanged. Each 16 rows past 16 cost ~0.26 GiB of each Spark's memory (the wider rounds' buffers),
-  so 32 is the default: set `ROUND_ROWS=48` where the head has the room ("Memory and safety").
+  so 32 is the default: set `ROUND_ROWS=48` where the head has the room ("Memory and safety"). At temperature > 0 a copy of
+  the reply's own earlier text takes at most 15 tokens a round (`zig/patches/0022`, `TF_DS_COPY_SELF_CAP=15`): sampled
+  repeats leave their copy sooner, and full-width windows over them cost one-stream sampled decode 4-7 %; copies of the
+  prompt keep the full width.
 - **The drafter's confidence head when the stock shards are gone.** Mia's AI Lab's recipe gives the overlay's F32 copy of
   `mtp.2.confidence_head.proj.weight` stock's F16 bytes back (`scripts/ablit_stock_dtypes.py`), which needs the stock
   shards. When they are gone, preparation checks the head and writes it to `conf_head_f32.bin`, and both ranks load it
@@ -65,7 +68,7 @@ hashes: 62 of 62 copy-window runs (copies 0-90 % wrong, three streams at once, t
 611 decodes of the later offline runs, up to 125K-token prompts, and every run of the kernel rounds (patch 0019), none
 different ([research/](research/README.md)).
 
-The image is Mia's AI Lab's with these twelve patches added (`tensorfold-dsv41:exl3-tp2-4900101c191d`). None is published,
+The image is Mia's AI Lab's with these thirteen patches added (`tensorfold-dsv41:exl3-tp2-eb5c456dfa3b`). None is published,
 so the first `./start.sh` builds it on the head (two Zig builds, ~6 minutes) and copies it to the worker.
 
 <!-- MEASURED -->

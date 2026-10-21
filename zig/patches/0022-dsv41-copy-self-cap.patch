@@ -1,0 +1,131 @@
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index bf40480..4f01b44 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -33,6 +33,7 @@ pub const Model = struct {
+     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
+     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
+     copy_skips_head: bool = false, // a lone stream's fully accepted copy window skips the head's next pass
++    copy_self_cap: u32 = 0, // a sampling stream's copy of its own reply at most this many tokens (0: no cap)
+     enter_match: i64 = 8, // matching tokens a copy window needs
+ };
+ 
+@@ -66,6 +67,7 @@ pub const Config = struct {
+     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
+     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
+     copy_skips_head: bool = false, // Model.copy_skips_head
++    copy_self_cap: u32 = 0, // Model.copy_self_cap
+     k: Constants = .{},
+ 
+     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
+@@ -120,6 +122,7 @@ pub const Config = struct {
+             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
+             .mtp_step_ms = m.mtp_step_ms,
+             .copy_skips_head = m.copy_skips_head,
++            .copy_self_cap = m.copy_self_cap,
+             .enter_match = m.enter_match,
+         };
+     }
+diff --git a/zig/src/core/lanes/proposer.zig b/zig/src/core/lanes/proposer.zig
+index f49626e..726ea97 100644
+--- a/zig/src/core/lanes/proposer.zig
++++ b/zig/src/core/lanes/proposer.zig
+@@ -11,6 +11,7 @@ pub const Proposer = struct {
+         propose: *const fn (ptr: *anyopaque, context: []const u32, max_draft: i64) anyerror![]const u32,
+         last_match: *const fn (ptr: *anyopaque) i64,
+         observe: ?*const fn (ptr: *anyopaque, proposed: i64, accepted: i64) void = null,
++        last_from: ?*const fn (ptr: *anyopaque) i64 = null,
+     };
+ 
+     /// Tokens valid until the next `propose`.
+@@ -25,6 +26,11 @@ pub const Proposer = struct {
+     pub fn observe(p: Proposer, proposed: i64, accepted: i64) void {
+         if (p.vtable.observe) |f| f(p.ptr, proposed, accepted);
+     }
++
++    /// Where in the context the last proposal's copy starts (null: the proposer does not say).
++    pub fn lastFrom(p: Proposer) ?i64 {
++        return if (p.vtable.last_from) |f| f(p.ptr) else null;
++    }
+ };
+ 
+ pub const max_ngram = 8;
+@@ -55,6 +61,7 @@ pub const SuffixLookup = struct {
+     accepted_tokens: i64 = 0,
+     silenced_rounds: i64 = 0,
+     last_match: i64 = 0,
++    last_from: i64 = -1, // the context position the last proposal copies from
+     last_confident: bool = false,
+ 
+     pub fn init(gpa: Allocator, params: Params) !SuffixLookup {
+@@ -76,7 +83,7 @@ pub const SuffixLookup = struct {
+         return .{ .ptr = s, .vtable = &vtable };
+     }
+ 
+-    pub const vtable: Proposer.VTable = .{ .propose = proposeFn, .last_match = lastMatchFn, .observe = observeFn };
++    pub const vtable: Proposer.VTable = .{ .propose = proposeFn, .last_match = lastMatchFn, .observe = observeFn, .last_from = lastFromFn };
+ 
+     fn proposeFn(ptr: *anyopaque, context: []const u32, max_draft: i64) anyerror![]const u32 {
+         const s: *SuffixLookup = @ptrCast(@alignCast(ptr));
+@@ -88,6 +95,11 @@ pub const SuffixLookup = struct {
+         return s.last_match;
+     }
+ 
++    fn lastFromFn(ptr: *anyopaque) i64 {
++        const s: *SuffixLookup = @ptrCast(@alignCast(ptr));
++        return s.last_from;
++    }
++
+     fn observeFn(ptr: *anyopaque, proposed: i64, accepted: i64) void {
+         const s: *SuffixLookup = @ptrCast(@alignCast(ptr));
+         s.observe(proposed, accepted) catch {};
+@@ -165,6 +177,7 @@ pub const SuffixLookup = struct {
+         }
+         s.last_confident = false;
+         s.last_match = best_len;
++        s.last_from = best_end;
+         if (best_end < 0 or best_len < s.params.min_match) return s.out.items;
+         s.last_confident = best_len >= s.params.confident_match;
+         const from: usize = @intCast(best_end);
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index a76e4ed..005b6a8 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -137,6 +137,11 @@ pub fn copyProposal(e: *Engine, s: *Stream) ![]const u32 {
+     const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
+     const copied = p.propose(s.context.items, @min(@as(i64, width), s.draftRoom() - 1)) catch return &.{};
+     if (copied.len < 2 or p.lastMatch() < e.cfg.enter_match) return &.{};
++    // Config.copy_self_cap (this recipe): a sampling stream's copy of its own reply, not of its prompt, at most this many
++    // tokens: a reply repeating itself at temperature > 0 leaves the copy sooner than one copying its prompt does
++    if (e.cfg.copy_self_cap > 0) if (s.sampling) |sm| if (sm.temperature > 0) if (p.lastFrom()) |from| {
++        if (from >= @as(i64, @intCast(s.prompt_len)) and copied.len > e.cfg.copy_self_cap) return copied[0..e.cfg.copy_self_cap];
++    };
+     return copied;
+ }
+ 
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 50f3bf0..3f505a3 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -33,6 +33,13 @@ pub const window_rows = 6;
+ /// round's rows (TF_DS_ROUND_ROWS) and the window rings' RING_EXTRA (48 here, the target's and the drafter's) bound it.
+ pub const max_window = 48;
+ 
++/// TF_DS_COPY_SELF_CAP=N (1 to 47; unset: no cap): a sampling stream's copy windows over its own reply at most N tokens.
++fn copySelfCap() u32 {
++    const v = std.c.getenv("TF_DS_COPY_SELF_CAP") orelse return 0;
++    const x = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return 0;
++    return if (x < 1 or x > 47) 0 else x;
++}
++
+ /// The image rows a fill_images frame carries at most.
+ pub const image_piece = 32 << 10;
+ 
+@@ -553,6 +560,7 @@ pub const Lanes = struct {
+             .exact_width = @intCast(@max(window_rows, self.copy_rows)),
+             .first_copy_rows = if (self.copy_rows > window_rows) @as(u32, window_rows) else 0,
+             .copy_skips_head = self.copy_skip,
++            .copy_self_cap = copySelfCap(),
+             .enter_match = self.enter_match,
+             .gpu_tokens = false,
+             .mtp = drafting,
