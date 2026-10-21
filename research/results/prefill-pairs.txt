@@ -27,3 +27,5 @@ Served (2026-10-21 21:25-21:31, image f33ace7b9214, a fresh start each, the same
 70,014 tokens   32.12 s against 35.63 s (-9.9 %)
 144,159 tokens  68.34 s against 74.86 s (-8.7 %)
 Every reply the same. Head MemAvailable after the load 6,918 MiB (7,645 before), worker 8,526 (9,562).
+A conversation through the prompt cache (served, pairs on against off, a fresh start each, temperature 0): a 30,168-token
+first turn (15.58 s against 16.88), then two turns resumed from the state kept at 28,672: all three replies the same.
