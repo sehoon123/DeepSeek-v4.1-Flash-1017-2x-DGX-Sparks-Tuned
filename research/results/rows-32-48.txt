@@ -13,3 +13,18 @@ code/4     163.66  163.18     166.88     165.75
 
 The engine's load line: 105.40 GiB at 32 rows, 105.58 at 48 (0.18 GiB a Spark). With the self cap, 48 rows lose nothing; take
 them where the head keeps room above MEMGUARD_GIB (results/soak-memory.txt).
+
+Memory with several conversations at once (served, 2026-10-21 13:10-14:26, after the bench, the edit probes, a full prompt
+cache and a 290,904-token prompt; head MemAvailable, sampled every 2-5 s):
+
+                                              32 rows, MEMGUARD 4   48 rows, MEMGUARD 4   48 rows, MEMGUARD 3,
+                                              (dashboard up)        (dashboard up)        dashboard stopped
+full cache + the 290K prompt                  4,778 MiB             4,382 MiB             4,430 MiB
+three conversations, full cache               4,792 (50 min)        4,269 (stopped early) 3,973 (12 min, 72 turns)
+four conversations, full cache                -                     -                     3,514 (10 min, 65 turns)
+idle afterwards                               4,724                 4,480                 ~4,000 (a plateau)
+
+The engine's own count (/health memory.active) after all that: 106.08 GiB at 48 rows, its load line (105.58) plus the
+prompt cache (0.5): the rest of the gap is outside its allocator (the buffers and graphs taken when a new concurrent shape
+first runs, kept until a restart). A 48-row head therefore wants MEMGUARD_GIB 3 or below (the recipe's default is 2.5);
+every turn of these runs ended without an error and without the guard firing.

@@ -186,6 +186,10 @@ edits, T=1 against known and serial hashes, 32K-126K prompts, four streams).
   trade between streams as it stands. Allowing it only when every live stream's last round was a copy (`zig/patches/0023`)
   keeps the gains and slows no one: two streams that both edit +28 %, four +9 %, the natural mix +3.0 % with the prose
   beside a copy unchanged (34.7 against 33.8); served, two edits at a time +29 % (`results/copy-multi.txt`).
+- **A Triton launch without its own variant** (logged once in service: `_index_score_rows` at a three-stream 48-row round
+  takes the fitting variant that assumes less, same constexprs): with `TF_AOT_WEAKEST=1`, every launch on its most
+  general variant, 26 of 26 replies equal their serial and known hashes (one stream, four, three streams editing with
+  48-row copies), 1.6 % slower. The fallback changes speed only.
 - **The copy's source**: the suffix lookup already takes the latest of the equally long matches (it walks back from the
   newest), the right one when a conversation has printed the same file more than once.
 
