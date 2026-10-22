@@ -1,0 +1,26 @@
+Served benchmark, 2026-10-23 (image with zig/patches 0001-0033, PREFILL_NEST_TOKENS 8192, TF_DS_IDX_SPLIT=1,
+ROUND_ROWS 48, PROMPT_CACHE_GIB 1); two waves each; "10-20" is the recipe's first served morning (upstream hotfix pin)
+
+Decode, aggregate tok/s           greedy (now)        10-20     change   |  T=1 (now)        a day earlier (32 rows)
+prose  1 stream                   68.45 / 68.50       64.31     +6.5 %   |  72.52 / 73.81    70.78
+prose  2 streams                  102.47 / 102.68     91.84     +11.7 %  |  94.46 / 94.96    94.82
+prose  4 streams                  137.23 / 137.59     124.22    +10.6 %  |  126.20 / 126.33  123.24
+code   1 stream                   115.61 / 116.17     95.46     +21.4 %  |  115.63 / 115.77  108.41
+code   2 streams                  150.55 / 152.62     141.09    +7.4 %   |  131.85 / 133.66  137.06
+code   4 streams                  167.14 / 166.61     153.70    +8.6 %   |  156.68 / 157.09  163.46
+geomean                                                         +10.93 % |  +0.81 % on the day before, which was +10.47 % on 10-20
+
+Prompts (the replies' hashes those of the prompt-pair measurements, same bits):
+tokens     before pairs   with 0026/0027   now      reply sha
+28,853     ~15.1 s        13.17 s          12.76 s  acffffab31b7
+70,014     ~35.6 s        31.48 s          29.53 s  424ac4494094
+144,159    ~74.8 s        65.29 s          61.33 s  2d87545d05bb
+
+First token (streaming):
+fresh 1.6K-token prompts            0.93 / 0.95 / 1.01 s   (1.11-1.18 s with 0026, 1.06-1.12 s with 0028)
+a 30K conversation's first turn     13.00 s                (13.87 s with 0026)
+its next turns                      1.31 / 2.19 / 2.13 s   (1.52 / 2.33 / 2.23 s with 0026)
+next turns at 133K tokens           2.27 s (+3.6K), 1.13 s (+1.5K)   (2.38 / 1.26 s before 0030 and the indexer split)
+a 1.9K request 3 s into a 68.6K one 2.51 s                 (27.64 s without 0031); both replies equal alone
+
+Checks: validate all passed; edit probe 20 of 20 equal to the reference; idle busiest thread 0.3 % / 0.0 % of a core.
