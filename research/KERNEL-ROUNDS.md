@@ -311,6 +311,22 @@ row's 40 blocks (3.5 ms); the down kernel (`grouped_rows_kernel`, 255 registers,
 three or four programs (168 or 128 registers: +43 % / +310 % on a pair) and its smaller tilings forced likewise (4,2,2 /
 8,1,1 at three or four programs: +6 to +45 %).
 
+## Round 19: the next turn's prefill, ahead of it (2026-10-22, `tools/warm_ahead_proxy.py`, `results/warm-ahead.txt`)
+
+A turn's prompt state is kept at the last 2,048-token chunk end before its last 128 tokens, so the next turn of the
+conversation re-prefills from there: the previous prompt's tail (up to ~2,200 tokens) as well as what is new. The
+reply's tokens were decoded, not prompt-processed (other kernels, other bits), so their state cannot be kept. What can
+be done exactly is to run the prompt pass the next turn would run, sooner: when the client is idle after a reply, send
+the conversation and the reply (as the client will send it back) to the server, so the cache keeps the state at the
+deepest chunk end every next request can resume (shared tokens + 3 - 128 at most). The first design kept a deeper one
+(the shared tokens' last chunk end, reached with a filler message): a short next message could not resume it, and the
+store, which frees first a state a newer one extends, had freed the conversation's earlier state: the next turn
+re-prefilled 39K tokens (first token 16.5 s). With the rule, 39K-token conversations, three turns, a client sending
+replies back as received: the third turn resumed at 38,912 instead of 36,864, its first token 0.54-0.59 s instead of
+1.40-1.57 s; a third turn arriving 0.4 s into the warm-ahead (closed) still resumed at 38,912 (1.19 s). The resumed
+reply has the bits of the same request from an empty cache. In use (a coding agent, 37K -> 55K tokens over 14 turns):
+the client's replies came back as predicted 19 of 19 times and 8 warm-aheads moved its resume point a chunk on.
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels

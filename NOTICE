@@ -74,8 +74,9 @@ sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned
     Manrique (@hashd1ve), Apache-2.0, carried unchanged with its original header.
   - start.sh, scripts/config.sh, scripts/prepare.sh (modified): the wide copy-window defaults and checks, ABLIT_PRUNE_STOCK,
     the confidence head from a file when the stock shards are gone, the TF_DS_* checks, the SIGTERM path, --fix-k for
-    rank 1, GHCR_IMAGE, ~/.local/bin on PATH, TF_EXL3_* forwarded to both ranks, ROUND_ROWS 32, TF_DS_COPY_ROWS following it, TF_DS_COPY_SELF_CAP 15, TF_DS_COPY_MULTI 15, TF_DS_GRAPH_CAP 128, NCCL_MAX_NCHANNELS 8, TF_DS_ENGRAM_DEDUP 1, TF_DS_ENGRAM_CACHE_MB 256, TF_DS_PAIR 1. scripts/local.sh.example (modified).
+    rank 1, GHCR_IMAGE, ~/.local/bin on PATH, TF_EXL3_* forwarded to both ranks, ROUND_ROWS 32, TF_DS_COPY_ROWS following it, TF_DS_COPY_SELF_CAP 15, TF_DS_COPY_MULTI 15, TF_DS_GRAPH_CAP 128, NCCL_MAX_NCHANNELS 8, TF_DS_ENGRAM_DEDUP 1, TF_DS_ENGRAM_CACHE_MB 256, PROMPT_CACHE_GIB, TF_DS_PAIR 1. scripts/local.sh.example (modified).
   - scripts/prune_ablit_stock.py, scripts/ablit_conf_head.py, scripts/test_ablit_conf_head.py (added).
+  - tools/warm_ahead_proxy.py (added): an optional API proxy warming the server's prompt cache ahead of a next turn.
   - README.md, CHANGELOG.md, CREDITS.md, NOTICE, zig/patches/README.md and the .github templates (modified);
     .github/FUNDING.yml (removed: it named Mia's AI Lab's sponsorship).
   - research/ (added): measurements, notes and tools; research/REFERENCES.md lists what they used.

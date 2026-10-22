@@ -57,6 +57,12 @@ their repository's.
 - **Short prompts 20 % sooner**: `zig/patches/0028`. A chunk's Engram table rows are read from the NVMe once each (a
   third or more of its n-grams name a row another one names), and the rows read last stay in host memory (256 MiB a
   Spark), so a conversation's next turn reads only what is new; the first chunk of every request waits for those reads.
+- **A conversation's next turn up to ~60 % sooner (optional)**: `tools/warm_ahead_proxy.py`, an OpenAI / Anthropic API
+  proxy in front of the server. While a client is idle after a reply, it has the server's prompt cache keep the state at
+  the next 2,048-token chunk end the conversation and its reply reached, so the next turn resumes there instead of
+  re-prefilling those tokens (39K-token conversations: a turn's first token 1.40-1.57 -> 0.54-0.59 s when the reply
+  crossed a chunk end). Replies are the same bits; any harness (a client is warmed ahead once it has shown how it sends
+  replies back). See *Warm-ahead proxy* below.
 - **The drafter's confidence head when the stock shards are gone.** Mia's AI Lab's recipe gives the overlay's F32 copy of
   `mtp.2.confidence_head.proj.weight` stock's F16 bytes back (`scripts/ablit_stock_dtypes.py`), which needs the stock
   shards. When they are gone, preparation checks the head and writes it to `conf_head_f32.bin`, and both ranks load it
@@ -394,6 +400,7 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 | `TF_DS_COPY_ROWS`, `TF_DS_COPY_SKIP` | 16, 1 | this recipe: wide copy windows (`zig/patches/0017`): a stream running alone checks up to 16 copied tokens a round, and `1` skips the drafter's pass after a round that accepted its whole copy; replies do not change. `6`, `0`: the engine's own |
 | `RDMA`, `GRAPHS`, `SIDE`, `PREFETCH`, `ENGRAM_AIO` | 1 | the engine's served settings |
 | `MAX_TOKENS` | 32768 | a reply's budget when a request sets none |
+| `PROMPT_CACHE_GIB` | empty (the server's 0.5) | this recipe: the prompt cache's budget a Spark; a kept state is ~7 MiB at 30-40K tokens (its rows stay in the KV pool), so `1` keeps ~140 |
 | `MIN_AVAIL_GIB`, `MIN_AVAIL_WAIT_S` | 112, 30 | `start.sh` refuses to start with less memory available than this on either Spark (`0` skips the check); it re-reads the memory for up to `MIN_AVAIL_WAIT_S` seconds first, because the page cache a build or a large copy just left counts as available only once it is written back (`0` reads once) |
 | `MEMGUARD_GIB`, `MEMGUARD_HOLD_S`, `MEMGUARD_HARD_GIB` | 2.5, 4, 1 | `scripts/memguard.sh` kills a rank's container when the memory available stays under the floor for `MEMGUARD_HOLD_S` seconds without coming back over it, or at once when it falls under the hard floor. A dip that recovers is logged and not killed (decimals fine; `MEMGUARD_GIB=0` turns the guard off) |
 | `HEAD_ENGRAM_DIR` | empty | a local folder with Engram's two shards for rank 0 (as `WORKER_ENGRAM_DIR` is on the worker); empty reads them from `HF_CACHE` |
@@ -408,6 +415,26 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 
 Extra arguments to `./start.sh` go to rank 0's `tensorfold-native serve` after the defaults; every `TENSORFOLD_*` and
 `TF_DS_*` variable you set goes to both ranks. Images are always on (rank 0 runs the vision tower).
+
+### Warm-ahead proxy
+
+`tools/warm_ahead_proxy.py` (optional, standard library only) sits between clients and the server:
+
+```
+LISTEN=0.0.0.0:8888 BACKEND=127.0.0.1:8000 KEY_FILE=~/.config/my-api-key python3 tools/warm_ahead_proxy.py
+```
+
+with the server on `HOST=127.0.0.1 PORT=8000` (`scripts/local.sh`). `KEY_FILE` (optional) makes it require
+`Authorization: Bearer <the file's contents>`; `WARM_AHEAD=0` makes it a plain proxy. Replies pass through byte for
+byte. The server keeps a prompt's state only at 2,048-token chunk ends before its last 128 tokens, so a next turn
+re-prefills from the last such end. After a reply, if no client request comes for `WARM_DELAY` seconds (3), the proxy
+asks the server's `/tokenize` how many tokens the conversation and the reply share with any next request and, when
+that reaches a chunk end no kept state covers yet, sends the conversation, the reply and a one-token user message
+(`max_tokens 1`): the cache keeps that chunk end. It is one every next request can use, and the state is the one the
+client's own request would compute, so replies are the same bits (checked against the same request from an empty
+cache). A client request closes a warm-ahead in flight (the server stops at its current chunk). The proxy appends the
+reply as the server sent it and learns, per client (its system prompt and tools), how the client sends replies back;
+a client is warmed ahead only once its next request has matched. Measurements: `research/results/warm-ahead.txt`.
 
 ## Memory and safety
 
@@ -460,6 +487,7 @@ tools/bench.py               prefill, decode, multi-stream and needle measuremen
 tools/exact.py               records a server's replies (token hashes) on a fixed prompt set and compares two records: proves a new image equals the old one
 tools/smoke.py               a quick correctness check: health, stop strings, streaming, a tool call and its result
 tools/prompt_reuse.py        a conversation resumes from its kept prompt state (from the GLM-5.3-Flash recipe)
+tools/warm_ahead_proxy.py    an optional API proxy that warms the prompt cache ahead of a conversation's next turn (this recipe)
 tools/toolcheck.py, needle.py, end_of_turn.py, anthropiccheck.py   single checks, from the GLM-5.3-Flash recipe
 docs/zig-engine.md           how the pieces fit, and what is not verified
 docs/hermes-agent.md         Hermes Agent as a client (by Steve Darlow)
