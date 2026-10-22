@@ -363,6 +363,9 @@ measurements ([What this recipe adds](#what-this-recipe-adds)) are of the ablite
 
 ## What `start.sh` and `scripts/prepare.sh` do
 
+To update: `./stop.sh`, `git pull`, `./scripts/prepare.sh` (it refuses to build a new image beside a running server:
+the build's compiles need a few GB of the memory the server leaves), `./start.sh`.
+
 `scripts/prepare.sh` (run by `start.sh` when something is missing; safe to re-run) on the head:
 
 1. checks docker, the GPU, ssh and the link;

@@ -74,6 +74,11 @@ if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built" != "$hash" ]]; then
   fi
 fi
 if [[ $REBUILD -eq 1 || "$built" != "$hash" ]]; then
+  # the build's compiles take a few GB of host memory; beside a running server (~6 GB left on a Spark) the memory guard
+  # would stop the server, and with a checkout already wanting the new image its restart would fail
+  if [[ "${PREPARE_BESIDE_SERVER:-0}" != 1 ]] && [[ -n "$(docker ps -q --filter "name=^${CONTAINER_NAME}$")" ]]; then
+    die "the server ($CONTAINER_NAME) is running on this Spark and a new image must be built: stop it first (./stop.sh), or set PREPARE_BESIDE_SERVER=1"
+  fi
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || { log "Pulling $BASE_IMAGE"; docker pull "$BASE_IMAGE" >/dev/null; }
   log "Building $IMAGE (TensorFold ${TF_REF:0:12} + inputs' tools ${INPUTS_REF:0:12}, $(compgen -G 'zig/patches/*.patch' | wc -l) patches, Zig $ZIG_VERSION; two Zig builds and the experts cubin, ~8 min on a Spark)"
   ctx=$(mktemp -d "$STATE_DIR/build.XXXXXX")

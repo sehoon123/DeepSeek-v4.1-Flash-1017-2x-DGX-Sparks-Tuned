@@ -5,6 +5,8 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **`scripts/prepare.sh` refuses to build a new image beside a running server** (`PREPARE_BESIDE_SERVER=1` overrides):
+  the build's compiles took the head under the memory guard's floor, which stopped the server.
 - **Sampled decoding's host side** (`zig/patches/0029`): a round's logits are copied to pinned memory (0.37 -> 0.07 ms a
   round) and each row's top candidates are found 16 logits at a time (0.37 -> 0.12 ms): T=1 decode +1.2 % (110.00 ->
   111.41 / 111.31 tok/s, two pairs, one stream), the same bits; greedy decoding (the device's argmax) is unchanged.
