@@ -371,6 +371,17 @@ conversations (tool calls, dropped reasoning, warm-ahead texts) against the serv
 135-140K tokens, 4.8-5.5 -> 0.1-1.9 ms at 13-15K; a conversation's second request still encodes whole (its first
 had no end-of-sentence yet).
 
+## Round 23: a request arriving during another's prompt (2026-10-22, evaluated, not changed)
+
+A short request resumed from the cache waited 29.6 s behind another client's 60K-token prompt: between a pass's chunks
+the host runs only the other streams' decode rounds (`TF_PREFILL_INTERLEAVE_MS`), and the next prompt pass starts when
+this one ends. Running a short pass inside the long one's `between` would need three pieces of per-pass state made the
+stream's own, on both ranks: the slot and extent a pass is set up with, the Engram read-ahead (keyed by start and length
+only: two streams' chunks can share both, and then the rows would be the other prompt's), and the pairs' back-host ring
+(keyed by start). Left for a client that sends requests at the same time; one sequential client never meets it, and the
+warm-ahead proxy no longer sends anything while the server is busy. Streaming itself is even: a reply's events (a
+round's tokens each) arrive 32.2 ms apart at the median, p99 ~41 ms, the same through the proxy as from the server.
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels
