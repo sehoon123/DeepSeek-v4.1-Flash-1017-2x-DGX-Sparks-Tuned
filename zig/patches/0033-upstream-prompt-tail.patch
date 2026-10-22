@@ -1,0 +1,112 @@
+From cf6aae2b81c3ddc198c9e8e60daee25ee8ec1e48 Mon Sep 17 00:00:00 2001
+From: evilpsycho42 <202909006+evilpsycho42@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 22:12:29 +0800
+Subject: [PATCH] fix(dsv41): a prompt that ends within the window past a kept
+ state resumes an earlier one, and keeps it
+
+The prompt cache picked the longest kept state, the lanes refused it (a resumed pass runs at least the window, 128
+rows), and the store dropped it as a failed restore: the prompt ran from 0, and the conversation that kept the state
+lost it too. A short prompt sharing a longer conversation's prefix and ending under 128 tokens past one of its chunk
+ends does this. Rules.tail, the window for dsv41, makes find pass over such a state for an earlier one.
+
+Test: a prompt ending inside the tail past a kept state resumes the earlier one, and the conversation that kept the
+state resumes it next (fails before this change: the prompt resumes the state inside the tail).
+---
+ zig/src/core/prompt_cache.zig      |  6 ++++--
+ zig/src/core/prompt_cache_test.zig | 19 +++++++++++++++++++
+ zig/src/families/dsv41/native.zig  |  4 +++-
+ zig/src/native/cuda.zig            |  2 +-
+ 4 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index cb9ac8f004..58f887510a 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -46,6 +46,8 @@ pub const Rules = struct {
+     min_gap: u32 = 256,
+     /// Shorter prompts keep nothing: below it a mark's extra prompt call costs more than a later turn's reuse saves.
+     min_prompt: u32 = 4096,
++    /// Rows a resumed pass must still run past its state (DeepSeek's sliding window): a state nearer the end is passed over.
++    tail: u32 = 0,
+ };
+ 
+ pub const Entry = struct {
+@@ -120,11 +122,11 @@ pub const Store = struct {
+         return at > 0 and (!s.rules.planned or std.mem.indexOfScalar(u32, starts, at) != null);
+     }
+ 
+-    /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row left.
++    /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row and `tail` left.
+     pub fn find(s: *Store, prompt: []const u32, starts: []const u32) ?*Entry {
+         var best: ?*Entry = null;
+         for (s.entries.items) |e| {
+-            if (e.tokens.len > prompt.len or e.at >= prompt.len or !s.usable(e.at, starts)) continue;
++            if (e.tokens.len > prompt.len or e.at >= prompt.len or @as(usize, e.at) + s.rules.tail > prompt.len or !s.usable(e.at, starts)) continue;
+             if (best != null and e.at <= best.?.at) continue;
+             const n = e.tokens.len;
+             if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
+diff --git a/zig/src/core/prompt_cache_test.zig b/zig/src/core/prompt_cache_test.zig
+index 9dabc21f24..2a74cd6751 100644
+--- a/zig/src/core/prompt_cache_test.zig
++++ b/zig/src/core/prompt_cache_test.zig
+@@ -199,6 +199,25 @@ test "an entry keys its lookahead tokens: a prompt that differs right after the
+     try std.testing.expect(s.find(&.{ 1, 2, 3, 4 }, &.{}) == null); // the lookahead token must be in the prompt
+ }
+ 
++test "a state within the tail of a prompt's end is passed over for an earlier one, and stays for the conversation that kept it" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.snapshots(), .{ .tail = 3, .min_prompt = 0 }, 1 << 20);
++    defer s.deinit();
++    const long = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
++    _ = f.pass(&s, &long, .{ .marks = &.{ 4, 8 } });
++    const short = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 20, 21 }; // shares 8 tokens and ends 2 past them, inside the tail
++    var p = try s.begin(a, &short, 9, &.{}, &.{}, null);
++    try std.testing.expectEqual(@as(u32, 4), p.from);
++    try std.testing.expectEqual(fresh(&short), f.pass(&s, &short, p));
++    const next = long ++ [_]u32{ 13, 14 }; // the long conversation's next turn resumes its own state at 8
++    p = try s.begin(a, &next, 12, &.{}, &.{}, null);
++    try std.testing.expectEqual(@as(u32, 8), p.from);
++}
++
+ test "planned families resume and keep only at the request's chunk starts" {
+     const gpa = std.testing.allocator;
+     var arena: std.heap.ArenaAllocator = .init(gpa);
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 55a532fb5a..d89b75b4c9 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -71,6 +71,8 @@ pub const Snaps = struct {
+     save: *const fn (*anyopaque, ?*anyopaque, u32) anyerror!*anyopaque,
+     restore: *const fn (*anyopaque, ?*anyopaque, *anyopaque) anyerror!void,
+     drop: *const fn (*anyopaque, *anyopaque) void,
++    /// Rows a resumed prompt pass must still run past a kept state (core/prompt_cache Rules.tail).
++    tail: u32 = 0,
+ };
+ 
+ /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
+@@ -150,7 +152,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     st.lanes.vision = st.vision;
+     // the pool is the model's (preallocated): a stream takes no device memory of its own
+     const L = lanes_mod.Lanes;
+-    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
++    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
+     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
+ }
+ 
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index ca4962a1d4..8da262a2a2 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -388,7 +388,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
+         if (want > 0) {
+             h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
+-            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{}, want);
++            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{ .tail = if (@hasField(@TypeOf(sn), "tail")) sn.tail else 0 }, want);
+         }
+     };
+     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0

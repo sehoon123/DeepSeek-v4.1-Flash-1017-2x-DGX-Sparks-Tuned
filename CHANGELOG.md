@@ -5,6 +5,10 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **A prompt ending just past a kept state no longer drops it** (`zig/patches/0033`: TensorFold's `cf6aae2b` by
+  evilpsycho42, PR #35, unchanged): such a prompt (one sharing a longer conversation's prefix and ending under 128 tokens
+  past its chunk end) resumes an earlier state and the conversation keeps its own; before, the state was handed to the
+  lanes, refused, dropped as a failed restore, and the prompt ran from 0.
 - **The prefill indexer split on every eligible chunk** (`TF_DS_IDX_SPLIT=1`, `scripts/config.sh`; `zig/patches/0001`,
   MiaAI-Lab's): 161K-token prefill -2.74 % against splitting only from token 131,072 (MiaAI-Lab's later default, aaa4xu's
   2550cda4) and -4.2 % against none, 43K -0.95 %, 16K +0.00 %; the same bits.

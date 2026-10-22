@@ -72,6 +72,8 @@ sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned
   - zig/Dockerfile (modified): the kit-patches build step.
   - zig/patches/0020-upstream-dsml-calls.patch (added): commit 4803479e of bertholomus/TensorFold (pull request #25) by
     Manrique (@hashd1ve), Apache-2.0, carried unchanged with its original header.
+  - zig/patches/0033-upstream-prompt-tail.patch (added): commit cf6aae2b of bertholomus/TensorFold (pull request #35) by
+    evilpsycho42, Apache-2.0, carried unchanged with its original header.
   - zig/patches/0032-rdma-idle-nap.patch (added): MiaAI-Lab's zig/patches/0010-rdma-idle-nap.patch (their repository at
     370daf0c; William J Riley's TensorFold PR #27 ported to the Zig ring), Apache-2.0, carried unchanged.
   - start.sh, scripts/config.sh, scripts/prepare.sh (modified): the wide copy-window defaults and checks, ABLIT_PRUNE_STOCK,

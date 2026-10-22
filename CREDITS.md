@@ -144,6 +144,10 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   [`4803479e`](https://github.com/bertholomus/TensorFold/commit/4803479e8f074f8b95b5f0573ff8bf625efc2ded) of BertholomusAI's
   TensorFold fork by **Manrique** ([@hashd1ve](https://github.com/hashd1ve)), merged there as pull request #25 after this
   recipe's engine pin, carried unchanged with its header (Apache-2.0): DSML tool calls read from their own tags.
+- **`zig/patches/0033-upstream-prompt-tail.patch`** is commit
+  [`cf6aae2b`](https://github.com/bertholomus/TensorFold/commit/cf6aae2b) of BertholomusAI's TensorFold fork by
+  **evilpsycho42** ([@evilpsycho42](https://github.com/evilpsycho42)), merged there as pull request #35, carried unchanged
+  with its header (Apache-2.0): a kept state too near a prompt's end is passed over instead of dropped.
 - **`zig/patches/0032-rdma-idle-nap.patch`** is MiaAI-Lab's `zig/patches/0010-rdma-idle-nap.patch`
   ([their repository](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks) at `370daf0c`), carried
   unchanged, with their `RDMA_IDLE_S` / `RDMA_NAP_US` settings: the RDMA gather proxy's idle nap by
