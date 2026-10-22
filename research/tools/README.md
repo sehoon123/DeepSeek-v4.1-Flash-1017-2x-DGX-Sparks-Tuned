@@ -33,3 +33,5 @@ local sparkDash checkout (not included). Nothing here is needed to run the recip
   the prompt-interleave canaries, `prefill-sparkdash.mjs`) and `bwprobe.py` (GPU read bandwidth).
 - `multiturn.py URL`: three eight-turn conversations at the served default sampling, each reply appended; prints prompt, tokens,
   TTFT and decode tok/s a turn (`results/multiturn-t1.txt`).
+
+- `topk-bench.cu`: `zig/patches/0034`'s top-k kernels against the one-block kernel they replace, sets and times.

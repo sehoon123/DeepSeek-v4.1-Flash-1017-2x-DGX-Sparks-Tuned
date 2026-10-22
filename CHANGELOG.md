@@ -5,6 +5,9 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **The indexer's top-k sooner** (`zig/patches/0034`): the decode rounds' top-k of 32,768 candidate keys 89.7 -> 16.3 us
+  and of the 610 tile maxima 23.9 -> 4.9 us (a row in slices over many blocks, keys in registers); decode at 78K tokens
+  42.13 -> 41.86 ms a round (+0.6 %), the same bits; short contexts and prefill unchanged.
 - **A prompt ending just past a kept state no longer drops it** (`zig/patches/0033`: TensorFold's `cf6aae2b` by
   evilpsycho42, PR #35, unchanged): such a prompt (one sharing a longer conversation's prefix and ending under 128 tokens
   past its chunk end) resumes an earlier state and the conversation keeps its own; before, the state was handed to the

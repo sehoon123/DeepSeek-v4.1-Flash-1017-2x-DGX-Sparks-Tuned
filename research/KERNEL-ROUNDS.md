@@ -406,6 +406,17 @@ what a client receives and so what it sends back, which the warm-ahead proxy lea
 it does not apply over 0028, and the row ids are always in range), the opt-in switches `TF_DS_SOLO_OVERHEAD` and
 `TF_DS_NO_COPIES`, and the pass-in-pieces scheduler (this recipe's 0031 nests short passes instead).
 
+## Round 25: the decode round at 78K tokens, sampled (2026-10-23, `zig/patches/0034`, `results/topk.txt`)
+
+An Nsight trace of rank 1 decoding a 78K-token tool conversation at T=1 (94 rounds, 42.96 ms each): the GPU idle 2.4 % of
+the window (a new process's graph instantiations 24 ms of the 95, launches and the peer's frames the rest); the MoE
+26.8 ms, the linears 9.9 ms, the gathers 3.6 ms (their waits in), the hc mixes ~4.5 ms (PDL waits in), the sparse
+attention 2.4 ms, the heads 2.1 ms, and this engine's own top-k of the indexer's keys 0.59 ms (eight a round). That one
+ran a row on one block: the pruned selection's 32,768 candidates took 89.7 us and the 610 tile maxima 23.9 us, standalone.
+Keys in registers with a warp's scan of each digit's bins, and the long rows in slices over many blocks then the top-k of
+the slices' top-k sets (the same set: the keys are unique): 16.3 and 4.9 us. Interleaved twice: 42.13 / 42.13 -> 41.81 /
+41.91 ms a round (+0.6 %), every run's tokens equal; short contexts (the fused Triton selection) and prefill unchanged.
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels

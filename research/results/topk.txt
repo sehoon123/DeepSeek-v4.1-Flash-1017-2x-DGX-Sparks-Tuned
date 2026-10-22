@@ -1,0 +1,14 @@
+The indexer's top-k (zig/patches/0034), standalone (research/tools/topk-bench.cu; rows 6, k 512, random keys as the
+indexer builds them) and in the engine (tf-dsv41-lanes, a 78K-token conversation at T=1, 300 tokens; interleaved)
+
+keys a row   one block a row (before)   0034
+610          23.9 us                    4.9 us
+1,094        26.1 us                    6.3 us
+4,096        28.4 us                    7.1 us
+32,768       89.7 us                    16.3 us (4096-key slices, then their top-k sets)
+top-k sets equal in 129 of 129 cases (n 1 to 32,768, k 1 / 64 / 512, ties in the score bits)
+
+engine        decode ms a round   decode tok/s   short contexts (14 requests)   prefill 16K / 42.8K
+before        42.13 / 42.13       75.5 / 75.5    83.78 / 83.90                  7.00 / 17.67, 7.00 / 17.75
+0034          41.81 / 41.91       76.1 / 75.9    83.79 / 83.81                  6.99 / 17.72, 7.06 / 17.69
+every run's tokens equal to the first's

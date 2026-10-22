@@ -1,0 +1,192 @@
+diff --git a/zig/kernels/cuda/dsv41_ops.cu b/zig/kernels/cuda/dsv41_ops.cu
+index 8503b89..8dd7a09 100644
+--- a/zig/kernels/cuda/dsv41_ops.cu
++++ b/zig/kernels/cuda/dsv41_ops.cu
+@@ -90,6 +90,105 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_topk_i64_kernel(const l
+     }
+ }
+ 
++// The same top-k set as tf_ds_topk_i64_kernel (the keys are unique, so the k-th largest key, and with it the set, is one
++// whatever the order of the work): a row a block, the row's keys read once into registers (at most RK a thread), each
++// 8-bit digit's histogram counted by warps into shared memory and its bins summed by one warp's prefix scan instead of
++// one thread's loop; then every key above the k-th is written and copies of the k-th fill the rest.
++template <int RK>
++__device__ __forceinline__ void topk_regs(const long long* row, int n, int k, long long* out) {
++    __shared__ unsigned int hist[256];
++    __shared__ unsigned long long prefix_s, mask_s;
++    __shared__ int want_s, count_s;
++    unsigned long long u[RK];
++#pragma unroll
++    for (int j = 0; j < RK; ++j) {
++        const int i = threadIdx.x + j * blockDim.x;
++        u[j] = i < n ? ((unsigned long long)row[i] ^ 0x8000000000000000ull) : 0ull;   // (0: below every key, never counted)
++    }
++    if (threadIdx.x == 0) { prefix_s = 0; mask_s = 0; want_s = k; count_s = 0; }
++    for (int d = 7; d >= 0; --d) {
++        for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
++        __syncthreads();
++        const unsigned long long prefix = prefix_s, mask = mask_s;
++#pragma unroll
++        for (int j = 0; j < RK; ++j) {
++            const int i = threadIdx.x + j * blockDim.x;
++            if (i < n && (u[j] & mask) == prefix) atomicAdd(&hist[(u[j] >> (8 * d)) & 0xff], 1u);
++        }
++        __syncthreads();
++        if (threadIdx.x < 32) {
++            // bins from the top: lane l holds bins 255-8l .. 248-8l; the first bin where the count from the top reaches want
++            const int lane = threadIdx.x;
++            unsigned int c[8], s = 0;
++#pragma unroll
++            for (int q = 0; q < 8; ++q) { c[q] = hist[255 - 8 * lane - q]; s += c[q]; }
++            unsigned int incl = s;
++#pragma unroll
++            for (int off = 1; off < 32; off <<= 1) { const unsigned int v = __shfl_up_sync(0xffffffffu, incl, off); if (lane >= off) incl += v; }
++            const unsigned int excl = incl - s;
++            const int want = want_s;
++            const unsigned int hit = __ballot_sync(0xffffffffu, (int)incl >= want);
++            const int first = __ffs(hit) - 1;   // the lane whose bins hold the k-th key (one exists: want <= the keys left)
++            if (lane == first) {
++                unsigned int acc = excl;
++                int b = 255 - 8 * lane;
++#pragma unroll
++                for (int q = 0; q < 8; ++q) {
++                    if ((int)(acc + c[q]) >= want) { b = 255 - 8 * lane - q; break; }
++                    acc += c[q];
++                }
++                want_s = want - (int)acc;
++                prefix_s = prefix | ((unsigned long long)b << (8 * d));
++                mask_s = mask | (0xffull << (8 * d));
++            }
++        }
++        __syncthreads();
++    }
++    const unsigned long long kth = prefix_s;
++#pragma unroll
++    for (int j = 0; j < RK; ++j) {
++        const int i = threadIdx.x + j * blockDim.x;
++        if (i < n && u[j] > kth) out[atomicAdd(&count_s, 1)] = (long long)(u[j] ^ 0x8000000000000000ull);
++    }
++    __syncthreads();
++#pragma unroll
++    for (int j = 0; j < RK; ++j) {
++        const int i = threadIdx.x + j * blockDim.x;
++        if (i < n && u[j] == kth) {
++            const int at = atomicAdd(&count_s, 1);
++            if (at < k) out[at] = (long long)(u[j] ^ 0x8000000000000000ull);
++        }
++    }
++}
++
++extern "C" __global__ void __launch_bounds__(1024) tf_ds_topk_i64_regs_kernel(const long long* keys, long long ks, int n, int k,
++                                                                                long long* top) {
++    const long long* row = keys + (long long)blockIdx.x * ks;
++    long long* out = top + (long long)blockIdx.x * k;
++    if (n <= 1024) topk_regs<1>(row, n, k, out);
++    else if (n <= 4096) topk_regs<4>(row, n, k, out);
++    else if (n <= 16384) topk_regs<16>(row, n, k, out);
++    else topk_regs<32>(row, n, k, out);   // n <= 32768 (the caller checks)
++}
++
++
++// n past 4096 with few rows: the row in slices of 4096 keys, each slice's top-k by its own block (the row's top-k set is
++// within the slices' top-k sets: the keys are unique), then the top-k of those (slices * k keys) by a block a row.
++extern "C" __global__ void __launch_bounds__(1024) tf_ds_topk_i64_slices_kernel(const long long* keys, long long ks, int n, int k,
++                                                                                  int slice, long long* cand) {
++    const int nslices = (n + slice - 1) / slice;
++    const int r = blockIdx.x / nslices, sl = blockIdx.x % nslices;
++    const int lo = sl * slice, m = min(slice, n - lo);
++    long long* out = cand + ((long long)r * nslices + sl) * k;
++    if (m <= k) {   // the whole slice is among its top-k
++        for (int i = threadIdx.x; i < k; i += blockDim.x) out[i] = i < m ? keys[(long long)r * ks + lo + i] : (long long)0x8000000000000000ull;
++        return;
++    }
++    topk_regs<4>(keys + (long long)r * ks + lo, m, k, out);
++}
++
++static void run_old(const long long* d, int rows, int n, int k, long long* o) { tf_ds_topk_i64_kernel<<<rows, 1024>>>(d, n, n, k, o); }
++
+ // t[idx] = rows of whole rows (index_put_ with distinct indices: the window ring's and the positional store's slots):
+ // dst row idx[r] = src row r, `bytes` bytes a row (16-byte words when the rows are aligned so), a row a block.
+ extern "C" __global__ void tf_ds_scatter_rows_kernel(const uint8_t* src, long long src_ld, const long long* idx,
+diff --git a/zig/src/families/dsv41/ops.zig b/zig/src/families/dsv41/ops.zig
+index 2982c42..70fb9b4 100644
+--- a/zig/src/families/dsv41/ops.zig
++++ b/zig/src/families/dsv41/ops.zig
+@@ -22,6 +22,13 @@ fn blocks(count: usize, threads: usize) u32 {
+ /// tf_ds_l2_prefetch_kernel's argument: up to 16 device ranges (their first byte and length).
+ pub const Prefetch = extern struct { ptr: [16]u64 = @splat(0), bytes: [16]u64 = @splat(0), n: c_int = 0 };
+ 
++/// tf_ds_topk_i64_regs_kernel holds a row of at most this many keys in registers; past one slice of keys with at most
++/// topk_slice_blocks blocks (slices of every row), tf_ds_topk_i64_slices_kernel first.
++const topk_regs_max = 32768;
++const topk_slice = 4096;
++const topk_slice_blocks = 192;
++const topk_scratch_keys = topk_slice_blocks * 512;
++
+ pub const Ops = struct {
+     pointwise: cuda.Module,
+     movement: cuda.Module,
+@@ -30,6 +37,9 @@ pub const Ops = struct {
+     f16_to_f32: cuda.Function,
+     add2_bf16: cuda.Function,
+     topk_i64: cuda.Function,
++    topk_i64_regs: cuda.Function,
++    topk_i64_slices: cuda.Function,
++    topk_scratch: cuda.DeviceBuffer, // the slices' top-k sets: topk_scratch_keys int64
+     topk_indices: cuda.Function,
+     scatter: cuda.Function,
+     cand_fast: cuda.Function,
+@@ -61,6 +71,9 @@ pub const Ops = struct {
+             .f16_to_f32 = try fm.function("tf_ds_f16_to_f32_kernel"),
+             .add2_bf16 = try fm.function("tf_ds_add2_bf16_kernel"),
+             .topk_i64 = try fm.function("tf_ds_topk_i64_kernel"),
++            .topk_i64_regs = try fm.function("tf_ds_topk_i64_regs_kernel"),
++            .topk_i64_slices = try fm.function("tf_ds_topk_i64_slices_kernel"),
++            .topk_scratch = try cuda.DeviceBuffer.alloc(d, topk_scratch_keys * 8),
+             .topk_indices = try fm.function("tf_ds_topk_indices_kernel"),
+             .scatter = try fm.function("tf_ds_scatter_rows_kernel"),
+             .cand_fast = try fm.function("tf_ds_cand_fast_kernel"),
+@@ -79,6 +92,7 @@ pub const Ops = struct {
+     }
+ 
+     pub fn unload(o: *Ops) void {
++        o.topk_scratch.free();
+         o.pointwise.unload();
+         o.movement.unload();
+         o.family.unload();
+@@ -125,6 +139,35 @@ pub const Ops = struct {
+     pub fn topkI64(o: *const Ops, s: cuda.Stream, keys: u64, ks: usize, rows: usize, n: usize, k: usize, top: u64) !void {
+         if (rows == 0) return;
+         if (k > n) return error.BadTopK;
++        // the same set, sooner: keys in registers (n <= 32768), and past one slice with few rows each slice's top-k by its
++        // own block, then the top-k of those (the row's top-k is within them: the keys are unique)
++        const ns = (n + topk_slice - 1) / topk_slice;
++        if (n > topk_slice and n <= topk_regs_max and rows * ns <= topk_slice_blocks and ns * k <= topk_regs_max and rows * ns * k <= topk_scratch_keys) {
++            var a1: cuda.Args = .{};
++            a1.add(keys);
++            a1.add(@as(c_longlong, @intCast(ks)));
++            a1.add(@as(c_int, @intCast(n)));
++            a1.add(@as(c_int, @intCast(k)));
++            a1.add(@as(c_int, @intCast(topk_slice)));
++            a1.add(o.topk_scratch.ptr);
++            try cuda.launch.launch(o.topk_i64_slices, .{ .grid = .{ .x = @intCast(rows * ns) }, .block = .{ .x = 1024 } }, s, &a1);
++            var a2: cuda.Args = .{};
++            a2.add(o.topk_scratch.ptr);
++            a2.add(@as(c_longlong, @intCast(ns * k)));
++            a2.add(@as(c_int, @intCast(ns * k)));
++            a2.add(@as(c_int, @intCast(k)));
++            a2.add(top);
++            return cuda.launch.launch(o.topk_i64_regs, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, s, &a2);
++        }
++        if (n <= topk_regs_max) {
++            var a3: cuda.Args = .{};
++            a3.add(keys);
++            a3.add(@as(c_longlong, @intCast(ks)));
++            a3.add(@as(c_int, @intCast(n)));
++            a3.add(@as(c_int, @intCast(k)));
++            a3.add(top);
++            return cuda.launch.launch(o.topk_i64_regs, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, s, &a3);
++        }
+         var a: cuda.Args = .{};
+         a.add(keys);
+         a.add(@as(c_longlong, @intCast(ks)));
