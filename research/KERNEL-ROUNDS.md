@@ -397,6 +397,14 @@ idle server's busiest thread went from 99.9 % of a core to 0.3 % on each Spark; 
 Their revision of 0001 (aaa4xu, 2550cda4) turns the prefill indexer split on by default from token 131,072; on this
 stack the split pays earlier (43K -0.95 %, 161K -2.74 % against that threshold, 16K the same, the same bits), so the
 recipe sets `TF_DS_IDX_SPLIT=1`, which the 0001 it carries already reads. Their 0008 (a POOL setting) is left out.
+BertholomusAI's engine branch moved on too (17 commits past the pin). Its `cf6aae2b` (evilpsycho42, PR #35) applies
+unchanged and fixes what reproduced here: a request sharing a conversation's prefix and ending under 128 tokens past its
+kept chunk end (a new session's first message after a shared system prompt can) got that state from the store, which the
+lanes refused, and the store dropped it as a failed restore: the conversation's next turn then resumed 6,144 instead of
+8,192 (2.33 s instead of 1.31). Carried as 0033. Left out: the tool-only reply's held whitespace (`6568611e`: it changes
+what a client receives and so what it sends back, which the warm-ahead proxy learns), the AIO refusal leak (`12132870`:
+it does not apply over 0028, and the row ids are always in range), the opt-in switches `TF_DS_SOLO_OVERHEAD` and
+`TF_DS_NO_COPIES`, and the pass-in-pieces scheduler (this recipe's 0031 nests short passes instead).
 
 ## What is left
 

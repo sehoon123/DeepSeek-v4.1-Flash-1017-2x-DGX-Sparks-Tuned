@@ -31,6 +31,7 @@ Measured 2026-10-19 and 20 (Korea time) on the setup in [../README.md](../README
 | `experts-three-programs.txt` | the prompt MoE's gate/up kernel with three programs per SM (`zig/kit-patches/0001`): standalone and served |
 | `engram-reads.txt` | Engram reads deduplicated per chunk and the host row cache (`zig/patches/0028`): simulation and prompt times |
 | `warm-ahead.txt` | `tools/warm_ahead_proxy.py`: next-turn first tokens with and without the warm-ahead; re-warm after a restart |
+| `prompt-tail.txt` | a prompt ending within the window past a kept state, before and after `zig/patches/0033` |
 | `indexer-split.txt` | the prefill indexer split (`zig/patches/0001`) at 16K / 43K / 161K: none, from 131K, every chunk |
 | `rdma-idle-nap.txt` | the RDMA proxy's idle nap (`zig/patches/0032`): idle CPU and decode, before and after |
 | `prefill-nest.txt` | requests arriving during another's long prompt pass, with and without `zig/patches/0031` |

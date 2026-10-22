@@ -1,0 +1,8 @@
+zig/patches/0033 (TensorFold cf6aae2b by evilpsycho42, PR #35, unchanged), served. Exact ids through /v1/completions:
+a conversation turn of 10,340 tokens keeps its state at 8,192; a request sharing its prefix and ending 100 tokens past
+it (8,292 tokens); the conversation's next turn (10,400).
+
+                                   before                                   with 0033
+the short request                  resumed 0, the store's failed count +1   resumed 0 (no earlier state), failed +0
+                                   (the 8,192 state dropped), 3.83 s        3.85 s
+the conversation's next turn       resumed 6,144 (the short one's), 2.33 s  resumed 8,192, 1.31 s
