@@ -22,3 +22,7 @@ tokens    encode   encodeReusing (on the previous request's memo)
 
 /tokenize (chat route: JSON, template, encode) on the server before 0030, the same five turns of that conversation,
 three passes (ms): 86.6 72.8 90.6 91.3 90.7 / 79.5 77.7 92.1 76.2 76.9 / 75.7 73.1 77.2 76.6 89.1
+
+Served (0030 built in): the same five turns, three passes (ms): 102.7 75.4 21.5 22.0 29.1 / 90.8 76.2 24.7 17.4 26.4 /
+73.8 74.5 21.1 17.8 22.3: from the third request on 17-29 ms instead of 76-92 (the first two encode whole, as above).
+Every id equal to the earlier build's: the 32 agent requests and the five long turns.
