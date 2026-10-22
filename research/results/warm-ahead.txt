@@ -17,3 +17,10 @@ In use (a coding agent through the proxy, one conversation growing 37K -> 55K to
 replies sent back as predicted 19 of 19 times; 8 warm-aheads done (states 34816->36864, 36864->38912, 40960->43008,
 43008->45056, 47104->49152, 51200->53248, ...), 1.5-2.0 s each; the turns whose replies reached no new chunk end sent
 none.
+
+As shipped (the shared tokens' ids up to the chunk end and 128 past it as a /v1/completions token prompt, instead of
+the conversation, the reply and a one-token user message: the server runs 128 rows past the chunk end, not up to
+~2,200; at once after a reply ending in tool calls): turn 3 0.511 s (resumed 38,912) with 6 s between turns; an agent
+loop whose tool takes 1.0 s (turn 2 a 1,035-token write_file call): turn 3 resumed 38,912, first token 1.182 s (the
+conversation-and-message warm-ahead: 1.480 s). A token prompt's kept state is resumed by the chat request of the same
+tokens (checked: 4,224 ids kept 4,096; the chat request resumed 4,096).

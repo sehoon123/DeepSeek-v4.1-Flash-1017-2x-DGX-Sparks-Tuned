@@ -326,6 +326,9 @@ replies back as received: the third turn resumed at 38,912 instead of 36,864, it
 1.40-1.57 s; a third turn arriving 0.4 s into the warm-ahead (closed) still resumed at 38,912 (1.19 s). The resumed
 reply has the bits of the same request from an empty cache. In use (a coding agent, 37K -> 55K tokens over 14 turns):
 the client's replies came back as predicted 19 of 19 times and 8 warm-aheads moved its resume point a chunk on.
+Shipped as a token prompt (the shared ids up to the chunk end and 128 past it, `/v1/completions`): the server runs 128
+rows past the chunk end instead of up to ~2,200, so a next request arriving meanwhile waits less (an agent loop with a
+1 s tool: 1.48 -> 1.18 s), and it starts at once after tool calls.
 
 ## What is left
 

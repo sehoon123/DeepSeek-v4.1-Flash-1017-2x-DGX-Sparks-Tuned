@@ -7,8 +7,8 @@ issue and pull-request numbers are their repository's.
 
 - **Warm-ahead proxy** (`tools/warm_ahead_proxy.py`, optional): an OpenAI / Anthropic API proxy that, while a client is
   idle after a reply, has the prompt cache keep the state at the next chunk end the conversation and its reply reached
-  (the conversation, the reply and a one-token user message, `max_tokens 1`), so the next turn resumes ~2,048 tokens
-  later. Only chunk ends every next request can use; a client is warmed ahead once it has shown how it sends replies
+  (those tokens up to it and 128 past it as a token prompt, `max_tokens 1`; at once after tool calls), so the next turn
+  resumes ~2,048 tokens later. Only chunk ends every next request can use; a client is warmed ahead once it has shown how it sends replies
   back (learned per system prompt and tools); a client request closes a warm-ahead in flight. 39K-token conversations:
   a turn's first token 1.40-1.57 -> 0.54-0.59 s when the reply crossed a chunk end; the same reply bits as from an
   empty cache. `PROMPT_CACHE_GIB` (`scripts/config.sh`, unset: the server's 0.5) sets the prompt cache's budget.

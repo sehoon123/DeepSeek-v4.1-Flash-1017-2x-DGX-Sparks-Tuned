@@ -429,10 +429,11 @@ with the server on `HOST=127.0.0.1 PORT=8000` (`scripts/local.sh`). `KEY_FILE` (
 byte. The server keeps a prompt's state only at 2,048-token chunk ends before its last 128 tokens, so a next turn
 re-prefills from the last such end. After a reply, if no client request comes for `WARM_DELAY` seconds (3), the proxy
 asks the server's `/tokenize` how many tokens the conversation and the reply share with any next request and, when
-that reaches a chunk end no kept state covers yet, sends the conversation, the reply and a one-token user message
-(`max_tokens 1`): the cache keeps that chunk end. It is one every next request can use, and the state is the one the
-client's own request would compute, so replies are the same bits (checked against the same request from an empty
-cache). A client request closes a warm-ahead in flight (the server stops at its current chunk). The proxy appends the
+that reaches a chunk end no kept state covers yet, sends those tokens up to the chunk end and 128 past it as a token
+prompt (`/v1/completions`, `max_tokens 1`): the cache keeps that chunk end. It is one every next request can use, and
+the state is the one the client's own request would compute, so replies are the same bits (checked against the same
+request from an empty cache). After a reply ending in tool calls it starts at once (`WARM_DELAY_TOOL`, 0): the client
+runs its tools meanwhile. What it learned of each client is kept in `WARM_STATE` (hashes only). A client request closes a warm-ahead in flight (the server stops at its current chunk). The proxy appends the
 reply as the server sent it and learns, per client (its system prompt and tools), how the client sends replies back;
 a client is warmed ahead only once its next request has matched. Measurements: `research/results/warm-ahead.txt`.
 

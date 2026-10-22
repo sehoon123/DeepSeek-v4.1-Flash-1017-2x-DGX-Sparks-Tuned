@@ -6,17 +6,20 @@ and replies never go to the log (it logs a client's hash, token counts and timin
   LISTEN=0.0.0.0:8888 BACKEND=127.0.0.1:8000 KEY_FILE=~/.config/api-key python3 tools/warm_ahead_proxy.py
 
 KEY_FILE (optional): requests must carry `Authorization: Bearer <its contents>` (401 otherwise); unset: no check.
-WARM_AHEAD (1, the default; 0: a plain proxy), WARM_DELAY (seconds, 3).
+WARM_AHEAD (1, the default; 0: a plain proxy), WARM_DELAY (seconds after a reply, 3), WARM_DELAY_TOOL (seconds after a
+reply ending in tool calls, 0), WARM_STATE (the file of what it learned of each client, hashes only; ~/.cache).
 
 The server's prompt cache keeps a prompt's state at 2,048-token chunk ends before its last 128 tokens, so a
 conversation's next turn re-prefills everything after the last such end. After a chat reply (OpenAI
 /v1/chat/completions or Anthropic /v1/messages), when no client request arrives for WARM_DELAY seconds, the proxy asks
 the server's /tokenize how many tokens the conversation with this reply appended shares with any next request
-(rendering only), and when that reaches a chunk end the next request could resume and none does yet, sends the server
-that conversation, the reply and a one-token user message (max_tokens 1): the cache keeps the state at that chunk end
-and the next turn resumes there, ~2,048 tokens later than before. The chunk end is one every next request can use
-(shared + 3 - 128 at most): a deeper one would be useless to a short next message and would make the server's store
-free the conversation's earlier state first. The state is the one the client's own request would compute (the same
+(rendering only), and when that reaches a chunk end X the next request could resume and none does yet, sends the
+server those shared tokens up to X + 128 as a token prompt (/v1/completions, max_tokens 1; the cache finds states by
+tokens, whatever the route): the cache keeps the state at X, the server runs only 128 rows past it, and the next turn
+resumes there, ~2,048 tokens later than before. X is at most shared - 128, so every next request (the shared tokens and
+a message) resumes it: a deeper state would be useless to a short next message and would make the server's store free
+the conversation's earlier state first. After a reply ending in tool calls the warm-ahead starts at once
+(WARM_DELAY_TOOL, 0): the client runs the tools meanwhile, and the chunk computed is one its next request needs anyway. The state is the one the client's own request would compute (the same
 tokens, the same chunk boundaries), so replies are the same bits (checked: a resumed reply equal to the same request
 from an empty cache). A client request arriving while a warm-ahead runs closes it (the server stops at its current
 chunk). The reply is appended as the server sent it; a client is warmed ahead only once its next request has shown that
@@ -49,6 +52,11 @@ HOP_HEADERS = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriz
                "transfer-encoding", "upgrade"}
 WARM = os.environ.get("WARM_AHEAD", "1") != "0"
 WARM_DELAY = float(os.environ.get("WARM_DELAY", "3"))
+# after a reply that ends in tool calls the client runs them and comes back: the warm-ahead starts at once, the chunk it
+# computes being one the next request needs anyway (a request arriving meanwhile waits at most for that chunk)
+WARM_DELAY_TOOL = float(os.environ.get("WARM_DELAY_TOOL", "0"))
+# what the proxy learned of each client (styles, which ones are followed), kept across restarts (hashes only)
+STATE_FILE = os.environ.get("WARM_STATE", str(Path.home() / ".cache/warm-ahead-clients.json"))
 CHUNK, WINDOW = 2048, 128   # the server's prompt chunk and the decoder's window (states kept at chunk ends <= len - 128)
 CHAT, MESSAGES = "/v1/chat/completions", "/v1/messages"
 NEXT_MIN = 3                # the fewest tokens a next request adds to the shared ones (a message's markers)
@@ -80,6 +88,27 @@ class Warm:
 
 
 W = Warm()
+
+
+def load_state():
+    try:
+        j = json.loads(Path(STATE_FILE).read_text())
+        W.styles = {k: dict(v) for k, v in (j.get("styles") or {}).items()}
+        W.seen = set(j.get("seen") or [])
+        W.given_up = set(j.get("given_up") or [])
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+
+
+def save_state():
+    try:
+        tmp = STATE_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"styles": W.styles, "seen": sorted(W.seen), "given_up": sorted(W.given_up)}, f)
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        pass
 
 
 def jhash(obj):
@@ -266,7 +295,9 @@ def learn(api, body, who):
         return
     if jhash(echo) == jhash(ours):
         W.stats["echo_same"] += 1
-        W.seen.add(who)
+        if who not in W.seen:
+            W.seen.add(who)
+            save_state()
         return
     style = dict(W.styles.get(who, {}))
     before = dict(style)
@@ -295,10 +326,12 @@ def learn(api, body, who):
     # keep a state its next request cannot use)
     if jhash(echo) == jhash(raw.message(style)):
         W.seen.add(who)
+        save_state()
         log(f"warm-ahead: client {who} echoes replies as {style or 'sent'}")
     else:
         W.seen.discard(who)
         W.given_up.add(who)
+        save_state()
         mine = raw.message(style)
         diff = {k: (len(json.dumps(mine.get(k), ensure_ascii=False)), len(json.dumps(echo.get(k), ensure_ascii=False)))
                 for k in sorted(set(mine) | set(echo)) if mine.get(k) != echo.get(k)}
@@ -332,25 +365,27 @@ def plan(api, path, base, msgs, m, prompt_tokens, completion_tokens):
         a = tokens(path, base, msgs + [m])
         b = tokens(path, base, msgs + [m, {"role": "user", "content": "x"}])
         if a is None or b is None:
-            return None, "no token count"
+            return None, "no token count", None
         shared = 0
         while shared < min(len(a), len(b)) and a[shared] == b[shared]:
             shared += 1
-        # a next request is the shared tokens and at least NEXT_MIN more (a message's markers and the reply's prompt),
-        # so it resumes at a chunk end only up to shared + NEXT_MIN - WINDOW: no deeper (a deeper state it could not
-        # use would also make the store free this conversation's earlier one first)
-        X = (shared + NEXT_MIN - WINDOW) // CHUNK * CHUNK
+        # the shared tokens' ids up to a chunk end X and the window past it, as a token prompt (/v1/completions; the
+        # cache finds states by tokens, whatever the route): the server keeps X and runs only 128 rows past it. X is
+        # at most shared - 128, so the prompt stays inside the shared tokens and every next request (shared + a message)
+        # resumes it (a deeper state it could not use would also make the store free this conversation's earlier one)
+        X = (shared - WINDOW) // CHUNK * CHUNK
         if X <= kept:
-            return None, f"shares {shared} tokens: no chunk end past {kept}"
-        note = f"shares {shared} tokens, state {kept}->{X}"
-        tail = [m, {"role": "user", "content": "x"}]
+            return None, f"shares {shared} tokens: no chunk end past {kept}", None
+        warm = {"model": base.get("model") or "model", "prompt": a[:X + WINDOW], "max_tokens": 1, "temperature": 0,
+                "priority": "background"}
+        return json.dumps(warm).encode(), f"shares {shared} tokens, state {kept}->{X}", "/v1/completions"
     else:
         # Anthropic: no ids to compare; only when the reply clearly crossed a chunk end past the window
         if prompt_tokens is None or completion_tokens is None:
-            return None, "no usage"
+            return None, "no usage", None
         X = (prompt_tokens + completion_tokens + NEXT_MIN - WINDOW) // CHUNK * CHUNK
         if X <= kept:
-            return None, "no chunk end crossed past the window"
+            return None, "no chunk end crossed past the window", None
         note = f"prompt {prompt_tokens}+{completion_tokens}, state {kept}->{X}"
         tail = [m, {"role": "user", "content": "x"}]
     warm = {k: v for k, v in base.items() if k not in ("stream", "stream_options", "n", "logprobs", "top_logprobs")}
@@ -358,9 +393,7 @@ def plan(api, path, base, msgs, m, prompt_tokens, completion_tokens):
     warm["max_tokens"] = 1
     if "max_completion_tokens" in warm:
         warm["max_completion_tokens"] = 1
-    if api == CHAT:
-        warm["priority"] = "background"
-    return json.dumps(warm, ensure_ascii=False).encode(), note
+    return json.dumps(warm, ensure_ascii=False).encode(), note, path
 
 
 def schedule(api, path, body, who, reply):
@@ -384,11 +417,15 @@ def schedule(api, path, body, who, reply):
         with W.lock:
             return W.gen == gen and W.inflight == 0
 
+    tool_turn = reply.finish in ("tool_calls", "tool_use")
+    delay = WARM_DELAY_TOOL if tool_turn else WARM_DELAY
+
     def later():
-        time.sleep(WARM_DELAY)
+        if delay > 0:
+            time.sleep(delay)
         if not idle():
             return
-        data, note = plan(api, path, body, msgs, m, reply.prompt_tokens, reply.completion_tokens)
+        data, note, route = plan(api, path, body, msgs, m, reply.prompt_tokens, reply.completion_tokens)
         if data is None:
             log(f"warm-ahead: client {who}: none ({note})")
             return
@@ -401,7 +438,7 @@ def schedule(api, path, body, who, reply):
         t0 = time.time()
         ok = False
         try:
-            conn.request("POST", path, body=data, headers={"Content-Type": "application/json"})
+            conn.request("POST", route, body=data, headers={"Content-Type": "application/json"})
             rep = conn.getresponse()
             rep.read()
             ok = rep.status == 200
@@ -413,7 +450,7 @@ def schedule(api, path, body, who, reply):
                     W.conn = None
                 W.stats["done" if ok else "stopped"] += 1
             conn.close()
-        log(f"warm-ahead: client {who} {note}: {'done' if ok else 'stopped'} in {time.time() - t0:.1f} s; {W.stats}")
+        log(f"warm-ahead: client {who} {note}{' (tool turn)' if tool_turn else ''}: {'done' if ok else 'stopped'} in {time.time() - t0:.1f} s; {W.stats}")
 
     threading.Thread(target=later, daemon=True).start()
 
@@ -546,7 +583,8 @@ class API(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    load_state()
     server = ProxyServer(LISTEN, API)
     print(f"warm-ahead proxy ({'key checked' if KEY else 'no key'}) on {LISTEN[0]}:{LISTEN[1]} -> {BACKEND[0]}:{BACKEND[1]}; warm-ahead "
-          f"{'on, ' + str(WARM_DELAY) + ' s after a reply' if WARM else 'off'}", flush=True)
+          f"{'on, ' + str(WARM_DELAY) + ' s after a reply (' + str(WARM_DELAY_TOOL) + ' s after tool calls), ' + str(len(W.seen)) + ' clients known' if WARM else 'off'}", flush=True)
     server.serve_forever()
