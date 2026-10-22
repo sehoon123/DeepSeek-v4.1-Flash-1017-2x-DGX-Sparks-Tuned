@@ -416,6 +416,12 @@ ran a row on one block: the pruned selection's 32,768 candidates took 89.7 us an
 Keys in registers with a warp's scan of each digit's bins, and the long rows in slices over many blocks then the top-k of
 the slices' top-k sets (the same set: the keys are unique): 16.3 and 4.9 us. Interleaved twice: 42.13 / 42.13 -> 41.81 /
 41.91 ms a round (+0.6 %), every run's tokens equal; short contexts (the fused Triton selection) and prefill unchanged.
+At the same 78K / T=1 shape, the switches rechecked (interleaved twice each, every run's tokens equal): the paced L2
+prefetch still pays (off: 72.7 / 72.6 against 76.1 / 75.9 tok/s, -4.4 %; short prompts -5.1 %), its 16 MiB budget is the
+best of 12 (-1.5 %), 16 and 20 (the same); both ranks' containers on the ten big cores alone change nothing (75.7 / 75.9
+against 76.5 / 73.5). The context buckets are powers of two, so a growing conversation recaptures its round graphs once
+a doubling; the indexer scores the whole bucket, ~0.1 ms a round more than its rows need at 78K. The MoE reads ~6.4 GB
+a rank a round in ~26.8 ms, ~90 % of the read ceiling; what is left is the gathers' latency and the small kernels.
 
 ## What is left
 
