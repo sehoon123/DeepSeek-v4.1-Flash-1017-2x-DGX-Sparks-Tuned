@@ -5,6 +5,9 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **The server's tokenizer reuses the previous request's ids** (`zig/patches/0030`): the leading segments (split at the
+  end-of-sentence tokens) a request shares with one of the last four long texts keep their ids; a 135K-token
+  conversation's next request 57 -> 2-3 ms to tokenize; the same ids.
 - **`scripts/prepare.sh` refuses to build a new image beside a running server** (`PREPARE_BESIDE_SERVER=1` overrides):
   the build's compiles took the head under the memory guard's floor, which stopped the server.
 - **Sampled decoding's host side** (`zig/patches/0029`): a round's logits are copied to pinned memory (0.37 -> 0.07 ms a

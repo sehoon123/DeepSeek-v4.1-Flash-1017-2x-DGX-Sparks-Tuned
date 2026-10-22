@@ -1,0 +1,203 @@
+diff --git a/zig/src/core/tokenizer/tokenizer.zig b/zig/src/core/tokenizer/tokenizer.zig
+index 176d995..4a1ab4e 100644
+--- a/zig/src/core/tokenizer/tokenizer.zig
++++ b/zig/src/core/tokenizer/tokenizer.zig
+@@ -130,6 +130,69 @@ pub const Tokenizer = struct {
+         return a.dupe(u32, ids.items);
+     }
+ 
++    /// A text's encoding kept for the next one (encodeReusing): its bytes, its ids and its top-level segments (the
++    /// split at added tokens) with the ids each made; owned by the allocator encodeReusing was given for it.
++    pub const Memo = struct {
++        text: []u8 = &.{},
++        ids: []u32 = &.{},
++        segs: []MemoSegment = &.{},
++
++        pub fn deinit(m: *Memo, a: Allocator) void {
++            a.free(m.text);
++            a.free(m.ids);
++            a.free(m.segs);
++            m.* = .{};
++        }
++    };
++    pub const MemoSegment = struct { start: usize, end: usize, id: ?u32, n: usize };
++
++    /// encode's ids, with `prev`'s taken for the leading top-level segments both texts have alike (the same bounds and
++    /// id, inside their common prefix): a segment's ids depend only on its bytes and on whether it starts the text, so
++    /// the ids are encode's. With `next`, this text's memo goes there, allocated with `keep`.
++    pub fn encodeReusing(t: *const Tokenizer, a: Allocator, keep: Allocator, text: []const u8, prev: ?*const Memo, next: ?*Memo) Error![]u32 {
++        if (!std.unicode.utf8ValidateSlice(text)) return t.encode(a, text); // (the lossy text's offsets are another text's)
++        var arena = std.heap.ArenaAllocator.init(a);
++        defer arena.deinit();
++        var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
++        const segs = try t.splitAdded(&ctx, &t.raw, text);
++        var same: usize = 0;
++        var same_ids: usize = 0;
++        if (prev) |p| {
++            const common = std.mem.findDiff(u8, p.text, text) orelse text.len;
++            while (same < segs.len and same < p.segs.len) : (same += 1) {
++                const s = segs[same];
++                const q = p.segs[same];
++                if (s.start != q.start or s.end != q.end or s.end > common) break;
++                if ((s.id == null) != (q.id == null)) break;
++                if (s.id != null and s.id.? != q.id.?) break;
++                same_ids += q.n;
++            }
++        }
++        var ids: std.ArrayList(u32) = .empty;
++        if (prev) |p| try ids.appendSlice(ctx.a, p.ids[0..same_ids]);
++        const counts = try ctx.a.alloc(usize, segs.len);
++        if (prev) |p| for (counts[0..same], p.segs[0..same]) |*c, q| {
++            c.* = q.n;
++        };
++        for (segs[same..], counts[same..]) |seg, *c| {
++            const before = ids.items.len;
++            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, text[seg.start..seg.end], seg.start == 0, &ids);
++            c.* = ids.items.len - before;
++        }
++        const out = try a.dupe(u32, ids.items);
++        errdefer a.free(out);
++        if (next) |nm| {
++            const kt = try keep.dupe(u8, text);
++            errdefer keep.free(kt);
++            const ki = try keep.dupe(u32, ids.items);
++            errdefer keep.free(ki);
++            const ks = try keep.alloc(MemoSegment, segs.len);
++            for (ks, segs, counts) |*k, sg, c| k.* = .{ .start = sg.start, .end = sg.end, .id = sg.id, .n = c };
++            nm.* = .{ .text = kt, .ids = ki, .segs = ks };
++        }
++        return out;
++    }
++
+     fn encodeText(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
+         var zero: usize = if (first) unicode.decodeAt(text, 0).len else 0;
+         const normalized = if (t.normalizer) |*n| try n.apply(ctx, text, &zero) else text;
+@@ -363,3 +426,51 @@ test "without a decoder, decode joins known ids' tokens with spaces" {
+     try std.testing.expectEqualStrings("t1 t4", text);
+     try std.testing.expectEqual(@as(?u32, null), t.unk_id);
+ }
++
++fn memoCheck(t: *const Tokenizer, seed: u64) !void {
++    const a = std.testing.allocator;
++    var prng = std.Random.DefaultPrng.init(seed);
++    const r = prng.random();
++    const parts = [_][]const u8{ "a", "b", " ", "ab", " ab", "c", "<|end|>", "  ", "<|end|><|end|>" };
++    var memo: Tokenizer.Memo = .{};
++    defer memo.deinit(a);
++    var text: std.ArrayList(u8) = .empty;
++    defer text.deinit(a);
++    for (0..300) |step| {
++        // the next text: the last one cut somewhere (or not) and extended, as a conversation's next request
++        if (step % 17 == 0) text.clearRetainingCapacity() else if (text.items.len > 0 and r.boolean()) text.shrinkRetainingCapacity(r.uintLessThan(usize, text.items.len + 1));
++        for (0..r.uintLessThan(usize, 12) + 1) |_| try text.appendSlice(a, parts[r.uintLessThan(usize, parts.len)]);
++        const want = try t.encode(a, text.items);
++        defer a.free(want);
++        var next: Tokenizer.Memo = .{};
++        const got = try t.encodeReusing(a, a, text.items, if (memo.text.len > 0) &memo else null, &next);
++        defer a.free(got);
++        try std.testing.expectEqualSlices(u32, want, got);
++        try std.testing.expectEqualSlices(u32, want, next.ids);
++        memo.deinit(a);
++        memo = next;
++    }
++}
++
++test "encodeReusing gives encode's ids: texts that share a prefix, the added token plain and stripping" {
++    const plain =
++        \\{"added_tokens":[{"id":7,"content":"<|end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}],
++        \\ "normalizer":{"type":"NFC"},
++        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
++        \\ "decoder":{"type":"ByteLevel"},
++        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
++        \\  "vocab":{"a":0,"b":1,"Ġ":2,"ab":3,"Ġa":4,"Ġab":5,"c":6},"merges":[["Ġ","a"],"a b","Ġa b"]}}
++    ;
++    const a = std.testing.allocator;
++    var t = try parse(a, plain);
++    defer t.deinit();
++    try memoCheck(&t, 1);
++    try memoCheck(&t, 2);
++    const stripping = try std.mem.replaceOwned(u8, a, plain, "\"lstrip\":false,\"rstrip\":false", "\"lstrip\":true,\"rstrip\":true");
++    defer a.free(stripping);
++    try std.testing.expect(!std.mem.eql(u8, stripping, plain));
++    var t2 = try parse(a, stripping);
++    defer t2.deinit();
++    try memoCheck(&t2, 3);
++    try memoCheck(&t2, 4);
++}
+diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
+index b7358b4..856444d 100644
+--- a/zig/src/server/hf_text.zig
++++ b/zig/src/server/hf_text.zig
+@@ -7,6 +7,9 @@ const model_text = @import("model_text.zig");
+ const Value = json.Value;
+ const Allocator = std.mem.Allocator;
+ 
++const memo_slots = 4;
++const memo_min_bytes = 8192; // shorter texts encode without the memos
++
+ pub const HfText = struct {
+     gpa: Allocator,
+     arena: std.heap.ArenaAllocator,
+@@ -19,6 +22,13 @@ pub const HfText = struct {
+     eos: []const u32 = &.{},
+     prefix: []const u32 = &.{}, // the post-processor's tokens before a text (add_special_tokens)
+     suffix: []const u32 = &.{},
++    // the last long texts' encodings: a conversation's next request repeats all but the end of one, whose ids are taken
++    // for the segments before the change (Tokenizer.encodeReusing: encode's ids). One request at a time uses them
++    // (another meanwhile encodes without).
++    memo_busy: std.atomic.Value(bool) = .init(false),
++    memos: [memo_slots]tokenizer.Tokenizer.Memo = [_]tokenizer.Tokenizer.Memo{.{}} ** memo_slots,
++    memo_used: [memo_slots]u64 = [_]u64{0} ** memo_slots,
++    memo_clock: u64 = 0,
+ 
+     /// Loads ``dir``'s tokenizer.json, chat template, special tokens and end-of-sequence ids; a failure's reason in `problem` (from `pa`).
+     pub fn load(gpa: Allocator, io: std.Io, dir: []const u8, pa: Allocator, problem: *[]const u8) !*HfText {
+@@ -49,6 +59,7 @@ pub const HfText = struct {
+     }
+ 
+     pub fn deinit(t: *HfText) void {
++        for (&t.memos) |*m| m.deinit(t.gpa);
+         if (t.compiled) |*c| c.deinit();
+         if (t.tool_compiled) |*c| c.deinit();
+         t.tok.deinit();
+@@ -216,11 +227,39 @@ pub const HfText = struct {
+ 
+     fn encodeFn(ctx: *anyopaque, a: Allocator, s: []const u8, add_special: bool) model_text.Error![]u32 {
+         const t = self(ctx);
+-        const ids = t.tok.encode(a, s) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
++        const ids = (if (s.len >= memo_min_bytes) t.encodeMemo(a, s) else t.tok.encode(a, s)) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
+         if (!add_special or (t.prefix.len == 0 and t.suffix.len == 0)) return ids;
+         return std.mem.concat(a, u32, &.{ t.prefix, ids, t.suffix });
+     }
+ 
++    /// encode through the memos: the one sharing the longest prefix (at least memo_min_bytes) lends its ids; this
++    /// text's memo replaces it when it repeats most of it (the same conversation, one request on), else the oldest.
++    fn encodeMemo(t: *HfText, a: Allocator, s: []const u8) tokenizer.Error![]u32 {
++        if (t.memo_busy.cmpxchgStrong(false, true, .acquire, .monotonic) != null) return t.tok.encode(a, s);
++        defer t.memo_busy.store(false, .release);
++        var best: ?usize = null;
++        var best_len: usize = 0;
++        var oldest: usize = 0;
++        for (t.memos, t.memo_used, 0..) |m, used, i| {
++            if (used < t.memo_used[oldest]) oldest = i;
++            if (m.text.len == 0) continue;
++            const common = std.mem.findDiff(u8, m.text, s) orelse s.len;
++            if (common > best_len) {
++                best = i;
++                best_len = common;
++            }
++        }
++        const lend = best != null and best_len >= memo_min_bytes;
++        var next: tokenizer.Tokenizer.Memo = .{};
++        const ids = try t.tok.encodeReusing(a, t.gpa, s, if (lend) &t.memos[best.?] else null, &next);
++        const slot = if (lend and best_len * 10 >= t.memos[best.?].text.len * 9) best.? else oldest;
++        t.memos[slot].deinit(t.gpa);
++        t.memos[slot] = next;
++        t.memo_clock += 1;
++        t.memo_used[slot] = t.memo_clock;
++        return ids;
++    }
++
+     fn decodeFn(ctx: *anyopaque, a: Allocator, ids: []const u32) Allocator.Error![]u8 {
+         return self(ctx).tok.decode(a, ids, false) catch |e| if (e == error.OutOfMemory) error.OutOfMemory else a.dupe(u8, "\u{fffd}");
+     }

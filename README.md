@@ -60,6 +60,9 @@ their repository's.
 - **Sampled decoding ~1.2 % faster**: `zig/patches/0029`. Between a round and the next, the host drew each row's token
   from its logits: their copy (~3 MB a round, to pageable memory) took 0.37 ms and the top-k search over the 129K
   vocabulary 0.37 ms; with pinned memory and the search 16 logits at a time, 0.07 + 0.12 ms. The same bits.
+- **A long conversation's next request read ~55 ms sooner**: `zig/patches/0030`. The server tokenized every request
+  whole (57 ms at 133K tokens); it keeps the last long texts' ids and encodes only what follows the previous reply
+  (2-3 ms). The same ids.
 - **A conversation's next turn up to ~60 % sooner (optional)**: `tools/warm_ahead_proxy.py`, an OpenAI / Anthropic API
   proxy in front of the server. While a client is idle after a reply, it has the server's prompt cache keep the state at
   the next 2,048-token chunk end the conversation and its reply reached, so the next turn resumes there instead of

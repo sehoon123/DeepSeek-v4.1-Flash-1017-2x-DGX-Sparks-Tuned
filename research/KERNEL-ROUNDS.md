@@ -358,6 +358,19 @@ pinned (`cuMemHostAlloc`, the same 24.8 MB) the copy 0.37 -> 0.07 ms. Decode 110
 0.003 ms, the drafter's results two copies of a few hundred bytes; the round itself is the GPU's (forward 41.5 ms with
 its issue overlapped, the drafter's pass 3.4 ms).
 
+## Round 22: the request's tokens (2026-10-22, `zig/patches/0030`, `results/tokenize-memo.txt`)
+
+Every request is rendered and tokenized whole: at 133-140K tokens `/tokenize` (the chat route: JSON, template, encode)
+took 73-92 ms a turn, the encode alone 57 ms (ReleaseSafe, a big core). The tokenizer splits a text at its added tokens
+that are not normalized (for this model the end-of-sentence a reply ends with) and encodes each segment by itself, from
+its bytes and whether it starts the text; a conversation's next request repeats the previous one's segments up to its
+last reply. So the server keeps the last four long texts with their segments and ids, and a new text takes the ids of
+the leading segments it has alike (the same bounds and token, inside the common prefix) and encodes the rest. The same
+ids: random texts against encode (the added token plain and with lstrip / rstrip), and 37 requests of served
+conversations (tool calls, dropped reasoning, warm-ahead texts) against the server's ids. Encode 57-59 -> 2.0-2.8 ms at
+135-140K tokens, 4.8-5.5 -> 0.1-1.9 ms at 13-15K; a conversation's second request still encodes whole (its first
+had no end-of-sentence yet).
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels
