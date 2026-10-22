@@ -11,3 +11,7 @@ Every run's tokens equal to the first's (nine runs). MiaAI-Lab's later revision 
 splits by default only from 65,536 compressed keys (token 131,072), where it measured +4.25 % at 256K and +7.46 % at
 400K and kept 8K / 32K within 0.9 %; here the split pays from ~40K on and costs nothing at 16K, so this recipe sets
 TF_DS_IDX_SPLIT=1 (every eligible chunk), which its 0001 already reads.
+
+Served, a conversation's next turns at 133K tokens (resumed from the cache; with 0030's tokenizer memo too, which
+saves ~55 ms of these): +3.6K new tokens 2.379 -> 2.133 s, +1.5K 1.126 s (was 1.258); a 132.6K-token first turn
+58.08 -> 56.29 s; at 4.8K the same (1.597 / 0.614 s).
