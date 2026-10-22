@@ -152,7 +152,9 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   ([their repository](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks) at `370daf0c`), carried
   unchanged, with their `RDMA_IDLE_S` / `RDMA_NAP_US` settings: the RDMA gather proxy's idle nap by
   **William J Riley** ([willjriley](https://github.com/willjriley); [TensorFold PR #27](https://github.com/bertholomus/TensorFold/pull/27)),
-  ported to the Zig ring by MiaAI-Lab.
+  ported to the Zig ring by **Mykhailo Tamarin** ([MykhailoTamarin](https://github.com/MykhailoTamarin); MiaAI-Lab's pull
+  request #26, with its 500 us default), with MiaAI-Lab's bounds on the settings. The indexer split's later default
+  that `results/indexer-split.txt` compares with is **aaa4xu**'s (MiaAI-Lab's pull request #35).
 - The copy windows widen the engine's own copy proposals; checking text copied from the context in one pass is the idea of
   prompt lookup decoding (Apoorv Saxena, 2023).
 

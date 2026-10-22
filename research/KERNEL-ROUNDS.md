@@ -392,7 +392,7 @@ equal to the same prompt alone (10 of 10). Streaming itself is even: a reply's e
 ## Round 24: upstream since the pin (2026-10-22, `zig/patches/0032`, `results/rdma-idle-nap.txt`, `results/indexer-split.txt`)
 
 MiaAI-Lab's recipe moved on 10-21. Their `0010-rdma-idle-nap.patch` (William J Riley's TensorFold PR #27, ported to the
-Zig ring) applies unchanged on this stack: carried as 0032 with their settings (`RDMA_IDLE_S` 2, `RDMA_NAP_US` 500). An
+Zig ring by Mykhailo Tamarin) applies unchanged on this stack: carried as 0032 with their settings (`RDMA_IDLE_S` 2, `RDMA_NAP_US` 500). An
 idle server's busiest thread went from 99.9 % of a core to 0.3 % on each Spark; sampled decode the same (+0.06 %).
 Their revision of 0001 (aaa4xu, 2550cda4) turns the prefill indexer split on by default from token 131,072; on this
 stack the split pays earlier (43K -0.95 %, 161K -2.74 % against that threshold, 16K the same, the same bits), so the

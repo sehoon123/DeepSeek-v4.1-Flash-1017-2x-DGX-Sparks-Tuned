@@ -67,7 +67,7 @@ their repository's.
   eligible chunk): the prefill indexer's rows are split between the two Sparks (161K tokens 71.3 -> 68.3 s, 43K -0.95 %,
   16K the same; the same bits).
 - **A quiet server no longer spins a core on each Spark**: `zig/patches/0032`, MiaAI-Lab's RDMA idle nap (their 0010,
-  unchanged; TensorFold PR #27 by William J Riley): the gather proxy sleeps between looks after 2 s with nothing to do
+  unchanged; TensorFold PR #27 by William J Riley, ported by Mykhailo Tamarin): the gather proxy sleeps between looks after 2 s with nothing to do
   (99.9 -> 0.3 % of a core idle); decode is the same (+0.06 %).
 - **A request arriving during another's long prompt starts in ~2 s, not after it**: `zig/patches/0031`,
   `PREFILL_NEST_TOKENS=8192`. Such a request whose own pass needs at most that many tokens (past its kept state) runs
