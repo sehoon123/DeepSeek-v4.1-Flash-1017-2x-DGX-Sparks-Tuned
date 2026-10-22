@@ -343,6 +343,21 @@ calibrated confidences) 66.06 and 65.85 tok/s; confidence bias -0.5 / +0.5 / +1.
 verified: more tokens a round, longer rounds); two drafts always trusted -1.7 %; copies from 3-token matches: the same.
 All the same bits. The calibration holds where context is long and decoding sampled; no switch to change.
 
+## Round 21: the host between sampled rounds (2026-10-22, `zig/patches/0029`, `results/sampler-pinned.txt`)
+
+At temperature > 0 the round's logits come to the host and each row is drawn there (top-k 20 + 8 candidates, top-p,
+Gumbel-max with position-keyed uniforms): nothing of the next round can start before. `--profile` on rank 0 (eight
+seeded T=1 requests, 6.1 rows a round): the logits copy 0.37 ms a round (3 MB into a pageable buffer: the driver stages
+it, ~9 GB/s) and the draws 0.37 ms, of a 45.5 ms round. The candidates' search went through the 129,280 logits one at
+a time with a branch each; past the first k, a later logit enters only above the last kept value (its id is higher
+than every kept one), so a 16-wide compare skips a block with none above it, and the rest take the same insertion: the
+same (value, id) pairs (a test against the one-at-a-time loop over ties, NaN and infinities). Standalone: 71.7 -> 17.1 us
+a row on a big core, 125.9 -> 27.7 on a little one. In the engine: draws 0.37 -> 0.12 ms, and with the logits buffer
+pinned (`cuMemHostAlloc`, the same 24.8 MB) the copy 0.37 -> 0.07 ms. Decode 110.00 / 110.00 -> 111.41 / 111.31 tok/s
+(+1.2 %, interleaved), every run's tokens equal. The rest of the host side of a round is small: the frame to rank 1
+0.003 ms, the drafter's results two copies of a few hundred bytes; the round itself is the GPU's (forward 41.5 ms with
+its issue overlapped, the drafter's pass 3.4 ms).
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels

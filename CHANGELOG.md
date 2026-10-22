@@ -5,6 +5,9 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **Sampled decoding's host side** (`zig/patches/0029`): a round's logits are copied to pinned memory (0.37 -> 0.07 ms a
+  round) and each row's top candidates are found 16 logits at a time (0.37 -> 0.12 ms): T=1 decode +1.2 % (110.00 ->
+  111.41 / 111.31 tok/s, two pairs, one stream), the same bits; greedy decoding (the device's argmax) is unchanged.
 - **Warm-ahead proxy** (`tools/warm_ahead_proxy.py`, optional): an OpenAI / Anthropic API proxy that, while a client is
   idle after a reply, has the prompt cache keep the state at the next chunk end the conversation and its reply reached
   (those tokens up to it and 128 past it as a token prompt, `max_tokens 1`; at once after tool calls), so the next turn

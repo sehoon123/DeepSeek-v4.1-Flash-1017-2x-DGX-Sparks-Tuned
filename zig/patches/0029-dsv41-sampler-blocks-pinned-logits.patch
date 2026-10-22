@@ -1,0 +1,122 @@
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 712d689..cc6440f 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -115,6 +115,7 @@ pub const Model = struct {
+     ids64: []i64,
+     vocab: usize,
+     logits: []f32, // round.max_rows rows of logits on the host
++    logits_pin: ?cuda.HostBuffer = null, // their pinned memory: a round's copy comes back by DMA, not staged by the driver
+     amax: u64, // u32 [round.max_rows]: a round's greedy tokens on the device (roundArgmax)
+     amax_host: [round.max_rows]u32 = undefined,
+     // the stream a fill is running: its slot and its view of the caches (its extent from base)
+@@ -171,6 +172,7 @@ pub const Model = struct {
+         prompt.idx_split = if (std.c.getenv("TF_DS_IDX_SPLIT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false; // every rank alike
+         m.spans = .empty;
+         m.img_buf = null;
++        m.logits_pin = null;
+         m.host = std.heap.ArenaAllocator.init(gpa);
+         errdefer m.host.deinit();
+         const a = m.host.allocator();
+@@ -410,7 +412,9 @@ pub const Model = struct {
+             m.ids64_2 = try a.alloc(i64, chunk_rows);
+         }
+         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
+-        m.logits = try a.alloc(f32, round.max_rows * m.vocab);
++        // pinned: a copy to pageable memory goes through the driver's staging buffer (a round's sampled rows: ~3 MB)
++        m.logits_pin = try cuda.HostBuffer.alloc(ctx.d, round.max_rows * m.vocab * @sizeOf(f32));
++        m.logits = m.logits_pin.?.slice(f32)[0 .. round.max_rows * m.vocab];
+         return m;
+     }
+ 
+@@ -418,6 +422,7 @@ pub const Model = struct {
+         m.joinAhead();
+         m.stream.synchronize() catch {};
+         if (m.img_buf) |*b| b.free();
++        if (m.logits_pin) |*b| b.free();
+         m.spans.deinit(m.gpa);
+         if (m.graphs) |*g| g.deinit();
+         if (m.pgraphs) |*g| g.deinit();
+diff --git a/zig/src/families/dsv41/sampling.zig b/zig/src/families/dsv41/sampling.zig
+index 3a8c450..76f66bc 100644
+--- a/zig/src/families/dsv41/sampling.zig
++++ b/zig/src/families/dsv41/sampling.zig
+@@ -68,8 +68,43 @@ fn before(va: f32, ia: i64, vb: f32, ib: i64) bool {
+ }
+ 
+ /// The row's first `count` (value, id) in that order: torch.topk's set (of equal values the lower ids) as np.lexsort
+-/// orders it.
++/// orders it. Once `count` are held, an element enters only before the last held one, and as the row is read in
++/// order its id is higher than every held id, so only a larger value can: a block of the row with none larger than
++/// the last held value is passed over whole (16 at a time), the rest go through the insertion one by one. The same
++/// pairs as `topCandidatesScalar` (a NaN is never larger, as there).
+ pub fn topCandidates(row: []const f32, count: usize, values: []f32, ids: []i64) usize {
++    const k = @min(count, row.len);
++    if (k == 0) return 0;
++    const L = 16;
++    var n: usize = 0;
++    var i: usize = 0;
++    while (i < row.len and n < k) : (i += 1) insertCandidate(row[i], i, k, &n, values, ids);
++    while (i + L <= row.len) : (i += L) {
++        const v: @Vector(L, f32) = row[i..][0..L].*;
++        const last: @Vector(L, f32) = @splat(values[k - 1]);
++        if (!@reduce(.Or, v > last)) continue;
++        for (i..i + L) |j| insertCandidate(row[j], j, k, &n, values, ids);
++    }
++    while (i < row.len) : (i += 1) insertCandidate(row[i], i, k, &n, values, ids);
++    return n;
++}
++
++inline fn insertCandidate(v: f32, i: usize, k: usize, n: *usize, values: []f32, ids: []i64) void {
++    const id: i64 = @intCast(i);
++    if (n.* == k and !before(v, id, values[k - 1], ids[k - 1])) return;
++    // insert in order, dropping the last when full
++    var j: usize = if (n.* < k) n.* else k - 1;
++    while (j > 0 and before(v, id, values[j - 1], ids[j - 1])) : (j -= 1) {
++        values[j] = values[j - 1];
++        ids[j] = ids[j - 1];
++    }
++    values[j] = v;
++    ids[j] = id;
++    if (n.* < k) n.* += 1;
++}
++
++/// topCandidates one element at a time (the reference its tests compare with).
++pub fn topCandidatesScalar(row: []const f32, count: usize, values: []f32, ids: []i64) usize {
+     const k = @min(count, row.len);
+     var n: usize = 0;
+     for (row, 0..) |v, i| {
+@@ -168,3 +203,33 @@ test "top candidates by value, then id" {
+     try std.testing.expectEqualSlices(i64, &.{ 1, 3, 5, 2 }, &ids);
+     try std.testing.expectEqualSlices(f32, &.{ 5, 5, 5, 3 }, &v);
+ }
++
++test "top candidates a block at a time as one at a time: ties, NaN, infinities, short rows" {
++    var prng = std.Random.DefaultPrng.init(20261022);
++    const r = prng.random();
++    var row: [4133]f32 = undefined;
++    var va: [64]f32 = undefined;
++    var ia: [64]i64 = undefined;
++    var vb: [64]f32 = undefined;
++    var ib: [64]i64 = undefined;
++    for (0..400) |q| {
++        const len = if (q % 5 == 0) r.uintLessThan(usize, 40) + 1 else row.len;
++        for (row[0..len]) |*x| x.* = r.floatNorm(f32) * 2.0 - 3.0;
++        for (0..12) |_| row[r.uintLessThan(usize, len)] = 8.0 + r.float(f32) * 10.0;
++        if (q % 3 == 1) for (row[0..len]) |*x| {
++            x.* = @round(x.* * 2.0) / 2.0;
++        };
++        if (q % 7 == 3) row[r.uintLessThan(usize, len)] = std.math.nan(f32);
++        if (q % 7 == 5) for (0..30) |_| {
++            row[r.uintLessThan(usize, len)] = if (r.boolean()) std.math.inf(f32) else -std.math.inf(f32);
++        };
++        if (q % 11 == 0) @memset(row[0..len], 1.5);
++        for ([_]usize{ 1, 2, 8, 28, 64 }) |count| {
++            const na = topCandidatesScalar(row[0..len], count, &va, &ia);
++            const nb = topCandidates(row[0..len], count, &vb, &ib);
++            try std.testing.expectEqual(na, nb);
++            try std.testing.expectEqualSlices(i64, ia[0..na], ib[0..nb]);
++            for (va[0..na], vb[0..nb]) |x, y| try std.testing.expectEqual(@as(u32, @bitCast(x)), @as(u32, @bitCast(y)));
++        }
++    }
++}

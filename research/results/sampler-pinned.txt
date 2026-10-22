@@ -1,0 +1,17 @@
+Sampled decoding's host side (tf-dsv41-lanes --profile 1 on rank 0, one stream, 48-row windows, the shipped switches;
+eight seeded requests at temperature 1.0 / top-p 0.95 / top-k 20 (four of 400 tokens, two of 400, two of 700), 731
+rounds, 6.11 rows a round; every run's tokens equal to the first's)
+
+run                                   decode tok/s   round ms   logits copy ms   draws ms
+before (pageable buffer, one at a time)   110.00     45.56      0.38             0.37
+after  (pinned buffer, 16 at a time)      111.41     44.99      0.07             0.12
+before                                    110.00     45.56      0.34             0.37
+after                                     111.31     45.01      0.07             0.13
+
+(the draws alone, a window earlier: 0.37 / 0.37 -> 0.15 / 0.14 ms a round, 110.20 / 109.48 -> 110.23 / 110.17 tok/s)
+
+The candidates' search alone (129,280 logits a row, 28 candidates, 64 rows of synthetic logits; ties, NaN and
+infinities among them; 0 differences in 320 comparisons):
+                  one at a time   16 at a time
+big core          71.7 us         17.1 us
+little core       125.9 us        27.7 us

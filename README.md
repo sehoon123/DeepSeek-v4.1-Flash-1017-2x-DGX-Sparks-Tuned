@@ -57,6 +57,9 @@ their repository's.
 - **Short prompts 20 % sooner**: `zig/patches/0028`. A chunk's Engram table rows are read from the NVMe once each (a
   third or more of its n-grams name a row another one names), and the rows read last stay in host memory (256 MiB a
   Spark), so a conversation's next turn reads only what is new; the first chunk of every request waits for those reads.
+- **Sampled decoding ~1.2 % faster**: `zig/patches/0029`. Between a round and the next, the host drew each row's token
+  from its logits: their copy (~3 MB a round, to pageable memory) took 0.37 ms and the top-k search over the 129K
+  vocabulary 0.37 ms; with pinned memory and the search 16 logits at a time, 0.07 + 0.12 ms. The same bits.
 - **A conversation's next turn up to ~60 % sooner (optional)**: `tools/warm_ahead_proxy.py`, an OpenAI / Anthropic API
   proxy in front of the server. While a client is idle after a reply, it has the server's prompt cache keep the state at
   the next 2,048-token chunk end the conversation and its reply reached, so the next turn resumes there instead of

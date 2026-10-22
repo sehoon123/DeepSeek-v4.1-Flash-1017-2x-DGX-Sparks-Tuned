@@ -62,7 +62,7 @@ sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned
   above, "this project" and "this repository", and their issue and pull-request numbers, mean Mia's AI Lab's repository.
 
   What was changed (Apache-2.0, section 4(b)):
-  - zig/patches/0010-0019 and 0021-0028 (added): changes to BertholomusAI's engine, this repository's work under Apache-2.0; the code they
+  - zig/patches/0010-0019 and 0021-0029 (added): changes to BertholomusAI's engine, this repository's work under Apache-2.0; the code they
     modify, and quote as diff context, stays under its authors' license (see "The DeepSeek-V4.1-Flash family" above).
   - zig/kit-patches/0001-experts-mma-three-programs.patch and zig/kit-patches/build_experts.py (added): a change to
     src/tensorfold/cuda/exl3/experts_grouped.cuh of BertholomusAI's TensorFold (branch deepseek-v41-tp2, Apache-2.0; its EXL3
