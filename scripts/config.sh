@@ -116,6 +116,9 @@ PARALLEL="${PARALLEL:-4}"              # requests at once (the engine's streams,
 ROUND_ROWS="${ROUND_ROWS:-32}"         # a decode round's rows at most, 16 to 48 (this recipe: 32, for wide copy windows; 48 copies faster
                                        # for ~0.3 GiB more of each Spark's memory, README "Memory and safety"; 16: the engine's)
 MAX_TOKENS="${MAX_TOKENS:-32768}"      # a reply's budget when a request sets none
+# The prompt cache's budget a Spark, GiB (unset: the server's 0.5). A kept state is ~7 MiB at 30-40K tokens (the
+# prompt's cache rows stay in the KV pool), so 1 GiB keeps ~140 of them: more conversations resume where they stopped.
+PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-}"
 THINKING="${THINKING:-1}"              # think first unless a request turns it off
 # The reasoning effort when a request names none: low, medium, high or xhigh (empty: the chat template's default)
 REASONING_EFFORT="${REASONING_EFFORT:-}"
