@@ -63,6 +63,9 @@ their repository's.
 - **A long conversation's next request read ~55 ms sooner**: `zig/patches/0030`. The server tokenized every request
   whole (57 ms at 133K tokens); it keeps the last long texts' ids and encodes only what follows the previous reply
   (2-3 ms). The same ids.
+- **Long prompts' prefill another 3-4 % faster**: `TF_DS_IDX_SPLIT=1` (MiaAI-Lab's `zig/patches/0001`, now on for every
+  eligible chunk): the prefill indexer's rows are split between the two Sparks (161K tokens 71.3 -> 68.3 s, 43K -0.95 %,
+  16K the same; the same bits).
 - **A quiet server no longer spins a core on each Spark**: `zig/patches/0032`, MiaAI-Lab's RDMA idle nap (their 0010,
   unchanged; TensorFold PR #27 by William J Riley): the gather proxy sleeps between looks after 2 s with nothing to do
   (99.9 -> 0.3 % of a core idle); decode is the same (+0.06 %).

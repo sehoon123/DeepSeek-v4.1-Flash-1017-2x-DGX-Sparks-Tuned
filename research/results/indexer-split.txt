@@ -1,0 +1,13 @@
+The prefill indexer split (zig/patches/0001, MiaAI-Lab's: TP2 splits prompt_keys row blocks between the ranks and
+all-gathers their selections, the same bits), on this recipe's stack (pairs, overlap, 48-row windows; tf-dsv41-lanes,
+one stream, fresh prompts, prefill seconds)
+
+prompt        no split        split from token 131,072      split every eligible chunk (TF_DS_IDX_SPLIT=1)
+16,384        -               7.12 / 7.18                   7.14 / 7.16   (+0.00 %)
+42,825        17.83 / 17.84   17.86 / 17.95 (18.06 / 17.87) 17.72 / 17.75 (-0.95 % against 131,072; 17.75 once more)
+161,190       71.18 / 71.40   70.09 / 70.39 (70.15 / 70.25) 68.24 / 68.39 (-2.74 %; 68.46 once more; -4.2 % against none)
+
+Every run's tokens equal to the first's (nine runs). MiaAI-Lab's later revision of 0001 (commit 2550cda4 by aaa4xu)
+splits by default only from 65,536 compressed keys (token 131,072), where it measured +4.25 % at 256K and +7.46 % at
+400K and kept 8K / 32K within 0.9 %; here the split pays from ~40K on and costs nothing at 16K, so this recipe sets
+TF_DS_IDX_SPLIT=1 (every eligible chunk), which its 0001 already reads.
