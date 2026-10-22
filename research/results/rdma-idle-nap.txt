@@ -1,0 +1,9 @@
+zig/patches/0032 (MiaAI-Lab's 0010-rdma-idle-nap.patch, unchanged; RDMA_IDLE_S 2, RDMA_NAP_US 500), served
+
+Idle server, the busiest thread of each rank's process (top -H, 3 s):
+                    before            with the nap
+rank 0 (head)       99.9 %            0.3 %
+rank 1 (worker)     99.9 %            0.3 %
+
+Sampled decode (T=1, prose and code at 1 / 2 / 4 streams, two waves each), against the same probe before the patch:
+geomean +0.06 % (each wave -0.3 to +0.8 %): decode's gathers never nap. Edit probe 20/20 equal to the reference.

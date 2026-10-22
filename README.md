@@ -63,6 +63,9 @@ their repository's.
 - **A long conversation's next request read ~55 ms sooner**: `zig/patches/0030`. The server tokenized every request
   whole (57 ms at 133K tokens); it keeps the last long texts' ids and encodes only what follows the previous reply
   (2-3 ms). The same ids.
+- **A quiet server no longer spins a core on each Spark**: `zig/patches/0032`, MiaAI-Lab's RDMA idle nap (their 0010,
+  unchanged; TensorFold PR #27 by William J Riley): the gather proxy sleeps between looks after 2 s with nothing to do
+  (99.9 -> 0.3 % of a core idle); decode is the same (+0.06 %).
 - **A request arriving during another's long prompt starts in ~2 s, not after it**: `zig/patches/0031`,
   `PREFILL_NEST_TOKENS=8192`. Such a request whose own pass needs at most that many tokens (past its kept state) runs
   between two of the long pass's chunks: a 1.9K-token request sent 3 s into a 68.6K-token prompt had its first token
