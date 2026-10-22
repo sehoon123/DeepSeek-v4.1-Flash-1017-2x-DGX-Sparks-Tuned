@@ -156,6 +156,10 @@ export TF_DS_GRAPH_CAP="${TF_DS_GRAPH_CAP:-128}"
 # experts in one call (zig/patches/0025; 0: one chunk at a time). Prefill 5-14 % faster (more on longer prompts) for
 # ~1.0 GiB more arena a Spark; the replies are the same.
 export TF_DS_PAIR="${TF_DS_PAIR:-1}"
+# zig/patches/0001 (MiaAI-Lab's): the prefill indexer's rows split between the two ranks, their selections all-gathered
+# (the same bits). 1: every eligible chunk. Measured here against splitting only from token 131,072 (MiaAI-Lab's later
+# default): 16K +0.00 %, 42.8K -0.95 %, 161K -2.74 % (-4.2 % against no split); unset or 0: no split (the pinned path).
+export TF_DS_IDX_SPLIT="${TF_DS_IDX_SPLIT:-1}"
 # The codebook experts cubin the engine loads (zig/patches/0027): the image's rebuild with zig/kit-patches (the prompt
 # gate / up kernel three programs an SM; every output the same bits). Set it empty for the kit's cubins/experts_cb.cubin.
 export TF_DS_EXPERTS_CUBIN="${TF_DS_EXPERTS_CUBIN-/opt/tensorfold/kit-overlay/experts_cb.cubin}"
