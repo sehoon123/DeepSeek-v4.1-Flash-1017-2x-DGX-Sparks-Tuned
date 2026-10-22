@@ -144,6 +144,11 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   [`4803479e`](https://github.com/bertholomus/TensorFold/commit/4803479e8f074f8b95b5f0573ff8bf625efc2ded) of BertholomusAI's
   TensorFold fork by **Manrique** ([@hashd1ve](https://github.com/hashd1ve)), merged there as pull request #25 after this
   recipe's engine pin, carried unchanged with its header (Apache-2.0): DSML tool calls read from their own tags.
+- **`zig/patches/0032-rdma-idle-nap.patch`** is MiaAI-Lab's `zig/patches/0010-rdma-idle-nap.patch`
+  ([their repository](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks) at `370daf0c`), carried
+  unchanged, with their `RDMA_IDLE_S` / `RDMA_NAP_US` settings: the RDMA gather proxy's idle nap by
+  **William J Riley** ([willjriley](https://github.com/willjriley); [TensorFold PR #27](https://github.com/bertholomus/TensorFold/pull/27)),
+  ported to the Zig ring by MiaAI-Lab.
 - The copy windows widen the engine's own copy proposals; checking text copied from the context in one pass is the idea of
   prompt lookup decoding (Apoorv Saxena, 2023).
 

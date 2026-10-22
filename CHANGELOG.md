@@ -5,6 +5,9 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **The RDMA proxy naps when idle** (`zig/patches/0032`: MiaAI-Lab's `0010-rdma-idle-nap.patch`, unchanged, with their
+  `RDMA_IDLE_S` 2 and `RDMA_NAP_US` 500; William J Riley's TensorFold PR #27): a quiet server no longer spins a core on
+  each Spark; decode's gathers never nap.
 - **Requests needing little fill inside a long prompt pass** (`zig/patches/0031`, `PREFILL_NEST_TOKENS`, 8192): a
   request that arrives during another's prompt pass and would prefill at most that many tokens runs its whole pass
   between two of the long one's chunks (the long pass then sets its slot up again on both ranks and reads its next

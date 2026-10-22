@@ -168,6 +168,10 @@ export TF_DS_ENGRAM_CACHE_MB="${TF_DS_ENGRAM_CACHE_MB:-256}"
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
 # NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).
 RDMA="${RDMA:-1}"
+# zig/patches/0032 (MiaAI-Lab's 0010, unchanged): the RDMA proxy naps once quiet for RDMA_IDLE_S seconds, RDMA_NAP_US
+# between looks. 0 keeps the always-spinning proxy (the stock engine's behavior). A decode round's gathers never see a nap.
+RDMA_IDLE_S="${RDMA_IDLE_S:-2}"       # 0 to 3600 seconds
+RDMA_NAP_US="${RDMA_NAP_US:-500}"    # 1 to 1000000 microseconds; bounds wake and shutdown delay
 GRAPHS="${GRAPHS:-1}"
 SIDE="${SIDE:-1}"
 PREFETCH="${PREFETCH:-1}"
