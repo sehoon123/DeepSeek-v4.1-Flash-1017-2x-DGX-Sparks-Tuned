@@ -1,0 +1,21 @@
+Engram table reads (zig/patches/0028), 2026-10-22, GB10 pair.
+
+Simulation (no engine): the engine's Engram hash (engram.zig Hasher.hashes) in Python, equal to the kit's engram.json
+cases (6 of 6). Stream: 300,000 tokens (DeepSeek-V4.1 tokenizer) of the engine's Zig sources and this recipe's .md / .py
+/ .sh files in a shuffled order, cut into 2,048-token chunks (146); per chunk and rank its rows (2 layers x 12 columns
+x 2,048 positions = 49,152, 24,576 a layer), the distinct ones, and hits in an LRU of the distinct rows read before.
+  rank 0 (columns 0-11): distinct 53.6 % of the ids; LRU 256K rows 36.6 %, 1M rows 49.6 %, 4M rows 52.0 % of the
+                         distinct found -> reads left 34.0 / 27.0 / 25.8 % of today's
+  rank 1 (columns 12-23): distinct 70.3 %; LRU 17.4 / 25.5 / 30.9 % -> reads left 58.1 / 52.4 / 48.6 %
+  (a 1M-row cache is ~264 MiB of rows: 256 FP8 values and 8 scales each)
+
+Engine (harness, one stream, each run its own process; prompts sh0-sh5: 1,628 tokens each from one long document at
+different offsets, md0-md2: 4,000 tokens, then 16,384 and 32,063; prefill seconds; off = TF_DS_ENGRAM_DEDUP=0
+TF_DS_ENGRAM_CACHE_MB=0, on = the defaults):
+                 1.6K (mean of 6)   4K (mean of 3)   16K     32K
+  off            1.243              2.097            7.17    13.76
+  on             0.998              2.023            6.93    13.42
+  the 11 replies' hashes equal between the runs (16K and 32K also their references); rank 0's first chunk-layer:
+  19,536 ids, 11,136 distinct; by the last prompt 549,554 rows found in the cache, 361,242 read.
+Decode with both on: req-test-x 11 of 11 equal (84.78 tokens/s), req-long-x all equal (68.60), four mixed streams 12 of
+12 equal to the no-pairs reference.

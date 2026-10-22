@@ -5,6 +5,13 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **Engram reads: each row once, the recent ones from memory** (`zig/patches/0028`; `TF_DS_ENGRAM_DEDUP=0`,
+  `TF_DS_ENGRAM_CACHE_MB=0` turn them off): a prompt chunk's Engram rows are read from the NVMe once each, however many
+  of its n-grams name them (30-46 % of a chunk's 24,576 ids repeat one), and the rows read last, by prompt chunks and
+  decode rounds, stay in host memory (256 MiB a Spark by default) for later chunks and requests to copy instead of
+  reading. A request's first chunk waits for its first Engram layer's rows, so short prompts gain most: 1.6K-token
+  prompts -20 % prefill time, 4K -3.5 %, 16K -3.3 %, 32K -2.5 % (prompts from one document, as a conversation's turns
+  are). The tables are read-only, so every byte is the same: prefill and decode hashes equal; ~0.3 GiB more a Spark.
 - **The prompt MoE's gate / up kernel three programs an SM** (`zig/kit-patches`, `zig/patches/0027`; `TF_DS_EXPERTS_CUBIN`
   set empty turns it off): the image now rebuilds the kit's `cubins/experts_cb.cubin` from its source (BertholomusAI's
   TensorFold, branch `deepseek-v41-tp2`, at `TF_PY_REF`) with one change to `grouped_mma_kernel`: two row stages instead

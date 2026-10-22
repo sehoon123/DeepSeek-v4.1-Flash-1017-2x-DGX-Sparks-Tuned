@@ -1,0 +1,310 @@
+diff --git a/zig/src/families/dsv41/engram_aio.zig b/zig/src/families/dsv41/engram_aio.zig
+index 2225ad3..579dfc9 100644
+--- a/zig/src/families/dsv41/engram_aio.zig
++++ b/zig/src/families/dsv41/engram_aio.zig
+@@ -60,8 +60,129 @@ const Batch = struct {
+     bytes: []usize,
+     failed: bool = false,
+     touch: bool = false,
++    // the row cache (TF_DS_ENGRAM_CACHE_MB): the rows read (not found there), put there once the batch is in
++    miss: []u32 = &.{}, // indices into the batch's ids of the rows read
++    rows: []u64 = &.{}, // their row ids
++    out_w: ?[*]u8 = null,
++    out_s: ?[*]u8 = null,
++    fd: i32 = -1,
++    base: u64 = 0,
++    row_w: usize = 0,
++    row_s: usize = 0,
+ };
+ 
++/// TF_DS_ENGRAM_CACHE_MB (this recipe; unset: 256, 0: off): the Engram rows read last, in host memory by table and row,
++/// every ring of the process sharing it. A batch copies the rows it finds here and reads only the others; the rows it
++/// read go in once it is in. The tables are read-only files, so a row from here has the bytes its read would have.
++/// Replacement by CLOCK (a row found again is kept a turn longer).
++pub const RowCache = struct {
++    const Key = struct { fd: i32, base: u64, row: u64 };
++    gpa: std.mem.Allocator,
++    mutex: std.Io.Mutex = .init,
++    map: std.AutoHashMapUnmanaged(Key, u32) = .empty,
++    keys: []Key,
++    used: []bool,
++    live: []bool,
++    data: []u8,
++    stride: usize = 0, // the first table's row_w + row_s (a table of other widths is not cached)
++    cap: usize,
++    hand: usize = 0,
++    hits: u64 = 0,
++    misses: u64 = 0,
++
++    fn create(gpa: std.mem.Allocator, mb: usize) !*RowCache {
++        return createRows(gpa, @max(1, mb * (1 << 20) / 272)); // 264 bytes a row (256 FP8 values, 8 scales) and the bookkeeping
++    }
++
++    fn createRows(gpa: std.mem.Allocator, cap: usize) !*RowCache {
++        const c = try gpa.create(RowCache);
++        errdefer gpa.destroy(c);
++        c.* = .{ .gpa = gpa, .keys = try gpa.alloc(Key, cap), .used = try gpa.alloc(bool, cap), .live = try gpa.alloc(bool, cap), .data = &.{}, .cap = cap };
++        @memset(c.used, false);
++        @memset(c.live, false);
++        try c.map.ensureTotalCapacity(gpa, @intCast(2 * cap)); // half full at most: short probes as rows come and go
++        return c;
++    }
++
++    fn destroy(c: *RowCache) void {
++        c.map.deinit(c.gpa);
++        c.gpa.free(c.keys);
++        c.gpa.free(c.used);
++        c.gpa.free(c.live);
++        if (c.data.len > 0) c.gpa.free(c.data);
++        c.gpa.destroy(c);
++    }
++
++    /// The rows of `ids` it holds copied to their places in out_w / out_s; `miss` gets the indices of the others.
++    /// `mutex` held by the caller.
++    fn take(c: *RowCache, t: engram_io.Table, fd: i32, ids: []const i64, out_w: []u8, out_s: []u8, gpa: std.mem.Allocator, miss: *std.ArrayList(u32)) !void {
++        const fits = c.stride == 0 or c.stride == t.row_w + t.row_s;
++        for (ids, 0..) |id, i| {
++            if (fits) if (c.map.get(.{ .fd = fd, .base = t.base_w, .row = @intCast(id) })) |at| {
++                const src = c.data[@as(usize, at) * c.stride ..];
++                @memcpy(out_w[i * t.row_w ..][0..t.row_w], src[0..t.row_w]);
++                @memcpy(out_s[i * t.row_s ..][0..t.row_s], src[t.row_w..][0..t.row_s]);
++                c.used[at] = true;
++                c.hits += 1;
++                continue;
++            };
++            c.misses += 1;
++            try miss.append(gpa, @intCast(i));
++        }
++    }
++
++    /// A batch's rows read, from where they landed. `mutex` held by the caller.
++    fn put(c: *RowCache, b: *const Batch) void {
++        if (b.out_w == null or b.miss.len == 0) return;
++        if (c.stride == 0) {
++            c.stride = b.row_w + b.row_s;
++            c.data = c.gpa.alloc(u8, c.cap * c.stride) catch {
++                c.cap = 0;
++                return;
++            };
++        }
++        if (c.cap == 0 or c.stride != b.row_w + b.row_s) return;
++        for (b.miss, b.rows) |i, row| {
++            const key: Key = .{ .fd = b.fd, .base = b.base, .row = row };
++            if (c.map.contains(key)) continue;
++            // CLOCK: pass the rows found since the hand last came by, take the next one
++            while (c.live[c.hand] and c.used[c.hand]) {
++                c.used[c.hand] = false;
++                c.hand = (c.hand + 1) % c.cap;
++            }
++            const at = c.hand;
++            if (c.live[at]) _ = c.map.remove(c.keys[at]);
++            c.keys[at] = key;
++            c.live[at] = true;
++            c.used[at] = false;
++            const dst = c.data[at * c.stride ..];
++            @memcpy(dst[0..b.row_w], b.out_w.?[@as(usize, i) * b.row_w ..][0..b.row_w]);
++            @memcpy(dst[b.row_w..][0..b.row_s], b.out_s.?[@as(usize, i) * b.row_s ..][0..b.row_s]);
++            c.map.putAssumeCapacity(key, @intCast(at));
++            c.hand = (c.hand + 1) % c.cap;
++        }
++    }
++};
++
++/// The process's row cache (every Aio's), made with the first ring; null: none (TF_DS_ENGRAM_CACHE_MB=0).
++var row_cache: ?*RowCache = null;
++var row_cache_made = false;
++var cache_io: std.Io = undefined;
++
++fn cacheMb() usize {
++    if (@import("builtin").is_test) return 0; // tests make their own
++    const v = std.c.getenv("TF_DS_ENGRAM_CACHE_MB") orelse return 256;
++    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 256;
++}
++
++/// The cache's counts (rows found, rows read) and rows held, for a log line.
++pub fn cacheStats() ?[3]u64 {
++    const c = row_cache orelse return null;
++    c.mutex.lockUncancelable(cache_io);
++    defer c.mutex.unlock(cache_io);
++    return .{ c.hits, c.misses, c.map.count() };
++}
++
+ pub const Aio = struct {
+     gpa: std.mem.Allocator,
+     io: std.Io,
+@@ -81,6 +202,12 @@ pub const Aio = struct {
+         a.* = .{ .gpa = gpa, .io = io, .ring = try gpa.alignedAlloc(u8, .fromByteUnits(block), slots * slot), .slots = slots };
+         errdefer gpa.free(a.ring);
+         if (linux.errno(ioSetup(@intCast(@min(slots, 65536)), &a.ctx)) != .SUCCESS) return error.AioUnavailable;
++        if (!row_cache_made) {
++            row_cache_made = true;
++            cache_io = io;
++            const mb = cacheMb();
++            if (mb > 0) row_cache = RowCache.create(gpa, mb) catch null;
++        }
+         return a;
+     }
+ 
+@@ -108,6 +235,8 @@ pub const Aio = struct {
+         a.gpa.free(b.dst);
+         a.gpa.free(b.skew);
+         a.gpa.free(b.bytes);
++        if (b.miss.len > 0) a.gpa.free(b.miss);
++        if (b.rows.len > 0) a.gpa.free(b.rows);
+     }
+ 
+     /// Whatever has completed (no wait): rows copied out, batches counted down. Holds `mutex`.
+@@ -135,7 +264,13 @@ pub const Aio = struct {
+     /// The submission (`mutex` held): rows `ids` of table `t`, a weight then a scale read each, copied into out_w /
+     /// out_s as they complete when given (null: a touch). Returns the batch id.
+     fn submitLocked(a: *Aio, t: engram_io.Table, ids: []const i64, out_w: ?[]u8, out_s: ?[]u8) !u64 {
+-        const reads = 2 * ids.len;
++        return a.submitSome(t, ids, null, out_w, out_s);
++    }
++
++    /// submitLocked of the rows ids[sel[..]] only (sel: owned by the batch from here; null: every row).
++    fn submitSome(a: *Aio, t: engram_io.Table, ids: []const i64, sel: ?[]u32, out_w: ?[]u8, out_s: ?[]u8) !u64 {
++        const nrows = if (sel) |q| q.len else ids.len;
++        const reads = 2 * nrows;
+         if (reads > a.slots or reads >= 1 << 20) return error.TooManyRows;
+         if (t.row_w + block > slot or t.row_s + block > slot) return error.RowTooWide;
+         const fd_w = if (t.fd_wd >= 0) t.fd_wd else t.fd_w;
+@@ -166,12 +301,23 @@ pub const Aio = struct {
+             .skew = try a.gpa.alloc(usize, reads),
+             .bytes = try a.gpa.alloc(usize, reads),
+         };
++        if (sel) |q| {
++            b.miss = q;
++            b.rows = try a.gpa.alloc(u64, q.len);
++            for (q, b.rows) |i, *r| r.* = @intCast(ids[i]);
++            b.out_w = out_w.?.ptr;
++            b.out_s = out_s.?.ptr;
++            b.fd = t.fd_w;
++            b.base = t.base_w;
++            b.row_w = t.row_w;
++            b.row_s = t.row_s;
++        }
+         const cbs = try a.gpa.alloc(Iocb, reads);
+         defer a.gpa.free(cbs);
+         const ptrs = try a.gpa.alloc(*Iocb, reads);
+         defer a.gpa.free(ptrs);
+         for (0..reads) |j| {
+-            const i = j >> 1;
++            const i: usize = if (sel) |q| q[j >> 1] else j >> 1;
+             const sc = j & 1 == 1;
+             const rb = if (sc) t.row_s else t.row_w;
+             const row: u64 = @intCast(ids[i]);
+@@ -224,7 +370,17 @@ pub const Aio = struct {
+         if (out_w.len < ids.len * t.row_w or out_s.len < ids.len * t.row_s) return error.BadSize;
+         a.mutex.lockUncancelable(a.io);
+         defer a.mutex.unlock(a.io);
+-        return a.submitLocked(t, ids, out_w, out_s);
++        const c = row_cache orelse return a.submitLocked(t, ids, out_w, out_s);
++        var miss: std.ArrayList(u32) = .empty;
++        errdefer miss.deinit(a.gpa);
++        {
++            c.mutex.lockUncancelable(cache_io);
++            defer c.mutex.unlock(cache_io);
++            try c.take(t, t.fd_w, ids, out_w, out_s, a.gpa, &miss);
++        }
++        const sel = try miss.toOwnedSlice(a.gpa);
++        errdefer a.gpa.free(sel);
++        return a.submitSome(t, ids, sel, out_w, out_s);
+     }
+ 
+     /// A touch of rows `ids`: their reads submitted, nothing copied, nobody waits (the lane hands these to a thread of
+@@ -244,6 +400,11 @@ pub const Aio = struct {
+             a.reap();
+             if (b.left == 0) {
+                 const failed = b.failed;
++                if (!failed) if (row_cache) |c| {
++                    c.mutex.lockUncancelable(cache_io);
++                    defer c.mutex.unlock(cache_io);
++                    c.put(b);
++                };
+                 if (a.batches.fetchRemove(id)) |kv| a.freeBatch(kv.value);
+                 for (a.live.items, 0..) |l, k| if (l[0] == id) {
+                     _ = a.live.orderedRemove(k);
+@@ -305,4 +466,27 @@ test "AIO rows equal the pool's, across a ring that wraps" {
+     var big_s: [9 * 3]u8 = undefined;
+     const nine: [9]i64 = @splat(0);
+     try std.testing.expectError(error.TooManyRows, aio.start(tab, &nine, &big_w, &big_s));
++    // the row cache: rows found there (a cache of 8 rows, ids from 20, so rows come back and get evicted) equal the
++    // reads' bytes, and dropping it leaves no allocation behind
++    const c = try RowCache.createRows(a, 8);
++    row_cache = c;
++    cache_io = io;
++    defer {
++        row_cache = null;
++        c.destroy();
++    }
++    for (0..40) |_| {
++        var ids: [6]i64 = undefined;
++        for (&ids) |*x| x.* = prng.random().intRangeLessThan(i64, 0, 20);
++        var want_w: [6 * 100]u8 = undefined;
++        var want_s: [6 * 3]u8 = undefined;
++        try pool.gather(tab, &ids, &want_w, &want_s);
++        var got_w: [6 * 100]u8 = @splat(0);
++        var got_s: [6 * 3]u8 = @splat(0);
++        const id = try aio.start(tab, &ids, &got_w, &got_s);
++        try aio.wait(id);
++        try std.testing.expectEqualSlices(u8, &want_w, &got_w);
++        try std.testing.expectEqualSlices(u8, &want_s, &got_s);
++    }
++    try std.testing.expect(c.hits > 0 and c.misses > 0);
+ }
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 1b57cb7..8ea7fa0 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -1388,6 +1388,50 @@ fn lap(e: *const Engine, eh: *const EngramHost, t: *u64) u64 {
+ /// ~0.5 s on one GB10): batches of a quarter of the ring's slots (two reads a row), all submitted (a submit reaps while the
+ /// ring is full), then waited for in order.
+ fn aioGather(aio: *engram_aio.Aio, t: engram_io.Table, ids: []const i64, out_w: []u8, out_s: []u8) !void {
++    if (ids.len < 64 or !dedupOn()) return aioGatherAll(aio, t, ids, out_w, out_s);
++    // TF_DS_ENGRAM_DEDUP: each row the chunk names read once (a third to a half of a chunk's ids name a row named
++    // before in it), then copied to every place that names it: the same bytes in the same places
++    const gpa = aio.gpa;
++    var first: std.AutoHashMapUnmanaged(i64, u32) = .empty;
++    defer first.deinit(gpa);
++    try first.ensureTotalCapacity(gpa, @intCast(ids.len));
++    const slot_of = try gpa.alloc(u32, ids.len);
++    defer gpa.free(slot_of);
++    var uniq: std.ArrayList(i64) = .empty;
++    defer uniq.deinit(gpa);
++    try uniq.ensureTotalCapacity(gpa, ids.len);
++    for (ids, slot_of) |id, *sl| {
++        const gop = first.getOrPutAssumeCapacity(id);
++        if (!gop.found_existing) {
++            gop.value_ptr.* = @intCast(uniq.items.len);
++            uniq.appendAssumeCapacity(id);
++        }
++        sl.* = gop.value_ptr.*;
++    }
++    const u = uniq.items.len;
++    if (u == ids.len) return aioGatherAll(aio, t, ids, out_w, out_s);
++    const uw = try gpa.alloc(u8, u * t.row_w);
++    defer gpa.free(uw);
++    const us = try gpa.alloc(u8, u * t.row_s);
++    defer gpa.free(us);
++    try aioGatherAll(aio, t, uniq.items, uw, us);
++    if (std.c.getenv("TF_DS_ENGRAM_CACHE_LOG") != null) if (engram_aio.cacheStats()) |st|
++        std.log.info("engram rows: {d} named, {d} distinct; cache {d} found, {d} read, {d} held", .{ ids.len, u, st[0], st[1], st[2] });
++    for (slot_of, 0..) |sl, i| {
++        const at: usize = sl;
++        @memcpy(out_w[i * t.row_w ..][0..t.row_w], uw[at * t.row_w ..][0..t.row_w]);
++        @memcpy(out_s[i * t.row_s ..][0..t.row_s], us[at * t.row_s ..][0..t.row_s]);
++    }
++}
++
++/// TF_DS_ENGRAM_DEDUP (this recipe; unset or 1: on, 0: off): a prompt chunk's Engram rows read once each.
++fn dedupOn() bool {
++    const v = std.c.getenv("TF_DS_ENGRAM_DEDUP") orelse return true;
++    return !std.mem.eql(u8, std.mem.span(v), "0");
++}
++
++/// aioGather's reads of every row of `ids` as given.
++fn aioGatherAll(aio: *engram_aio.Aio, t: engram_io.Table, ids: []const i64, out_w: []u8, out_s: []u8) !void {
+     const per = @max(aio.slots / 4, 1);
+     var batch: [64]u64 = undefined;
+     var nb: usize = 0;

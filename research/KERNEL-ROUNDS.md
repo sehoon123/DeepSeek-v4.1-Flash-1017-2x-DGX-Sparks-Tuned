@@ -290,6 +290,27 @@ chunks' Engram reads earlier on a ring of their own: -9.4 / -12.5 / -13.9 % pref
   spills cost more than the extra programs hide. Four streams' round rows (16 / 24 / 32 / 48) decode the same (~38.1 a
   stream); with copies 48 rows +7.0 % against 32.
 
+## Round 18: Engram's table reads, and the prompt MoE kernels once more (2026-10-22, `zig/patches/0028`, `results/engram-reads.txt`)
+
+A request's first chunk waits for its first Engram layer's rows (~200-290 ms) with only the embedding and layer 0 on
+the GPU, and the NVMe serves them at its random-read rate (two 4 KiB reads a row: its 256 FP8 values and its 8 scales;
+reading on two rings was no faster). Reading fewer rows is what helps. The engine's n-gram hash, ported to Python and
+checked against the kit's six `engram.json` cases, over a code-heavy stream (300K tokens of the engine's sources and
+this recipe's files, 146 chunks): 46 % of a chunk's ids on rank 0 (its columns: the 2- and 3-grams) and 30 % on rank 1
+(3- and 4-grams) repeat a row named before in the same chunk, and of the distinct rows a 264 MiB cache of the rows
+read before holds 50 % (rank 0) and 26 % (rank 1): 27 % and 52 % of today's reads left. `zig/patches/0028` reads a
+prompt chunk's distinct rows only (then copies them to every place that names them) and keeps the rows read last, by
+prompt chunks and decode rounds, in host memory (256 MiB a Spark, CLOCK replacement), for every ring of the process.
+The tables are read-only files, so every row has the bytes its read would have. Engine, one stream, prompts from one
+document: 1.6K tokens 1.243 -> 0.998 s (-20 %), 4K -3.5 %, 16K -3.3 %, 32K -2.5 %; every prefill and decode hash equal
+(11 prompts and their 4-token replies, `req-test-x`, `req-long-x`, four mixed streams).
+
+Negative, the same bits each time: the experts' input rotation (`rot_in_kernel`, one warp a 128-value block, ~171 GB/s
+of writes on a pair) with eight warps a program (7.4 ms against 3.4 on a pair: rows scattered) or one warp walking a
+row's 40 blocks (3.5 ms); the down kernel (`grouped_rows_kernel`, 255 registers, two 4-warp programs an SM) forced to
+three or four programs (168 or 128 registers: +43 % / +310 % on a pair) and its smaller tilings forced likewise (4,2,2 /
+8,1,1 at three or four programs: +6 to +45 %).
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels

@@ -54,6 +54,9 @@ their repository's.
   work; ~1.1 GiB more arena a Spark. And the prompt MoE's gate / up kernel runs three programs an SM instead of two
   (`zig/kit-patches`, the kit's experts cubin rebuilt from its source in the image, `zig/patches/0027`): prefill another
   2-3 %, the same bits.
+- **Short prompts 20 % sooner**: `zig/patches/0028`. A chunk's Engram table rows are read from the NVMe once each (a
+  third or more of its n-grams name a row another one names), and the rows read last stay in host memory (256 MiB a
+  Spark), so a conversation's next turn reads only what is new; the first chunk of every request waits for those reads.
 - **The drafter's confidence head when the stock shards are gone.** Mia's AI Lab's recipe gives the overlay's F32 copy of
   `mtp.2.confidence_head.proj.weight` stock's F16 bytes back (`scripts/ablit_stock_dtypes.py`), which needs the stock
   shards. When they are gone, preparation checks the head and writes it to `conf_head_f32.bin`, and both ranks load it
@@ -82,8 +85,8 @@ hashes: 62 of 62 copy-window runs (copies 0-90 % wrong, three streams at once, t
 611 decodes of the later offline runs, up to 125K-token prompts, and every run of the kernel rounds (patch 0019), none
 different ([research/](research/README.md)).
 
-The image is Mia's AI Lab's with these eighteen patches added and the kit's experts cubin rebuilt with `zig/kit-patches`
-(`tensorfold-dsv41:exl3-tp2-faa0332ca029`). None is published, so the first `./start.sh` builds it on the head (two Zig
+The image is Mia's AI Lab's with these nineteen patches added and the kit's experts cubin rebuilt with `zig/kit-patches`
+(`tensorfold-dsv41:exl3-tp2-c5efaf7a1b56`). None is published, so the first `./start.sh` builds it on the head (two Zig
 builds and the cubin, ~8 minutes) and copies it to the worker.
 
 <!-- MEASURED -->

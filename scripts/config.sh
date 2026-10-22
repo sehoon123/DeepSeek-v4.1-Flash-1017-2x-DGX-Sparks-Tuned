@@ -156,6 +156,11 @@ export TF_DS_PAIR="${TF_DS_PAIR:-1}"
 # The codebook experts cubin the engine loads (zig/patches/0027): the image's rebuild with zig/kit-patches (the prompt
 # gate / up kernel three programs an SM; every output the same bits). Set it empty for the kit's cubins/experts_cb.cubin.
 export TF_DS_EXPERTS_CUBIN="${TF_DS_EXPERTS_CUBIN-/opt/tensorfold/kit-overlay/experts_cb.cubin}"
+# Engram's table reads (zig/patches/0028): a prompt chunk's rows read once each however many of its n-grams name them
+# (TF_DS_ENGRAM_DEDUP, 0: off), and the rows read last kept in host memory (TF_DS_ENGRAM_CACHE_MB a Spark, 0: off),
+# so a chunk reads from the NVMe only the rows neither holds. The same bytes either way; ~0.3 GiB more a Spark.
+export TF_DS_ENGRAM_DEDUP="${TF_DS_ENGRAM_DEDUP:-1}"
+export TF_DS_ENGRAM_CACHE_MB="${TF_DS_ENGRAM_CACHE_MB:-256}"
 # The engine's settings as BertholomusAI's served two-node launch has them: CUDA graphs, the mixes' side stream, the
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
 # NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).
