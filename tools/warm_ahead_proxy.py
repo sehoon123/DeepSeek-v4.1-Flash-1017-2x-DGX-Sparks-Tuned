@@ -429,7 +429,8 @@ def schedule(api, path, body, who, reply):
 
     def idle():
         with W.lock:
-            return W.gen == gen and W.inflight == 0 and W.conn is None
+            ok = W.gen == gen and W.inflight == 0 and W.conn is None
+        return ok and server_idle()
 
     tool_turn = reply.finish in ("tool_calls", "tool_use")
     delay = WARM_DELAY_TOOL if tool_turn else WARM_DELAY
@@ -437,6 +438,17 @@ def schedule(api, path, body, who, reply):
     def later():
         if delay > 0:
             time.sleep(delay)
+        # a request of another client (one not coming through this proxy) on the server: wait for it to end, up to
+        # 2 minutes, as long as this client sends nothing
+        for _ in range(240):
+            with W.lock:
+                if W.gen != gen or W.inflight > 0 or W.conn is not None:
+                    return
+            if server_idle():
+                break
+            time.sleep(0.5)
+        else:
+            return
         if not idle():
             return
         data, note, route = plan(api, path, body, msgs, m, reply.prompt_tokens, reply.completion_tokens)
@@ -469,9 +481,20 @@ def schedule(api, path, body, who, reply):
     threading.Thread(target=later, daemon=True).start()
 
 
+def server_idle():
+    """No request on the server, ours or another client's (one that does not come through this proxy)."""
+    try:
+        with urllib.request.urlopen(f"http://{BACKEND[0]}:{BACKEND[1]}/health", timeout=3) as r:
+            live = json.loads(r.read()).get("live") or {}
+        return live.get("connections", 0) == 0 and live.get("waiting", 0) == 0
+    except (OSError, ValueError):
+        return False
+
+
 def quiet(seconds):
     with W.lock:
-        return W.inflight == 0 and W.conn is None and time.time() - W.last_start >= seconds
+        ok = W.inflight == 0 and W.conn is None and time.time() - W.last_start >= seconds
+    return ok and server_idle()
 
 
 def send_warm(route, data):

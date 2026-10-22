@@ -29,3 +29,9 @@ After a server restart (the proxy saw it unreachable, then healthy, then 30 s wi
 conversation (38,602 tokens with its reply) re-run in pieces of 16,384 tokens, each resuming the last
 (16,384 -> 32,768 -> 36,864 kept), 20 s. Its next turn (38,615 tokens): resumed 36,864, first token 1.17 s. A second
 conversation of the same size through a proxy with REWARM=0: resumed 0, first token 16.19 s.
+
+Beside requests that do not come through the proxy: a warm-ahead or a re-warm piece is sent only when the server's
+/health shows no request in flight. A tool-call reply's warm-ahead (due at once) while a direct 60K-token request
+prefilled (30.7 s): it waited for that request's end, ran in ~1 s (36,864 -> 38,912), and the next turn resumed 38,912
+(first token 0.477 s). Before this check, re-warms after restarts ran beside direct requests: four follow-up turns of
+1.5-3.3K new tokens took 8.2-10.8 s instead of 1.0-2.0 s.

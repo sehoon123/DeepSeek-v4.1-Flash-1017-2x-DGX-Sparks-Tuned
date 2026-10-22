@@ -444,7 +444,9 @@ reply as the server sent it and learns, per client (its system prompt and tools)
 a client is warmed ahead only once its next request has matched. After the server restarts (the proxy saw it
 unreachable; the prompt cache is empty), the conversations of the last `REWARM_HOURS` (2) run again, in pieces of
 `REWARM_PIECE` tokens (16,384) each keeping its chunk end, while clients are quiet (30 s), so their next turns resume
-where they were (`REWARM=0`: off; conversations are kept in memory only). Measurements: `research/results/warm-ahead.txt`.
+where they were (`REWARM=0`: off; conversations are kept in memory only). Neither a warm-ahead nor a re-warm piece is
+sent while the server has a request in flight, also one that does not come through the proxy (a warm-ahead waits up
+to 2 minutes for it). Measurements: `research/results/warm-ahead.txt`.
 
 ## Memory and safety
 
