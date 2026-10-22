@@ -1,0 +1,320 @@
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 99177d2..fa6034c 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -56,6 +56,13 @@ pub const LaneHost = struct {
+     // chat instead of freezing it for the whole pass; the other jobs' cancels are taken there too (issue #3). The
+     // filling job itself is left alone: its own cancel stays in `cancels` for its pass to see, admissions wait.
+     interleave_ns: i96 = 0,
++    // prompts that need little (TF_DS_PREFILL_NEST_TOKENS, 0/unset: off; with the interleave): when the queue's first
++    // request would prefill at most this many tokens (its prompt past its kept state, no pictures) and a lane is free,
++    // its whole pass runs between two chunks of the pass filling now instead of after it (the backend then sets the
++    // outer pass up again). One level: no pass runs inside the nested one.
++    nest_tokens: u32 = 0,
++    nesting: bool = false,
++    outer: ?*Job = null, // the job whose pass a nested one runs inside: its cancel waits for its own pass too
+     filling: ?*Job = null,
+     between_err: ?anyerror = null,
+ 
+@@ -81,6 +88,7 @@ pub const LaneHost = struct {
+         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
+         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+         kept0: u64 = 0, // the store's kept count when the job looked it up
++        nest_left: ?u32 = null, // what its pass would prefill, as nestable() found it once
+ 
+         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+@@ -118,7 +126,9 @@ pub const LaneHost = struct {
+         enforced.loop_guard = true;
+         var ms: i96 = 0;
+         if (std.c.getenv("TF_DS_PREFILL_INTERLEAVE_MS")) |v| ms = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
+-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .interleave_ns = ms * std.time.ns_per_ms };
++        var nest: u32 = 0;
++        if (std.c.getenv("TF_DS_PREFILL_NEST_TOKENS")) |v| nest = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
++        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .interleave_ns = ms * std.time.ns_per_ms, .nest_tokens = nest };
+     }
+ 
+     pub fn start(h: *LaneHost) !void {
+@@ -284,10 +294,12 @@ pub const LaneHost = struct {
+ 
+     /// takeCancels, except a cancel of `keep` (the job in its prompt pass) stays in `cancels` for that pass to see.
+     fn takeCancelsKeeping(h: *LaneHost, keep: ?Id) void {
++        const outer: ?Id = if (h.outer) |o| o.id else null; // (a nested pass runs: the pass it runs inside ends its own)
+         h.mutex.lockUncancelable(h.io);
+         const ids = h.gpa.dupe(Id, h.cancels.items) catch &.{};
+         h.cancels.clearRetainingCapacity();
+         if (keep) |k| if (std.mem.indexOfScalar(Id, ids, k) != null) h.cancels.append(h.gpa, k) catch {};
++        if (outer) |o| if (o != keep and std.mem.indexOfScalar(Id, ids, o) != null) h.cancels.append(h.gpa, o) catch {};
+         var dropped: std.ArrayList(*Job) = .empty;
+         for (ids) |id| {
+             for (h.queued.items, 0..) |job, i| if (job.id == id) {
+@@ -300,6 +312,7 @@ pub const LaneHost = struct {
+         dropped.deinit(h.gpa);
+         for (ids) |id| {
+             if (keep) |k| if (id == k) continue; // its pass ends it (error.Cancelled) and admitOne finishes it
++            if (outer) |o| if (id == o) continue;
+             for (h.admitted.items, 0..) |job, i| if (job.id == id) {
+                 if (!job.stream.finished) h.core.discard(&job.stream);
+                 h.lock();
+@@ -414,7 +427,29 @@ pub const LaneHost = struct {
+ 
+     fn betweenWanted(ptr: *anyopaque) bool {
+         const h: *LaneHost = @ptrCast(@alignCast(ptr));
+-        return h.core.log == null and h.core.runnableCount() > 0;
++        return h.core.log == null and (h.core.runnableCount() > 0 or h.nestable());
++    }
++
++    /// Whether the queue's first request may fill now, inside the pass filling (TF_DS_PREFILL_NEST_TOKENS): a lane
++    /// free, no pictures, and what its pass would prefill (its prompt past the kept state it resumes) at most
++    /// nest_tokens. Engine thread only (the kept states' store is).
++    fn nestable(h: *LaneHost) bool {
++        if (h.nest_tokens == 0 or h.nesting or h.filling == null) return false;
++        h.lock();
++        defer h.unlock();
++        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) return false;
++        const job = h.queued.items[0];
++        const r = job.request;
++        if (r.images.len > 0) return false;
++        if (job.nest_left == null) {
++            const key = keyOf(r);
++            var at: usize = 0;
++            if (cacheable(r)) if (h.cache) |store| if (store.find(key, r.chunks)) |e| {
++                at = e.at;
++            };
++            job.nest_left = @intCast(@min(key.len -| at, std.math.maxInt(u32)));
++        }
++        return job.nest_left.? <= h.nest_tokens;
+     }
+ 
+     /// Stream.between: decode rounds for the other live streams, interleave_ns at most, between two of the filling
+@@ -422,6 +457,18 @@ pub const LaneHost = struct {
+     fn between(ptr: *anyopaque) anyerror!void {
+         const h: *LaneHost = @ptrCast(@alignCast(ptr));
+         if (h.core.log != null) return; // a step resets the core's arena, which a trail's open events live in
++        // a request needing little waits: its whole pass now, inside this one, and its first token out
++        if (h.nestable()) {
++            const outer = h.filling;
++            h.nesting = true;
++            h.outer = outer;
++            defer {
++                h.nesting = false;
++                h.outer = null;
++                h.filling = outer;
++            }
++            _ = h.admitOne();
++        }
+         const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         while (true) {
+             h.takeCancelsKeeping(if (h.filling) |f| f.id else null);
+@@ -827,4 +874,102 @@ test "prefill interleave: a decoding stream keeps getting tokens and its cancel
+     try std.testing.expectEqual(Reason.cancelled, a.wait());
+ }
+ 
++test "prefill nesting: a request needing little fills inside a long pass and ends first; the outer pass's cancel waits for it" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    host.interleave_ns = 5 * std.time.ns_per_ms;
++    host.nest_tokens = 4;
++    try host.start();
++    defer host.stop();
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        tokens: std.ArrayList(u32) = .empty,
++        done: ?Reason = null,
++        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
++                .finished => |f| b.done = f.reason,
++                else => {},
++            }
++        }
++        fn doneNow(b: *@This()) ?Reason {
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            return b.done;
++        }
++        fn wait(b: *@This()) Reason {
++            while (true) {
++                if (b.doneNow()) |r| return r;
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++        }
++    };
++    const e = host.engine();
++    const prompt_a = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4 }; // ten tokens: not nested itself
++    const prompt_b = [_]u32{ 2, 7, 1 }; // three: fills inside A's pass
++    const Watch = struct {
++        engine: Engine,
++        a_stream: ?*lanes.Stream = null,
++        b: *Box,
++        req_b: *const Request,
++        cancel_a: bool,
++        b_done_at_a_last: ?Reason = null,
++        a_chunks: usize = 0,
++        b_chunks: usize = 0,
++        fn call(ctx: *anyopaque, s: *lanes.Stream, chunk: usize) void {
++            const w: *@This() = @ptrCast(@alignCast(ctx));
++            if (w.a_stream == null) w.a_stream = s;
++            if (s == w.a_stream) {
++                w.a_chunks += 1;
++                if (chunk == 1) w.engine.submit(2, w.req_b, .{ .ctx = w.b, .event = Box.event }) catch {};
++                if (chunk == 5) w.b_done_at_a_last = w.b.doneNow();
++            } else {
++                w.b_chunks += 1;
++                if (w.cancel_a and chunk == 2) w.engine.cancel(1); // A is suspended in its between: its pass ends it
++            }
++        }
++    };
++    target.prefill_chunks = 6;
++    for ([_]bool{ false, true }) |cancel_a| {
++        var a: Box = .{};
++        defer a.tokens.deinit(gpa);
++        var b: Box = .{};
++        defer b.tokens.deinit(gpa);
++        const req_a: Request = .{ .prompt = &prompt_a, .max_tokens = 3 };
++        const req_b: Request = .{ .prompt = &prompt_b, .max_tokens = 5 };
++        var watch = Watch{ .engine = e, .b = &b, .req_b = &req_b, .cancel_a = cancel_a };
++        target.prefill_hook = Watch.call;
++        target.prefill_hook_ctx = &watch;
++        try e.submit(1, &req_a, .{ .ctx = &a, .event = Box.event });
++        try std.testing.expectEqual(Reason.length, b.wait());
++        try std.testing.expectEqual(if (cancel_a) Reason.cancelled else Reason.length, a.wait());
++        try std.testing.expectEqual(@as(usize, 6), watch.b_chunks); // B's whole pass
++        if (!cancel_a) {
++            // B ended while A's pass was still running (its last chunk saw B done), and both decoded their own tokens
++            try std.testing.expectEqual(@as(?Reason, Reason.length), watch.b_done_at_a_last);
++            try std.testing.expectEqual(@as(usize, 6), watch.a_chunks);
++            for ([_]*Box{ &a, &b }, [_][]const u32{ &prompt_a, &prompt_b }) |box, prompt| {
++                var history: std.ArrayList(u32) = .empty;
++                defer history.deinit(gpa);
++                try history.appendSlice(gpa, prompt);
++                for (box.tokens.items) |t| {
++                    try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
++                    try history.append(gpa, t);
++                }
++            }
++        } else try std.testing.expect(watch.a_chunks <= 3); // A's pass saw its cancel at its next chunk
++        while (target.lanes.count() > 0) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++    }
++}
++
+ test { _ = @import("lane_host_test.zig"); }
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index 5608c38..30e8fae 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -115,7 +115,8 @@ pub const Fake = struct {
+             // the host's rounds for the other streams between two chunks, as dsv41's prompt pass offers them
+             if (chunk + 1 < chunks) if (s.between) |b| if (b.wanted(b.ptr)) try b.run(b.ptr);
+         }
+-        const h = &got.value_ptr.history;
++        // (the lane again: another stream's pass may have run inside this one's between, growing the map)
++        const h = &x.lanes.getPtr(s).?.history;
+         s.cached = 0;
+         if (s.reuse.saved) |saved| { // the kept state's tokens stand in for the prompt's first `at`
+             const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 26930dd..bf7ced3 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -55,7 +55,7 @@ pub const image_piece = 32 << 10;
+ pub var logits_sha = false;
+ 
+ /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
+-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_pair = 10 };
++pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_pair = 10, fill_resume = 11 };
+ 
+ /// A frame being written.
+ pub const Wire = struct {
+@@ -344,6 +344,7 @@ pub const Lanes = struct {
+     vision: ?*@import("vision.zig").Vision = null, // rank 0's tower (a vision checkpoint served with its kit's vision/)
+     step: u64 = 0,
+     wire: Wire = .{},
++    fill_passes: u64 = 0, // prompt passes begun: a pass sees whether another ran inside its `between` (a nested one)
+     streams: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
+     wc: [max_window]lanes.config.Cost = undefined, // the window costs (init)
+     sc: [max_rows]lanes.config.Cost = undefined, // the shared forwards' costs (init)
+@@ -639,6 +640,7 @@ pub const Lanes = struct {
+         const ids = s.prompt();
+         const len = ids.len;
+         if (len == 0) return error.EmptyPrompt;
++        self.fill_passes += 1;
+         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
+         if (size > m.pool_cap) return error.PromptTooLong;
+         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
+@@ -809,7 +811,19 @@ pub const Lanes = struct {
+             // a round's own Engram reads would race: joined first, its rows kept for the next chunk)
+             if (start < len and s.images.len == 0) if (s.between) |b| if (b.wanted(b.ptr)) {
+                 m.joinAhead();
++                const passes = self.fill_passes;
+                 try b.run(b.ptr);
++                // another prompt's whole pass ran there (TF_DS_PREFILL_NEST_TOKENS): this pass's slot and extent again
++                // on both ranks (a chunk frame names neither), its sequence for the read-ahead, no rows read for that one
++                if (self.fill_passes != passes) {
++                    if (try self.begin(.fill_resume)) {
++                        try self.wire.int(gpa, u32, @intCast(slot));
++                        try self.wire.int(gpa, u64, base);
++                        try self.flush();
++                    }
++                    try m.fillResume(slot, base);
++                    m.fill_seq = seq.items;
++                }
+             };
+         }
+         if (!head) return error.NoPromptLogits;
+@@ -1250,6 +1264,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+             8 => .fill_images,
+             9 => .done,
+             10 => .fill_pair,
++            11 => .fill_resume,
+             else => return error.BadFrame,
+         };
+         if (try r.int(u64) != step) return error.OutOfStep;
+@@ -1269,6 +1284,14 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
+                 m.fill_seq = seqs[slot].items;
+             },
++            .fill_resume => {
++                // a pass resumed after another prompt's pass ran inside it: its slot (whose ids seqs keeps) again
++                slot = try r.int(u32);
++                const base = try r.int(u64);
++                if (slot >= max_streams) return error.BadSlot;
++                m.fillResume(slot, @intCast(base)) catch |err| refused(err);
++                m.fill_seq = seqs[slot].items;
++            },
+             .fill_chunk => {
+                 const start: usize = @intCast(try r.int(u64));
+                 const n: usize = try r.int(u32);
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index cc6440f..ac5ec31 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -649,6 +649,18 @@ pub const Model = struct {
+         m.fill_slot = slot;
+     }
+ 
++    /// fillBegin again for a pass another prompt's pass ran inside, between two of its chunks (TF_DS_PREFILL_NEST_TOKENS):
++    /// its slot's views, and no Engram rows read ahead (front or back hosts, pairs or not) taken for its next chunk: they
++    /// are keyed by position alone, and the other prompt's chunks may have had this one's.
++    pub fn fillResume(m: *Model, slot: usize, base: usize) !void {
++        m.joinAhead();
++        m.back_spawned = false;
++        inline for (.{ &m.eh, &m.eh2, &m.eh3, &m.eh4 }) |hp| if (hp.*) |*x| {
++            x.ahead_ready = .{ false, false };
++        };
++        try m.fillBegin(slot, base);
++    }
++
+     /// The prompt's chunk of n rows from position `start` (seq: the stream's ids through the chunk's end) through every
+     /// layer with the served bounded replay (replay = the prompt's length - the window: an encoder-only chunk stops at
+     /// the decoder's first layer). A chunk that reaches the head leaves the logits of its last row in ch.head_g and,
