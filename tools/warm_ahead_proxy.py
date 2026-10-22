@@ -37,6 +37,7 @@ from pathlib import Path
 import socket
 import threading
 import time
+import urllib.request
 
 def _addr(v):
     host, _, port = v.rpartition(":")
@@ -57,6 +58,12 @@ WARM_DELAY = float(os.environ.get("WARM_DELAY", "3"))
 WARM_DELAY_TOOL = float(os.environ.get("WARM_DELAY_TOOL", "0"))
 # what the proxy learned of each client (styles, which ones are followed), kept across restarts (hashes only)
 STATE_FILE = os.environ.get("WARM_STATE", str(Path.home() / ".cache/warm-ahead-clients.json"))
+# after the server restarts (its prompt cache empty), the conversations of the last REWARM_HOURS run again in pieces of
+# REWARM_PIECE tokens while clients are quiet, so their next turns resume where they were (REWARM=0: off). Kept in
+# memory only: the proxy never writes a conversation to disk.
+REWARM = os.environ.get("REWARM", "1") != "0"
+REWARM_PIECE = int(os.environ.get("REWARM_PIECE", "16384"))
+REWARM_HOURS = float(os.environ.get("REWARM_HOURS", "2"))
 CHUNK, WINDOW = 2048, 128   # the server's prompt chunk and the decoder's window (states kept at chunk ends <= len - 128)
 CHAT, MESSAGES = "/v1/chat/completions", "/v1/messages"
 NEXT_MIN = 3                # the fewest tokens a next request adds to the shared ones (a message's markers)
@@ -84,6 +91,8 @@ class Warm:
         self.expect = {}        # client -> (api, prefix length, prefix hash, the appended message as predicted)
         self.seen = set()       # clients whose echo matched the prediction (as learned): only these are warmed ahead
         self.given_up = set()   # clients whose echo differs in a way not learned: never warmed ahead
+        self.recent = {}        # client -> (time, path, body, the reply as predicted): the conversations to re-warm
+        self.last_start = 0.0   # the time the last client request arrived
         self.stats = {"sent": 0, "done": 0, "stopped": 0, "echo_same": 0, "echo_learned": 0}
 
 
@@ -404,6 +413,11 @@ def schedule(api, path, body, who, reply):
     if api == CHAT and m.get("content") is None and not m.get("tool_calls"):
         return      # a client drops an empty reply: nothing to append
     W.expect[who] = (api, len(msgs), jhash(msgs), m, reply)
+    if api == CHAT:
+        with W.lock:
+            W.recent[who] = (time.time(), path, body, m)
+            while len(W.recent) > 3:
+                W.recent.pop(min(W.recent, key=lambda k: W.recent[k][0]))
     if len(W.expect) > 64:
         W.expect.pop(next(iter(W.expect)))
     if reply.prompt_tokens is not None and reply.prompt_tokens + (reply.completion_tokens or 0) < CHUNK:
@@ -415,7 +429,7 @@ def schedule(api, path, body, who, reply):
 
     def idle():
         with W.lock:
-            return W.gen == gen and W.inflight == 0
+            return W.gen == gen and W.inflight == 0 and W.conn is None
 
     tool_turn = reply.finish in ("tool_calls", "tool_use")
     delay = WARM_DELAY_TOOL if tool_turn else WARM_DELAY
@@ -430,7 +444,7 @@ def schedule(api, path, body, who, reply):
             log(f"warm-ahead: client {who}: none ({note})")
             return
         with W.lock:
-            if W.gen != gen or W.inflight > 0:
+            if W.gen != gen or W.inflight > 0 or W.conn is not None:
                 return
             conn = http.client.HTTPConnection(*BACKEND, timeout=900)
             W.conn = conn
@@ -455,11 +469,87 @@ def schedule(api, path, body, who, reply):
     threading.Thread(target=later, daemon=True).start()
 
 
+def quiet(seconds):
+    with W.lock:
+        return W.inflight == 0 and W.conn is None and time.time() - W.last_start >= seconds
+
+
+def send_warm(route, data):
+    """One warm request to the server, closed by any client request; True when it ran to its end."""
+    with W.lock:
+        if W.inflight > 0:
+            return False
+        conn = http.client.HTTPConnection(*BACKEND, timeout=900)
+        W.conn = conn
+    ok = False
+    try:
+        conn.request("POST", route, body=data, headers={"Content-Type": "application/json"})
+        rep = conn.getresponse()
+        rep.read()
+        ok = rep.status == 200
+    except (OSError, http.client.HTTPException):
+        pass
+    finally:
+        with W.lock:
+            if W.conn is conn:
+                W.conn = None
+        conn.close()
+    return ok
+
+
+def rewarm_loop():
+    """Watches the server; after a restart re-runs the recent conversations (pieces of REWARM_PIECE tokens, each one
+    keeping its chunk end, so a client request in between costs at most the piece in flight)."""
+    down = False
+    while True:
+        time.sleep(10)
+        try:
+            with urllib.request.urlopen(f"http://{BACKEND[0]}:{BACKEND[1]}/health", timeout=5) as r:
+                h = json.loads(r.read())
+            up = h.get("status") == "ok" and not h.get("warming")
+        except (OSError, ValueError):
+            up = False
+        if not up:
+            down = True
+            continue
+        if not down or not quiet(30):
+            continue
+        with W.lock:
+            todo = sorted(W.recent.items(), key=lambda kv: -kv[1][0])
+        finished = True
+        for who, (t, path, body, m) in todo:
+            if time.time() - t > REWARM_HOURS * 3600:
+                continue
+            msgs = (body.get("messages") or []) + ([m] if who in W.seen else [])
+            ids = tokens(path, body, msgs)
+            if ids is None:
+                continue
+            X = (len(ids) - WINDOW) // CHUNK * CHUNK
+            at, t0 = 0, time.time()
+            while at < X:
+                nxt = min(X, at + REWARM_PIECE)
+                if not quiet(5):
+                    finished = False
+                    break
+                warm = {"model": body.get("model") or "model", "prompt": ids[:nxt + WINDOW], "max_tokens": 1, "temperature": 0,
+                        "priority": "background"}
+                if not send_warm("/v1/completions", json.dumps(warm).encode()):
+                    finished = False
+                    break
+                at = nxt
+            log(f"re-warm after a restart: client {who}, {at} of {X} tokens kept in {time.time() - t0:.0f} s")
+            if not finished:
+                break
+        if finished:
+            down = False
+
+
 def client_arrived():
     """A client request: no warm-ahead runs beside it."""
     with W.lock:
         W.inflight += 1
         W.gen += 1
+        W.last_start = time.time()
         conn, W.conn = W.conn, None
     if conn is not None:
         try:
@@ -584,6 +674,8 @@ class API(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     load_state()
+    if WARM and REWARM:
+        threading.Thread(target=rewarm_loop, daemon=True).start()
     server = ProxyServer(LISTEN, API)
     print(f"warm-ahead proxy ({'key checked' if KEY else 'no key'}) on {LISTEN[0]}:{LISTEN[1]} -> {BACKEND[0]}:{BACKEND[1]}; warm-ahead "
           f"{'on, ' + str(WARM_DELAY) + ' s after a reply (' + str(WARM_DELAY_TOOL) + ' s after tool calls), ' + str(len(W.seen)) + ' clients known' if WARM else 'off'}", flush=True)

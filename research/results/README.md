@@ -27,6 +27,11 @@ Measured 2026-10-19 and 20 (Korea time) on the setup in [../README.md](../README
 | `policy-ceiling.txt`, `gate-drafter.txt` | depth-policy predictors on held-out prompts (`calib/policy-ceiling.py`); decode against the drafter's landing rate (`calib/gate-drafter.py`) |
 | `copy-threshold.txt`, `vocab-coverage.txt` | copy-window entry at 4 / 6 / 8 / 12 tokens (`calib/ce-compare.py`); how much of the vocabulary the replies use (`calib/vocab-coverage.py`) |
 | `validate-round3.log` | Mia's AI Lab's `tools/validate.py` against the served model, replies compared with the morning's |
+| `decode-final-greedy.json`, `decode-final-sampled.json` | the served decode bench after rounds 6-13 (greedy and T=1, prose and code at 1 / 2 / 4 streams) |
+| `experts-three-programs.txt` | the prompt MoE's gate/up kernel with three programs per SM (`zig/kit-patches/0001`): standalone and served |
+| `engram-reads.txt` | Engram reads deduplicated per chunk and the host row cache (`zig/patches/0028`): simulation and prompt times |
+| `warm-ahead.txt` | `tools/warm_ahead_proxy.py`: next-turn first tokens with and without the warm-ahead; re-warm after a restart |
+| `policy-long-sampled.txt` | the draft policy's switches on long-context sampled decode (Round 20) |
 
 The traces (Nsight Systems exports) and the drafter dumps (`TF_DS_CALIB_FILE`: the confidence head's inputs, i.e. the
 model's hidden states) are not included: they are large, and the dumps are derived from the model.

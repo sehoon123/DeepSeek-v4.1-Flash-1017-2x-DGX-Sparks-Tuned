@@ -11,7 +11,9 @@ issue and pull-request numbers are their repository's.
   resumes ~2,048 tokens later. Only chunk ends every next request can use; a client is warmed ahead once it has shown how it sends replies
   back (learned per system prompt and tools); a client request closes a warm-ahead in flight. 39K-token conversations:
   a turn's first token 1.40-1.57 -> 0.54-0.59 s when the reply crossed a chunk end; the same reply bits as from an
-  empty cache. `PROMPT_CACHE_GIB` (`scripts/config.sh`, unset: the server's 0.5) sets the prompt cache's budget.
+  empty cache. After a server restart it re-runs the recent conversations in 16K-token pieces while clients are quiet
+  (`REWARM`): a 38K-token conversation's next turn 16.2 -> 1.17 s after a restart. `PROMPT_CACHE_GIB`
+  (`scripts/config.sh`, unset: the server's 0.5) sets the prompt cache's budget.
 - **Engram reads: each row once, the recent ones from memory** (`zig/patches/0028`; `TF_DS_ENGRAM_DEDUP=0`,
   `TF_DS_ENGRAM_CACHE_MB=0` turn them off): a prompt chunk's Engram rows are read from the NVMe once each, however many
   of its n-grams name them (30-46 % of a chunk's 24,576 ids repeat one), and the rows read last, by prompt chunks and

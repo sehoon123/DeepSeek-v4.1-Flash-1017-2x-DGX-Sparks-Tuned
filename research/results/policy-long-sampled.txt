@@ -1,0 +1,12 @@
+Draft policy, long-context sampled decode (tf-dsv41-lanes, one stream, 48-row windows, the shipped switches;
+two tool conversations of 52,220 and 78,244 tokens, reasoning effort max, temperature 1.0, top-p 0.95, top-k 20,
+seeds fixed, 700 tokens each; every run's tokens equal to the first's)
+
+run                      decode tok/s   tokens/round   drafted   accepted
+shipped                  66.06          2.578          1327      760
+TF_DS_CONF_BIAS=-0.5     65.54          2.455          1186      736
+TF_DS_CONF_BIAS=0.5      63.46          2.638          1540      771
+TF_DS_CONF_BIAS=1.0      61.51          2.684          1753      779
+TF_DS_MIN_K=2            64.82          2.562          1369      757
+TF_DS_COPY_MIN=3         65.78          2.578          1330      760
+shipped (again)          65.85          2.578          1330      760

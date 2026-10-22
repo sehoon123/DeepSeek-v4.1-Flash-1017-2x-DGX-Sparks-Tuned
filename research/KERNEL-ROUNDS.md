@@ -328,7 +328,20 @@ reply has the bits of the same request from an empty cache. In use (a coding age
 the client's replies came back as predicted 19 of 19 times and 8 warm-aheads moved its resume point a chunk on.
 Shipped as a token prompt (the shared ids up to the chunk end and 128 past it, `/v1/completions`): the server runs 128
 rows past the chunk end instead of up to ~2,200, so a next request arriving meanwhile waits less (an agent loop with a
-1 s tool: 1.48 -> 1.18 s), and it starts at once after tool calls.
+1 s tool: 1.48 -> 1.18 s), and it starts at once after tool calls. A restart empties the cache: the proxy, having seen
+the server unreachable, re-runs the recent conversations when clients are quiet, in 16K-token pieces (each kept, so a
+request arriving meanwhile loses at most the piece in flight). A 38K-token conversation: re-warmed in 20 s (three
+pieces, each resuming the last), its next turn's first token 1.17 s (resumed 36,864) instead of 16.19 s (from 0).
+
+## Round 20: the draft policy where agents spend their time (2026-10-22, `results/policy-long-sampled.txt`)
+
+An agent workload is mostly decode (prompts ~70K tokens, the cache resuming all but ~2K of them, ~860 tokens decoded
+a turn with long reasoning, sampled at the server's defaults): ~85 % of the time goes to decode, at fewer tokens a
+round than the short benchmarks (2.6-2.9 against 3.3 for prose). Replayed with the same shape (52K and 78K-token tool
+conversations, reasoning at max effort, T 1.0 / top-p 0.95 / top-k 20, seeded): the shipped policy (the drafter's
+calibrated confidences) 66.06 and 65.85 tok/s; confidence bias -0.5 / +0.5 / +1.0: -0.6 / -3.8 / -6.8 % (more drafts
+verified: more tokens a round, longer rounds); two drafts always trusted -1.7 %; copies from 3-token matches: the same.
+All the same bits. The calibration holds where context is long and decoding sampled; no switch to change.
 
 ## What is left
 

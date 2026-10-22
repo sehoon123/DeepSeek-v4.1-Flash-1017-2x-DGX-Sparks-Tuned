@@ -435,7 +435,10 @@ the state is the one the client's own request would compute, so replies are the 
 request from an empty cache). After a reply ending in tool calls it starts at once (`WARM_DELAY_TOOL`, 0): the client
 runs its tools meanwhile. What it learned of each client is kept in `WARM_STATE` (hashes only). A client request closes a warm-ahead in flight (the server stops at its current chunk). The proxy appends the
 reply as the server sent it and learns, per client (its system prompt and tools), how the client sends replies back;
-a client is warmed ahead only once its next request has matched. Measurements: `research/results/warm-ahead.txt`.
+a client is warmed ahead only once its next request has matched. After the server restarts (the proxy saw it
+unreachable; the prompt cache is empty), the conversations of the last `REWARM_HOURS` (2) run again, in pieces of
+`REWARM_PIECE` tokens (16,384) each keeping its chunk end, while clients are quiet (30 s), so their next turns resume
+where they were (`REWARM=0`: off; conversations are kept in memory only). Measurements: `research/results/warm-ahead.txt`.
 
 ## Memory and safety
 

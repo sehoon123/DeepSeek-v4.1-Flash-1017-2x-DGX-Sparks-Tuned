@@ -24,3 +24,8 @@ the conversation, the reply and a one-token user message: the server runs 128 ro
 loop whose tool takes 1.0 s (turn 2 a 1,035-token write_file call): turn 3 resumed 38,912, first token 1.182 s (the
 conversation-and-message warm-ahead: 1.480 s). A token prompt's kept state is resumed by the chat request of the same
 tokens (checked: 4,224 ids kept 4,096; the chat request resumed 4,096).
+
+After a server restart (the proxy saw it unreachable, then healthy, then 30 s without client requests): the recent
+conversation (38,602 tokens with its reply) re-run in pieces of 16,384 tokens, each resuming the last
+(16,384 -> 32,768 -> 36,864 kept), 20 s. Its next turn (38,615 tokens): resumed 36,864, first token 1.17 s. A second
+conversation of the same size through a proxy with REWARM=0: resumed 0, first token 16.19 s.
