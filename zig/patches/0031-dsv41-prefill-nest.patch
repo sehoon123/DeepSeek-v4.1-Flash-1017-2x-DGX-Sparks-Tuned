@@ -1,5 +1,5 @@
 diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
-index 99177d2..fa6034c 100644
+index 99177d2..b9055ef 100644
 --- a/zig/src/core/lane_host.zig
 +++ b/zig/src/core/lane_host.zig
 @@ -56,6 +56,13 @@ pub const LaneHost = struct {
@@ -56,7 +56,34 @@ index 99177d2..fa6034c 100644
              for (h.admitted.items, 0..) |job, i| if (job.id == id) {
                  if (!job.stream.finished) h.core.discard(&job.stream);
                  h.lock();
-@@ -414,7 +427,29 @@ pub const LaneHost = struct {
+@@ -336,11 +349,13 @@ pub const LaneHost = struct {
+             h.full_wait = null;
+         }
+         if (h.finish_until) |t| {
+-            if (std.Io.Clock.awake.now(h.io).toNanoseconds() < t and h.nearEnd()) {
+-                h.unlock();
+-                return false;
++            if (!h.nesting) {
++                if (std.Io.Clock.awake.now(h.io).toNanoseconds() < t and h.nearEnd()) {
++                    h.unlock();
++                    return false;
++                }
++                h.finish_until = null;
+             }
+-            h.finish_until = null;
+         }
+         const job = h.queued.orderedRemove(0);
+         h.admitted.append(h.gpa, job) catch {
+@@ -403,7 +418,7 @@ pub const LaneHost = struct {
+         };
+         h.prefilled(job, began);
+         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+-        if (now - began >= long_pass_ns) {
++        if (now - began >= long_pass_ns and !h.nesting) { // (a nested pass: the long one it ran in goes on)
+             h.lock();
+             h.finish_until = now + finish_ns;
+             h.unlock();
+@@ -414,7 +429,33 @@ pub const LaneHost = struct {
  
      fn betweenWanted(ptr: *anyopaque) bool {
          const h: *LaneHost = @ptrCast(@alignCast(ptr));
@@ -72,6 +99,10 @@ index 99177d2..fa6034c 100644
 +        h.lock();
 +        defer h.unlock();
 +        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) return false;
++        if (h.full_wait) |n| {
++            const active = h.core.activeCount();
++            if (active > 0 and active >= n and std.Io.Clock.awake.now(h.io).toNanoseconds() < h.full_retry) return false;
++        }
 +        const job = h.queued.items[0];
 +        const r = job.request;
 +        if (r.images.len > 0) return false;
@@ -87,30 +118,36 @@ index 99177d2..fa6034c 100644
      }
  
      /// Stream.between: decode rounds for the other live streams, interleave_ns at most, between two of the filling
-@@ -422,6 +457,18 @@ pub const LaneHost = struct {
+@@ -422,6 +463,24 @@ pub const LaneHost = struct {
      fn between(ptr: *anyopaque) anyerror!void {
          const h: *LaneHost = @ptrCast(@alignCast(ptr));
          if (h.core.log != null) return; // a step resets the core's arena, which a trail's open events live in
-+        // a request needing little waits: its whole pass now, inside this one, and its first token out
++        // requests needing little wait: their whole passes now, inside this one, one after another, first tokens out
 +        if (h.nestable()) {
 +            const outer = h.filling;
-+            h.nesting = true;
 +            h.outer = outer;
 +            defer {
 +                h.nesting = false;
 +                h.outer = null;
 +                h.filling = outer;
 +            }
-+            _ = h.admitOne();
++            var n: usize = 0;
++            while (n < 4) : (n += 1) {
++                h.nesting = true;
++                if (!h.admitOne()) break;
++                h.filling = outer;
++                h.nesting = false;
++                if (!h.nestable()) break;
++            }
 +        }
          const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
          while (true) {
              h.takeCancelsKeeping(if (h.filling) |f| f.id else null);
-@@ -827,4 +874,102 @@ test "prefill interleave: a decoding stream keeps getting tokens and its cancel
+@@ -827,4 +886,114 @@ test "prefill interleave: a decoding stream keeps getting tokens and its cancel
      try std.testing.expectEqual(Reason.cancelled, a.wait());
  }
  
-+test "prefill nesting: a request needing little fills inside a long pass and ends first; the outer pass's cancel waits for it" {
++test "prefill nesting: requests needing little fill inside a long pass, one after another, and end first; the outer pass's cancel waits" {
 +    const gpa = std.testing.allocator;
 +    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
 +    defer cfg.deinit(gpa);
@@ -119,7 +156,7 @@ index 99177d2..fa6034c 100644
 +    var clock: lanes.fake.FixedClock = .{};
 +    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
 +    defer core.deinit();
-+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 3 });
 +    host.interleave_ns = 5 * std.time.ns_per_ms;
 +    host.nest_tokens = 4;
 +    try host.start();
@@ -157,9 +194,11 @@ index 99177d2..fa6034c 100644
 +        engine: Engine,
 +        a_stream: ?*lanes.Stream = null,
 +        b: *Box,
++        c: *Box,
 +        req_b: *const Request,
 +        cancel_a: bool,
 +        b_done_at_a_last: ?Reason = null,
++        c_done_at_a_last: ?Reason = null,
 +        a_chunks: usize = 0,
 +        b_chunks: usize = 0,
 +        fn call(ctx: *anyopaque, s: *lanes.Stream, chunk: usize) void {
@@ -167,8 +206,14 @@ index 99177d2..fa6034c 100644
 +            if (w.a_stream == null) w.a_stream = s;
 +            if (s == w.a_stream) {
 +                w.a_chunks += 1;
-+                if (chunk == 1) w.engine.submit(2, w.req_b, .{ .ctx = w.b, .event = Box.event }) catch {};
-+                if (chunk == 5) w.b_done_at_a_last = w.b.doneNow();
++                if (chunk == 1) {
++                    w.engine.submit(2, w.req_b, .{ .ctx = w.b, .event = Box.event }) catch {};
++                    w.engine.submit(3, w.req_b, .{ .ctx = w.c, .event = Box.event }) catch {};
++                }
++                if (chunk == 5) {
++                    w.b_done_at_a_last = w.b.doneNow();
++                    w.c_done_at_a_last = w.c.doneNow();
++                }
 +            } else {
 +                w.b_chunks += 1;
 +                if (w.cancel_a and chunk == 2) w.engine.cancel(1); // A is suspended in its between: its pass ends it
@@ -181,20 +226,24 @@ index 99177d2..fa6034c 100644
 +        defer a.tokens.deinit(gpa);
 +        var b: Box = .{};
 +        defer b.tokens.deinit(gpa);
++        var c: Box = .{};
++        defer c.tokens.deinit(gpa);
 +        const req_a: Request = .{ .prompt = &prompt_a, .max_tokens = 3 };
 +        const req_b: Request = .{ .prompt = &prompt_b, .max_tokens = 5 };
-+        var watch = Watch{ .engine = e, .b = &b, .req_b = &req_b, .cancel_a = cancel_a };
++        var watch = Watch{ .engine = e, .b = &b, .c = &c, .req_b = &req_b, .cancel_a = cancel_a };
 +        target.prefill_hook = Watch.call;
 +        target.prefill_hook_ctx = &watch;
 +        try e.submit(1, &req_a, .{ .ctx = &a, .event = Box.event });
 +        try std.testing.expectEqual(Reason.length, b.wait());
++        try std.testing.expectEqual(Reason.length, c.wait());
 +        try std.testing.expectEqual(if (cancel_a) Reason.cancelled else Reason.length, a.wait());
-+        try std.testing.expectEqual(@as(usize, 6), watch.b_chunks); // B's whole pass
++        try std.testing.expectEqual(@as(usize, 12), watch.b_chunks); // B's and C's whole passes
 +        if (!cancel_a) {
 +            // B ended while A's pass was still running (its last chunk saw B done), and both decoded their own tokens
 +            try std.testing.expectEqual(@as(?Reason, Reason.length), watch.b_done_at_a_last);
++            try std.testing.expectEqual(@as(?Reason, Reason.length), watch.c_done_at_a_last);
 +            try std.testing.expectEqual(@as(usize, 6), watch.a_chunks);
-+            for ([_]*Box{ &a, &b }, [_][]const u32{ &prompt_a, &prompt_b }) |box, prompt| {
++            for ([_]*Box{ &a, &b, &c }, [_][]const u32{ &prompt_a, &prompt_b, &prompt_b }) |box, prompt| {
 +                var history: std.ArrayList(u32) = .empty;
 +                defer history.deinit(gpa);
 +                try history.appendSlice(gpa, prompt);
