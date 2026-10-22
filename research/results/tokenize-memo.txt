@@ -1,6 +1,8 @@
 The server's tokenize with the previous request's ids (zig/patches/0030: Tokenizer.encodeReusing, the server's four memos)
 
 Checks (every one equal to encode's ids):
+- the server's memos (hf_text.zig test): a conversation's six requests past 8 KB, another conversation's between, one
+  with the memos in use (encoded without), every one encode's ids, the two conversations in two memos;
 - unit test: 300 texts a seed, four seeds, each the last one cut or not and extended, on the tokenizer tests' byte-level
   BPE with its added token plain and with lstrip / rstrip;
 - 37 requests of served conversations, in order (tool calls and their results, replies with reasoning then a new user
