@@ -4,7 +4,7 @@ fresh; a 68.6K-token prompt L sent first, the others 3 s later; replies compared
 case                                  nest off            nest on (PREFILL_NEST_TOKENS=8192)
 1.9K-token request: first token       27.64 s             2.02 s (2.32, 2.39, 2.43 in the cancel runs)
 L: first token                        29.31 s             34.62 s
-two short requests (T=0, then T=1)    -                   2.40 s, 9.03 s
+two short requests (T=0, then T=1)    -                   2.40 s, 9.03 s (first build); 2.34 s, 2.98 s
 12.7K-token request (over the limit)  -                   32.36 s (waits for L, as before)
 L closed by its client at 4.2 s       -                   the short request 2.32 s, done 3.26 s; L ended (cancelled)
 
@@ -12,3 +12,8 @@ Replies equal to the prompt alone: 10 of 10 (L and the short ones, the T=1 one i
 during L's pass in the interleave's slices (250 ms a chunk), so a 60-token reply ended after 15-20 s, before L's first
 token. Host tests (a fake backend, Debug): a request needing little ends before a six-chunk pass's last chunk with
 its own tokens; the outer request cancelled during the nested pass ends cancelled, the nested one completes.
+
+The first build nested one request a `between` and let a nested pass of over a second set the host's near-end gate
+(after a long pass, streams within 256 tokens of their end decode before the next admission, up to 5 s): the second
+short request waited for it. The served build nests every waiting one back to back (up to four) and keeps that gate for
+whole passes: the second request 9.03 -> 2.98 s, and the 1.9K-token one 2.51 s, its reply and L's equal alone again.

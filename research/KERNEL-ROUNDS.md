@@ -383,8 +383,9 @@ each slot's ids), the Engram read-ahead (keyed by start and length only: the nes
 the next chunk reads its rows anew), and the pairs' back-host ring (keyed by start). The host keeps the outer request's
 cancel for its own pass (a nested pass's `between` takes the others'), and nests one level. Served, a 68.6K-token prompt
 with a 1.9K-token request sent 3 s into it: that request's first token after 2.02-2.43 s instead of 27.64 s, the long
-prompt's after 34.6 s instead of 29.3; two short requests (one at T=1) 2.40 and 9.03 s; a 12.7K-token one (over the
-limit) waits as before; the long request closed by its client while the short pass ran ended cleanly. Every reply
+prompt's after 34.6 s instead of 29.3; two short requests (one at T=1) 2.34 and 2.98 s (2.40 and 9.03 s in a first build
+that nested one a `between` and let a nested pass hold the host's near-end gate); a 12.7K-token one (over the limit)
+waits as before; the long request closed by its client while the short pass ran ended cleanly. Every reply
 equal to the same prompt alone (10 of 10). Streaming itself is even: a reply's events (a round's tokens each) arrive
 32.2 ms apart at the median, p99 ~41 ms, the same through the proxy as from the server.
 
