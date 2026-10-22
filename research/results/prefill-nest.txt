@@ -1,0 +1,14 @@
+Requests arriving during another's prompt pass (zig/patches/0031; served, two Sparks; greedy unless noted; each request
+fresh; a 68.6K-token prompt L sent first, the others 3 s later; replies compared with the same prompt sent alone after)
+
+case                                  nest off            nest on (PREFILL_NEST_TOKENS=8192)
+1.9K-token request: first token       27.64 s             2.02 s (2.32, 2.39, 2.43 in the cancel runs)
+L: first token                        29.31 s             34.62 s
+two short requests (T=0, then T=1)    -                   2.40 s, 9.03 s
+12.7K-token request (over the limit)  -                   32.36 s (waits for L, as before)
+L closed by its client at 4.2 s       -                   the short request 2.32 s, done 3.26 s; L ended (cancelled)
+
+Replies equal to the prompt alone: 10 of 10 (L and the short ones, the T=1 one included). The short requests decode
+during L's pass in the interleave's slices (250 ms a chunk), so a 60-token reply ended after 15-20 s, before L's first
+token. Host tests (a fake backend, Debug): a request needing little ends before a six-chunk pass's last chunk with
+its own tokens; the outer request cancelled during the nested pass ends cancelled, the nested one completes.

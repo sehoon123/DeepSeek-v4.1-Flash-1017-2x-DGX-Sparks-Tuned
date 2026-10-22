@@ -371,16 +371,22 @@ conversations (tool calls, dropped reasoning, warm-ahead texts) against the serv
 135-140K tokens, 4.8-5.5 -> 0.1-1.9 ms at 13-15K; a conversation's second request still encodes whole (its first
 had no end-of-sentence yet).
 
-## Round 23: a request arriving during another's prompt (2026-10-22, evaluated, not changed)
+## Round 23: a request arriving during another's prompt (2026-10-22, `zig/patches/0031`, `results/prefill-nest.txt`)
 
 A short request resumed from the cache waited 29.6 s behind another client's 60K-token prompt: between a pass's chunks
-the host runs only the other streams' decode rounds (`TF_PREFILL_INTERLEAVE_MS`), and the next prompt pass starts when
-this one ends. Running a short pass inside the long one's `between` would need three pieces of per-pass state made the
-stream's own, on both ranks: the slot and extent a pass is set up with, the Engram read-ahead (keyed by start and length
-only: two streams' chunks can share both, and then the rows would be the other prompt's), and the pairs' back-host ring
-(keyed by start). Left for a client that sends requests at the same time; one sequential client never meets it, and the
-warm-ahead proxy no longer sends anything while the server is busy. Streaming itself is even: a reply's events (a
-round's tokens each) arrive 32.2 ms apart at the median, p99 ~41 ms, the same through the proxy as from the server.
+the host ran only the other streams' decode rounds (`TF_PREFILL_INTERLEAVE_MS`), and the next prompt pass started when
+this one ended. Now, in that `between`, the queue's first request runs its whole pass when it would prefill at most
+`PREFILL_NEST_TOKENS` (8192; its prompt past the kept state it resumes, as the store's lookup finds it, no pictures).
+Three pieces of per-pass state had to become the stream's own again after such a pass, on both ranks: the slot and
+extent the pass is set up with (a chunk frame names neither; a `fill_resume` frame sets them up again, rank 1 keeping
+each slot's ids), the Engram read-ahead (keyed by start and length only: the nested prompt's chunks may share both, so
+the next chunk reads its rows anew), and the pairs' back-host ring (keyed by start). The host keeps the outer request's
+cancel for its own pass (a nested pass's `between` takes the others'), and nests one level. Served, a 68.6K-token prompt
+with a 1.9K-token request sent 3 s into it: that request's first token after 2.02-2.43 s instead of 27.64 s, the long
+prompt's after 34.6 s instead of 29.3; two short requests (one at T=1) 2.40 and 9.03 s; a 12.7K-token one (over the
+limit) waits as before; the long request closed by its client while the short pass ran ended cleanly. Every reply
+equal to the same prompt alone (10 of 10). Streaming itself is even: a reply's events (a round's tokens each) arrive
+32.2 ms apart at the median, p99 ~41 ms, the same through the proxy as from the server.
 
 ## What is left
 

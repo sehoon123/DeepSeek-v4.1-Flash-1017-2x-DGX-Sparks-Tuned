@@ -5,6 +5,11 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **Requests needing little fill inside a long prompt pass** (`zig/patches/0031`, `PREFILL_NEST_TOKENS`, 8192): a
+  request that arrives during another's prompt pass and would prefill at most that many tokens runs its whole pass
+  between two of the long one's chunks (the long pass then sets its slot up again on both ranks and reads its next
+  chunk's Engram rows anew); one level; the outer request's cancel waits for its own pass. A 1.9K-token request 3 s into
+  a 68.6K-token prompt: first token 27.6 -> 2.0-2.4 s; every reply equal to the same prompt's alone.
 - **The server's tokenizer reuses the previous request's ids** (`zig/patches/0030`): the leading segments (split at the
   end-of-sentence tokens) a request shares with one of the last four long texts keep their ids; a 135K-token
   conversation's next request 57 -> 2-3 ms to tokenize; the same ids.

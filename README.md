@@ -63,6 +63,10 @@ their repository's.
 - **A long conversation's next request read ~55 ms sooner**: `zig/patches/0030`. The server tokenized every request
   whole (57 ms at 133K tokens); it keeps the last long texts' ids and encodes only what follows the previous reply
   (2-3 ms). The same ids.
+- **A request arriving during another's long prompt starts in ~2 s, not after it**: `zig/patches/0031`,
+  `PREFILL_NEST_TOKENS=8192`. Such a request whose own pass needs at most that many tokens (past its kept state) runs
+  between two of the long pass's chunks: a 1.9K-token request sent 3 s into a 68.6K-token prompt had its first token
+  after 2.0-2.4 s instead of 27.6 s; the long prompt took ~5 s longer. The same bits for both.
 - **A conversation's next turn up to ~60 % sooner (optional)**: `tools/warm_ahead_proxy.py`, an OpenAI / Anthropic API
   proxy in front of the server. While a client is idle after a reply, it has the server's prompt cache keep the state at
   the next 2,048-token chunk end the conversation and its reply reached, so the next turn resumes there instead of

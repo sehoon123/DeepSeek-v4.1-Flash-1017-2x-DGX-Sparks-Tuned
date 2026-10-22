@@ -182,7 +182,8 @@ PREFILL_INTERLEAVE_MS="${PREFILL_INTERLEAVE_MS:-250}"
 # zig/patches/0031: a request arriving during another's prompt pass, whose own pass would prefill at most this many tokens
 # (its prompt past the kept state it resumes), runs its pass between two of the long pass's chunks instead of after it:
 # TF_DS_PREFILL_NEST_TOKENS, read by rank 0 only, with the interleave above. 0: it waits for the whole pass, as before.
-PREFILL_NEST_TOKENS="${PREFILL_NEST_TOKENS:-0}"
+# 8192: about four chunks (a few seconds) the long pass waits for each request that comes in.
+PREFILL_NEST_TOKENS="${PREFILL_NEST_TOKENS:-8192}"
 
 # ---------------------------------------------------------------- files
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
