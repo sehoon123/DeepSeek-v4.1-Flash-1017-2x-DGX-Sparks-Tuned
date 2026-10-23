@@ -1,0 +1,19 @@
+A sampled round's candidates found on the device (zig/patches/0035), and the drafter's MoE on fewer experts and its pass
+in two graphs (research, left out); tf-dsv41-lanes on both ranks, the harness's requests, interleaved; every run's tokens
+equal to the first's
+
+candidates on the device: nine requests at T=1 (eight short, a 78K-token tool conversation), three runs each
+                      decode tok/s (all nine)      the 78K conversation     the eight short
+host's draws (before) 107.78 / 107.78 / 107.61     75.95 / 76.14 / 76.34    111.89 / 111.86 / 111.62
+0035                  108.05 / 108.16 / 108.05     76.53 / 76.14 / 76.53    112.10 / 112.30 / 112.10   (+0.34 %)
+a checking build (each row drawn both ways): 4,000+ rows, candidate lists 0 unlike the whole row's, tokens 0 unlike
+
+the drafter's MoE on its best routed experts a row (research; the dropped slots name the kept expert with no weight, the
+kept weights scaled to the routed total): the 78K conversation at T=1 and eleven short greedy requests, two runs each
+experts a row   78K tok/s        tokens a round   short tok/s      tokens a round
+3 (as trained)  76.14 / 76.34    3.19 / 3.19      84.86 / 84.68    3.29 / 3.29
+2               74.81 / 74.26    3.03 / 3.00      80.39 / 80.82    3.04 / 3.05
+1               65.93 / 66.82    2.54 / 2.61      71.39 / 71.88    2.58 / 2.59
+
+the drafter pass's graph in two (block 0's attention first, so the rest's launch runs behind it; research):
+one graph 108.49 / 107.90 / 107.87, two 108.11 / 108.16 / 108.11 tok/s (the nine requests): +0.04 %, noise; left out

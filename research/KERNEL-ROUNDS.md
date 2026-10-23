@@ -423,10 +423,28 @@ against 76.5 / 73.5). The context buckets are powers of two, so a growing conver
 a doubling; the indexer scores the whole bucket, ~0.1 ms a round more than its rows need at 78K. The MoE reads ~6.4 GB
 a rank a round in ~26.8 ms, ~90 % of the read ceiling; what is left is the gathers' latency and the small kernels.
 
+## Round 26: fewer bytes a token, and the host between rounds (2026-10-23, `zig/patches/0035`, `results/sampling-candidates.txt`)
+
+At 78K tokens a round reads ~9.8 GB a rank (routed experts ~6.4, dense linears ~2.3, the head 0.25, the drafter ~0.7)
+in ~42 ms: ~89 % of the read ceiling, so a faster token needs fewer bytes a token. The drafter is the one part whose
+arithmetic the replies never see. Its MoE on its best two (one) routed experts a row, the dropped slots naming the kept
+expert with no weight (read once), saves ~0.5 (1.0) ms a pass, but its drafts fall to 3.03 (2.54) tokens a round from
+3.19: -2.4 / -5.1 % decode (-13 / -15 %), every reply equal; left out. Its window is the trained 128 positions (the
+attention kernel's compile-time WIN). Between rounds, a trace of rank 1 showed it idle ~0.15 ms a round for rank 0's
+draws (a round's rows of logits, ~2.3 MB, copied to the host, then each row's top candidates found on one core) and
+~0.07 ms a drafter pass for its graph's launch (125 nodes, ~80 us of host time with the GPU waiting; the round's
+stretches launch behind work). 0035 finds the candidates on the device: a row's 32 slices each keep their C largest
+keys (the value's order, -0.0 as +0.0, then the inverted id; unique), a block sorts the slices' keys and writes the
+first C with their values' own bits; 132 words a row come back, and the host draws from them with `sampleRow`'s own
+code (a row holding a NaN from its whole row, as before). A checking build drew 4,000+ rows both ways: lists and tokens
+all equal. Interleaved three times over nine requests at T=1: 107.72 -> 108.09 tok/s (+0.34 %), every run's tokens
+equal. The pass in two graphs (block 0's attention first, the rest launched behind it) measured +0.04 %, noise: left out.
+
 ## What is left
 
 The remaining recoverable time is latency-bound and outside the code we can change bit-exactly: the kit's kernels
 (rewriting `grouped_cp` / `glinear` would need their exact reduction order), the gather's pinned-memory path (GPU-initiated
-RDMA), and the host's round trip between rounds (~0.35-0.45 ms: acceptance read on the host before the next graph).
+RDMA), and the host's round trip between rounds (~0.35-0.45 ms: acceptance read on the host before the next graph; 0035
+takes ~0.13 ms of it).
 Copy windows past 48 rows would need the round buffers' max_rows (48) and more captured kernels. The larger lever for
 text without copies is tokens a round: a better drafter (training), not kernels.

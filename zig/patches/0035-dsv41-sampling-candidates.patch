@@ -1,0 +1,370 @@
+diff --git a/zig/kernels/cuda/dsv41_ops.cu b/zig/kernels/cuda/dsv41_ops.cu
+index 8dd7a09..574fb80 100644
+--- a/zig/kernels/cuda/dsv41_ops.cu
++++ b/zig/kernels/cuda/dsv41_ops.cu
+@@ -189,6 +189,102 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_topk_i64_slices_kernel(
+ 
+ static void run_old(const long long* d, int rows, int n, int k, long long* o) { tf_ds_topk_i64_kernel<<<rows, 1024>>>(d, n, n, k, o); }
+ 
++// A round's sampling candidates (sampling.topCandidates on the device): each row's first C (value, id) in the order
++// "the larger value, then the lower id" (np.lexsort((ids, -values))), -0.0 the same value as +0.0. A row holding a
++// NaN is flagged: the host draws that row from the whole row (topCandidates' own NaN handling). Phase 1: block
++// (slice, row) keeps its slice's C largest keys (C rounds of a block max over the keys, which are unique); phase 2:
++// block `row` sorts the slices' keys and writes the first C, each value read back from the row (its own bits).
++// A row's record (TF_CAND_REC words): C fp32 values at 0, C int32 ids at TF_CAND_MAX, the NaN flag at 2 * TF_CAND_MAX.
++#define TF_CAND_SLICES 32
++#define TF_CAND_MAX 64
++#define TF_CAND_REC (2 * TF_CAND_MAX + 4)
++#define TF_CAND_T1 256
++#define TF_CAND_E 16
++
++__device__ __forceinline__ unsigned long long tf_cand_key(float v, unsigned id, int& nan) {
++    unsigned b = __float_as_uint(v);
++    if ((b & 0x7fffffffu) > 0x7f800000u) { nan = 1; return 0ull; }
++    if ((b & 0x7fffffffu) == 0u) b = 0u;
++    const unsigned o = (b & 0x80000000u) ? ~b : (b | 0x80000000u);
++    return ((unsigned long long)o << 32) | (unsigned long long)(0xffffffffu - id);
++}
++
++extern "C" __global__ void __launch_bounds__(TF_CAND_T1) tf_ds_cands_slices_kernel(const float* __restrict__ logits, long long ld, int V, int C, unsigned long long* __restrict__ keys, int* __restrict__ nans) {
++    const int s = blockIdx.x, r = blockIdx.y, t = threadIdx.x;
++    const int L = (V + TF_CAND_SLICES - 1) / TF_CAND_SLICES;
++    const int lo = s * L, hi = min(V, lo + L);
++    const float* row = logits + (long long)r * ld;
++    unsigned long long k[TF_CAND_E];
++    int nan = 0;
++#pragma unroll
++    for (int e = 0; e < TF_CAND_E; ++e) {
++        const int i = lo + e * TF_CAND_T1 + t;
++        k[e] = i < hi ? tf_cand_key(row[i], (unsigned)i, nan) : 0ull;
++    }
++    __shared__ unsigned long long wmax[TF_CAND_T1 / 32];
++    __shared__ int any_nan;
++    if (t == 0) any_nan = 0;
++    __syncthreads();
++    if (nan) any_nan = 1;
++    unsigned long long* out = keys + ((long long)r * TF_CAND_SLICES + s) * TF_CAND_MAX;
++    for (int c = 0; c < C; ++c) {
++        unsigned long long m = 0ull;
++#pragma unroll
++        for (int e = 0; e < TF_CAND_E; ++e) m = k[e] > m ? k[e] : m;
++        unsigned long long w = m;
++#pragma unroll
++        for (int o = 16; o > 0; o >>= 1) {
++            const unsigned long long x = __shfl_xor_sync(0xffffffffu, w, o);
++            w = x > w ? x : w;
++        }
++        if ((t & 31) == 0) wmax[t >> 5] = w;
++        __syncthreads();
++        unsigned long long g = wmax[0];
++#pragma unroll
++        for (int j = 1; j < TF_CAND_T1 / 32; ++j) g = wmax[j] > g ? wmax[j] : g;
++        __syncthreads();
++        if (t == 0) out[c] = g;
++        if (g != 0ull && m == g) {
++#pragma unroll
++            for (int e = 0; e < TF_CAND_E; ++e)
++                if (k[e] == g) k[e] = 0ull;
++        }
++    }
++    __syncthreads();
++    if (t == 0) nans[r * TF_CAND_SLICES + s] = any_nan;
++}
++
++extern "C" __global__ void __launch_bounds__(1024) tf_ds_cands_merge_kernel(const float* __restrict__ logits, long long ld, int C, const unsigned long long* __restrict__ keys, const int* __restrict__ nans, unsigned* __restrict__ out) {
++    const int r = blockIdx.x, t = threadIdx.x;
++    const int n = TF_CAND_SLICES * TF_CAND_MAX;
++    __shared__ unsigned long long sk[TF_CAND_SLICES * TF_CAND_MAX];
++    for (int i = t; i < n; i += 1024) sk[i] = (i % TF_CAND_MAX) < C ? keys[(long long)r * n + i] : 0ull;
++    __syncthreads();
++    for (int size = 2; size <= n; size <<= 1) {
++        for (int stride = size >> 1; stride > 0; stride >>= 1) {
++            for (int i = t; i < n / 2; i += 1024) {
++                const int a = 2 * i - (i & (stride - 1));
++                const int b = a + stride;
++                const bool desc = (a & size) == 0;
++                const unsigned long long x = sk[a], y = sk[b];
++                if ((x < y) == desc) { sk[a] = y; sk[b] = x; }
++            }
++            __syncthreads();
++        }
++    }
++    unsigned* rec = out + (long long)r * TF_CAND_REC;
++    if (t < C) {
++        const unsigned id = 0xffffffffu - (unsigned)(sk[t] & 0xffffffffull);
++        rec[TF_CAND_MAX + t] = id;
++        rec[t] = __float_as_uint(logits[(long long)r * ld + id]);
++    }
++    if (t == 0) {
++        int a = 0;
++        for (int s = 0; s < TF_CAND_SLICES; ++s) a |= nans[r * TF_CAND_SLICES + s];
++        rec[2 * TF_CAND_MAX] = (unsigned)a;
++    }
++}
++
+ // t[idx] = rows of whole rows (index_put_ with distinct indices: the window ring's and the positional store's slots):
+ // dst row idx[r] = src row r, `bytes` bytes a row (16-byte words when the rows are aligned so), a row a block.
+ extern "C" __global__ void tf_ds_scatter_rows_kernel(const uint8_t* src, long long src_ld, const long long* idx,
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index bf7ced3..56888fa 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -19,6 +19,7 @@ const model = @import("model.zig");
+ const round = @import("round.zig");
+ const draft = @import("draft.zig");
+ const sampling = @import("sampling.zig");
++const ops_mod = @import("ops.zig");
+ const link = @import("link.zig");
+ const cuda = @import("cuda");
+ 
+@@ -252,6 +253,20 @@ pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
+     return @intCast(t);
+ }
+ 
++/// draw's token for round row `row` from its device candidates (Model.roundCandidates' records, `count` of them a
++/// row), or from its whole row if the row holds a NaN.
++fn drawCandidates(m: anytype, recs: []const u32, count: usize, row: usize, position: u64, s: ?lanes.Sampling) !u32 {
++    const W = ops_mod.cand_max;
++    const rec = recs[row * ops_mod.cand_rec ..][0..ops_mod.cand_rec];
++    if (rec[2 * W] != 0) return draw(try m.roundLogitsRow(row), position, s);
++    var ids: [W]i64 = undefined;
++    for (rec[W..][0..count], 0..) |id, j| ids[j] = id;
++    const sm = s orelse return @intCast(ids[0]);
++    if (sm.temperature <= 0) return @intCast(ids[0]);
++    const values: []const f32 = @ptrCast(rec[0..count]);
++    return @intCast(try sampling.sampleCandidates(values, ids[0..count], m.vocab, position, .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p }));
++}
++
+ /// Where rank 0's backend calls spend their time (ns, summed; --profile): a round's frame to rank 1, its forward
+ /// and absorb (synchronized apart), the logits' copy to the host and the draws; the drafter passes; the prefills.
+ pub const Profile = struct {
+@@ -902,7 +917,19 @@ pub const Lanes = struct {
+             };
+         }
+         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
+-        const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
++        // sampled: each row's candidates from the device (sampling.topCandidates' first `count` in its order), unless
++        // a stream's sampling needs its whole row (no top_k, or more candidates than the device keeps)
++        const V = m.vocab;
++        var count: usize = 1;
++        var whole = greedy;
++        if (!greedy) for (windows) |w| {
++            const sm = w.stream.sampling orelse continue;
++            if (sm.temperature <= 0) continue;
++            if (sm.top_k == 0 or sm.top_k + sampling.margin > ops_mod.cand_max) whole = true;
++            count = @max(count, @min(V, sm.top_k + sampling.margin));
++        };
++        const recs: []const u32 = if (whole) &.{} else try m.roundCandidates(rows.ids.len, count);
++        const logits: []const f32 = if (greedy or !whole) &.{} else try m.roundLogits(rows.ids.len);
+         const t3 = m.now();
+         defer if (self.prof) |*p| {
+             p.send += t1 - t0;
+@@ -914,10 +941,9 @@ pub const Lanes = struct {
+             p.rounds += 1;
+             p.rows += rows.ids.len;
+         };
+-        const V = m.vocab;
+         for (windows, out, 0..) |w, *o, k| {
+             const row0 = self.built.wins[k].row;
+-            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
++            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else if (recs.len == 0) try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling) else try drawCandidates(m, recs, count, row0 + r, w.positions[r], w.stream.sampling);
+             const l = self.streams.getPtr(w.stream).?;
+             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
+             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index ac5ec31..d9ab636 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -118,6 +118,10 @@ pub const Model = struct {
+     logits_pin: ?cuda.HostBuffer = null, // their pinned memory: a round's copy comes back by DMA, not staged by the driver
+     amax: u64, // u32 [round.max_rows]: a round's greedy tokens on the device (roundArgmax)
+     amax_host: [round.max_rows]u32 = undefined,
++    cands: u64 = 0, // a round's sampling candidates on the device (roundCandidates): ops_mod.cand_rec words a row
++    cand_keys: u64 = 0, // their phase 1 scratch: u64 [round.max_rows, ops_mod.cand_slices, ops_mod.cand_max]
++    cand_nans: u64 = 0, // and i32 [round.max_rows, ops_mod.cand_slices]
++    cand_pin: ?cuda.HostBuffer = null, // the records' pinned copy on the host
+     // the stream a fill is running: its slot and its view of the caches (its extent from base)
+     fill_slot: usize = 0,
+     // the prompt a fill's chunks come from (the caller's, set for the fill) and the thread reading the next chunk's
+@@ -173,6 +177,7 @@ pub const Model = struct {
+         m.spans = .empty;
+         m.img_buf = null;
+         m.logits_pin = null;
++        m.cand_pin = null;
+         m.host = std.heap.ArenaAllocator.init(gpa);
+         errdefer m.host.deinit();
+         const a = m.host.allocator();
+@@ -334,6 +339,9 @@ pub const Model = struct {
+         }
+         m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
+         m.amax = try m.arena.take(round.max_rows * 4);
++        m.cands = try m.arena.take(round.max_rows * ops_mod.cand_rec * 4);
++        m.cand_keys = try m.arena.take(round.max_rows * ops_mod.cand_slices * ops_mod.cand_max * 8);
++        m.cand_nans = try m.arena.take(round.max_rows * ops_mod.cand_slices * 4);
+         if (o.graphs) m.graphs = round.Graphs.init(gpa);
+         if (o.side) try m.rd.useSide(&m.eng);
+         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
+@@ -415,6 +423,7 @@ pub const Model = struct {
+         // pinned: a copy to pageable memory goes through the driver's staging buffer (a round's sampled rows: ~3 MB)
+         m.logits_pin = try cuda.HostBuffer.alloc(ctx.d, round.max_rows * m.vocab * @sizeOf(f32));
+         m.logits = m.logits_pin.?.slice(f32)[0 .. round.max_rows * m.vocab];
++        m.cand_pin = try cuda.HostBuffer.alloc(ctx.d, round.max_rows * ops_mod.cand_rec * 4);
+         return m;
+     }
+ 
+@@ -423,6 +432,7 @@ pub const Model = struct {
+         m.stream.synchronize() catch {};
+         if (m.img_buf) |*b| b.free();
+         if (m.logits_pin) |*b| b.free();
++        if (m.cand_pin) |*b| b.free();
+         m.spans.deinit(m.gpa);
+         if (m.graphs) |*g| g.deinit();
+         if (m.pgraphs) |*g| g.deinit();
+@@ -1069,6 +1079,25 @@ pub const Model = struct {
+         return m.logits[0 .. R * m.vocab];
+     }
+ 
++    /// The round's sampling candidates, R rows of their records (ops.candidates: each row's first `count` in
++    /// sampling.topCandidates' order, or its NaN flag), on the host (after verify).
++    pub fn roundCandidates(m: *Model, R: usize, count: usize) ![]const u32 {
++        const d = m.ctx.d;
++        try m.ops.candidates(m.stream, m.rd.logits, m.vocab, m.vocab, R, count, m.cand_keys, m.cand_nans, m.cands);
++        const pin = m.cand_pin.?.slice(u32);
++        try d.check(d.api.cuMemcpyDtoHAsync_v2(pin.ptr, m.cands, R * ops_mod.cand_rec * 4, m.stream.handle), "cuMemcpyDtoHAsync");
++        try m.stream.synchronize();
++        return pin[0 .. R * ops_mod.cand_rec];
++    }
++
++    /// Row r of the round's logits on the host (a row the candidates flag).
++    pub fn roundLogitsRow(m: *Model, r: usize) ![]const f32 {
++        const d = m.ctx.d;
++        try m.stream.synchronize();
++        try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.rd.logits + r * m.vocab * 4, m.vocab * 4), "cuMemcpyDtoH");
++        return m.logits[0..m.vocab];
++    }
++
+     /// The prompt's logits on the host (after a fill's last chunk).
+     pub fn promptLogitsHost(m: *Model) ![]const f32 {
+         const d = m.ctx.d;
+diff --git a/zig/src/families/dsv41/ops.zig b/zig/src/families/dsv41/ops.zig
+index 70fb9b4..4ad7c18 100644
+--- a/zig/src/families/dsv41/ops.zig
++++ b/zig/src/families/dsv41/ops.zig
+@@ -29,6 +29,12 @@ const topk_slice = 4096;
+ const topk_slice_blocks = 192;
+ const topk_scratch_keys = topk_slice_blocks * 512;
+ 
++/// The sampling candidates' layout (dsv41_ops.cu TF_CAND_*): a row's record holds cand_max values, cand_max ids and
++/// a NaN flag (cand_rec words); phase 1 works in cand_slices slices of a row.
++pub const cand_max = 64;
++pub const cand_rec = 2 * cand_max + 4;
++pub const cand_slices = 32;
++
+ pub const Ops = struct {
+     pointwise: cuda.Module,
+     movement: cuda.Module,
+@@ -39,6 +45,8 @@ pub const Ops = struct {
+     topk_i64: cuda.Function,
+     topk_i64_regs: cuda.Function,
+     topk_i64_slices: cuda.Function,
++    cands_slices: cuda.Function,
++    cands_merge: cuda.Function,
+     topk_scratch: cuda.DeviceBuffer, // the slices' top-k sets: topk_scratch_keys int64
+     topk_indices: cuda.Function,
+     scatter: cuda.Function,
+@@ -73,6 +81,8 @@ pub const Ops = struct {
+             .topk_i64 = try fm.function("tf_ds_topk_i64_kernel"),
+             .topk_i64_regs = try fm.function("tf_ds_topk_i64_regs_kernel"),
+             .topk_i64_slices = try fm.function("tf_ds_topk_i64_slices_kernel"),
++            .cands_slices = try fm.function("tf_ds_cands_slices_kernel"),
++            .cands_merge = try fm.function("tf_ds_cands_merge_kernel"),
+             .topk_scratch = try cuda.DeviceBuffer.alloc(d, topk_scratch_keys * 8),
+             .topk_indices = try fm.function("tf_ds_topk_indices_kernel"),
+             .scatter = try fm.function("tf_ds_scatter_rows_kernel"),
+@@ -136,6 +146,30 @@ pub const Ops = struct {
+ 
+     /// keys.topk(k, sorted=False).values of unique int64 keys [rows, n] (row stride ks) into top [rows, k], the set in no
+     /// particular order (_topk_finish sorts the indices).
++    /// A round's sampling candidates (tf_ds_cands_*_kernel): each of `rows` rows of `n` fp32 logits (stride ld) its
++    /// first `count` (<= cand_max) in sampling.topCandidates' order, into out's records (cand_rec words a row);
++    /// keys u64 [rows, cand_slices, cand_max] and nans i32 [rows, cand_slices] scratch.
++    pub fn candidates(o: *const Ops, s: cuda.Stream, logits: u64, ld: usize, n: usize, rows: usize, count: usize, keys: u64, nans: u64, out: u64) !void {
++        if (rows == 0) return;
++        if (count == 0 or count > cand_max or n > cand_slices * 256 * 16 or n < count) return error.UnsupportedShape;
++        var a: cuda.Args = .{};
++        a.add(logits);
++        a.add(@as(i64, @intCast(ld)));
++        a.add(@as(c_int, @intCast(n)));
++        a.add(@as(c_int, @intCast(count)));
++        a.add(keys);
++        a.add(nans);
++        try cuda.launch.launch(o.cands_slices, .{ .grid = .{ .x = cand_slices, .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
++        var b: cuda.Args = .{};
++        b.add(logits);
++        b.add(@as(i64, @intCast(ld)));
++        b.add(@as(c_int, @intCast(count)));
++        b.add(keys);
++        b.add(nans);
++        b.add(out);
++        try cuda.launch.launch(o.cands_merge, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, s, &b);
++    }
++
+     pub fn topkI64(o: *const Ops, s: cuda.Stream, keys: u64, ks: usize, rows: usize, n: usize, k: usize, top: u64) !void {
+         if (rows == 0) return;
+         if (k > n) return error.BadTopK;
+diff --git a/zig/src/families/dsv41/sampling.zig b/zig/src/families/dsv41/sampling.zig
+index 76f66bc..cfa6f2b 100644
+--- a/zig/src/families/dsv41/sampling.zig
++++ b/zig/src/families/dsv41/sampling.zig
+@@ -141,7 +141,23 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
+     var values: [max_candidates]f32 = undefined;
+     var ids: [max_candidates]i64 = undefined;
+     const width = topCandidates(row, count, &values, &ids);
+-    // choose_rows on the candidates (already in lexsort's order)
++    return chooseRow(values[0..width], ids[0..width], position, s);
++}
++
++/// sampleRow's token from a row's first candidates (topCandidates' (value, id) pairs in its order, at least
++/// min(row_len, top_k + margin) of them) instead of the row: the same checks, the same choice.
++pub fn sampleCandidates(values: []const f32, ids: []const i64, row_len: usize, position: u64, s: Sampling) !i64 {
++    if (s.temperature <= 0) return ids[0];
++    if (s.top_k == 0) return error.NotPortedYet;
++    const count = @min(row_len, s.top_k + margin);
++    if (count > max_candidates) return error.TooManyCandidates;
++    if (values.len < count or ids.len < count) return error.TooFewCandidates;
++    return chooseRow(values[0..count], ids[0..count], position, s);
++}
++
++/// choose_rows on a row's candidates (already in lexsort's order).
++fn chooseRow(values: []const f32, ids: []const i64, position: u64, s: Sampling) i64 {
++    const width = values.len;
+     const k = @max(1, @min(s.top_k, width));
+     const t = @max(s.temperature, 1e-6);
+     var scaled: [max_candidates]f64 = undefined;
+@@ -233,3 +249,26 @@ test "top candidates a block at a time as one at a time: ties, NaN, infinities,
+         }
+     }
+ }
++
++test "a row's draw from its first candidates (a longer list's head too) as from the row: ties, zeros, infinities" {
++    var prng = std.Random.DefaultPrng.init(0x5eed);
++    const rnd = prng.random();
++    var row: [3000]f32 = undefined;
++    var values: [max_candidates]f32 = undefined;
++    var ids: [max_candidates]i64 = undefined;
++    for (0..300) |trial| {
++        for (&row) |*v| v.* = switch (rnd.uintLessThan(u32, 10)) {
++            0 => 0.0,
++            1 => -0.0,
++            2 => @floatFromInt(rnd.uintLessThan(u32, 4)),
++            3 => if (rnd.boolean()) std.math.inf(f32) else -std.math.inf(f32),
++            else => rnd.floatNorm(f32) * 4,
++        };
++        const top_k: usize = 1 + rnd.uintLessThan(usize, 40);
++        const s: Sampling = .{ .seed = trial, .temperature = 0.3 + rnd.float(f64), .top_k = top_k, .top_p = if (rnd.boolean()) 0.95 else 1.0, .min_p = if (rnd.boolean()) 0.05 else 0.0 };
++        const count = @min(row.len, top_k + margin + rnd.uintLessThan(usize, max_candidates - top_k - margin + 1));
++        const n = topCandidatesScalar(&row, count, &values, &ids);
++        const pos: u64 = rnd.int(u32);
++        try std.testing.expectEqual(try sampleRow(&row, pos, s), try sampleCandidates(values[0..n], ids[0..n], row.len, pos, s));
++    }
++}
