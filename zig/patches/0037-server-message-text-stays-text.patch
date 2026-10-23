@@ -1,0 +1,354 @@
+diff --git a/zig/src/core/tokenizer/tokenizer.zig b/zig/src/core/tokenizer/tokenizer.zig
+index 4a1ab4e..3160b1c 100644
+--- a/zig/src/core/tokenizer/tokenizer.zig
++++ b/zig/src/core/tokenizer/tokenizer.zig
+@@ -124,8 +124,43 @@ pub const Tokenizer = struct {
+             valid = fixed.items;
+         }
+         var ids: std.ArrayList(u32) = .empty;
+-        for (try t.splitAdded(&ctx, &t.raw, valid)) |seg| {
+-            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, valid[seg.start..seg.end], seg.start == 0, &ids);
++        for (try t.splitAdded(&ctx, &t.raw, valid, null)) |seg| {
++            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, valid[seg.start..seg.end], seg.start == 0, &ids, null);
++        }
++        return a.dupe(u32, ids.items);
++    }
++
++    /// Whether `s` holds an added token's text (one encode would read as that token).
++    pub fn hasAdded(t: *const Tokenizer, s: []const u8) bool {
++        return t.raw.next(s, 0) != null or t.normalized.next(s, 0) != null;
++    }
++
++    /// Byte ranges of a text where added tokens are not matched: their text there is plain text.
++    pub const Skip = struct {
++        base: usize = 0, // where the text being split starts in the whole one
++        spans: []const [2]usize, // [start, end) of the whole text, sorted by start, apart
++
++        fn inside(k: Skip, lo: usize, hi: usize) bool {
++            for (k.spans) |sp| {
++                if (sp[0] >= k.base + hi) break;
++                if (k.base + lo < sp[1]) return true;
++            }
++            return false;
++        }
++    };
++
++    /// encode's ids, but an added token's text that overlaps one of `spans` (byte ranges of `text`, sorted, apart) is
++    /// read as plain text, not as the token: a chat message's content keeps the characters it has. A text with no
++    /// added token inside a span gets encode's ids exactly (the same split, the same pieces). Only a valid UTF-8 text
++    /// (else encode, whose lossy read moves the offsets); a segment its normalizer changes keeps its matches.
++    pub fn encodeProtected(t: *const Tokenizer, a: Allocator, text: []const u8, spans: []const [2]usize) Error![]u32 {
++        if (spans.len == 0 or !std.unicode.utf8ValidateSlice(text)) return t.encode(a, text);
++        var arena = std.heap.ArenaAllocator.init(a);
++        defer arena.deinit();
++        var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
++        var ids: std.ArrayList(u32) = .empty;
++        for (try t.splitAdded(&ctx, &t.raw, text, .{ .spans = spans })) |seg| {
++            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, text[seg.start..seg.end], seg.start == 0, &ids, .{ .base = seg.start, .spans = spans });
+         }
+         return a.dupe(u32, ids.items);
+     }
+@@ -154,7 +189,7 @@ pub const Tokenizer = struct {
+         var arena = std.heap.ArenaAllocator.init(a);
+         defer arena.deinit();
+         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
+-        const segs = try t.splitAdded(&ctx, &t.raw, text);
++        const segs = try t.splitAdded(&ctx, &t.raw, text, null);
+         var same: usize = 0;
+         var same_ids: usize = 0;
+         if (prev) |p| {
+@@ -176,7 +211,7 @@ pub const Tokenizer = struct {
+         };
+         for (segs[same..], counts[same..]) |seg, *c| {
+             const before = ids.items.len;
+-            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, text[seg.start..seg.end], seg.start == 0, &ids);
++            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, text[seg.start..seg.end], seg.start == 0, &ids, null);
+             c.* = ids.items.len - before;
+         }
+         const out = try a.dupe(u32, ids.items);
+@@ -193,10 +228,12 @@ pub const Tokenizer = struct {
+         return out;
+     }
+ 
+-    fn encodeText(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
++    fn encodeText(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32), skip: ?Skip) Error!void {
+         var zero: usize = if (first) unicode.decodeAt(text, 0).len else 0;
+         const normalized = if (t.normalizer) |*n| try n.apply(ctx, text, &zero) else text;
+-        for (try t.splitAdded(ctx, &t.normalized, normalized)) |seg| {
++        // the skipped ranges hold in the normalized text's offsets only when the normalizer kept this text as it was
++        const kept = if (skip) |k| (if (std.mem.eql(u8, normalized, text)) k else null) else null;
++        for (try t.splitAdded(ctx, &t.normalized, normalized, kept)) |seg| {
+             if (seg.id) |id| {
+                 try ids.append(ctx.a, id);
+                 continue;
+@@ -210,12 +247,13 @@ pub const Tokenizer = struct {
+     }
+ 
+     /// Added-token split with tokenizers' lstrip and rstrip rules.
+-    fn splitAdded(t: *const Tokenizer, ctx: *steps.Context, trie: *const Trie, s: []const u8) Error![]const Segment {
++    fn splitAdded(t: *const Tokenizer, ctx: *steps.Context, trie: *const Trie, s: []const u8, skip: ?Skip) Error![]const Segment {
+         var out: std.ArrayList(Segment) = .empty;
+         var done: usize = 0;
+         var at: usize = 0;
+         while (trie.next(s, at)) |hit| {
+             at = hit.end;
++            if (skip) |k| if (k.inside(hit.start, hit.end)) continue; // plain text there: it stays in the text segment
+             const token = t.added[hit.token];
+             var start = hit.start;
+             var stop = hit.end;
+@@ -474,3 +512,43 @@ test "encodeReusing gives encode's ids: texts that share a prefix, the added tok
+     try memoCheck(&t2, 3);
+     try memoCheck(&t2, 4);
+ }
++
++test "encodeProtected: an added token's text inside a span is plain text; with none inside, encode's ids" {
++    const json =
++        \\{"added_tokens":[{"id":8,"content":"<x>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
++        \\  {"id":9,"content":"<n>","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false}],
++        \\ "normalizer":{"type":"Sequence","normalizers":[]},
++        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
++        \\ "decoder":{"type":"ByteLevel"},
++        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
++        \\  "vocab":{"a":0,"b":1,"Ġ":2,"<":3,"x":4,">":5,"n":6,"Ġa":7},"merges":[["Ġ","a"]]}}
++    ;
++    const a = std.testing.allocator;
++    var t = try parse(a, json);
++    defer t.deinit();
++    const text = "a<x>b a<n>b <x>a";
++    const plain = try t.encode(a, text);
++    defer a.free(plain);
++    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u32, plain, &.{8}));
++    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, plain, &.{9}));
++    try std.testing.expect(t.hasAdded(text) and t.hasAdded("b <n>") and !t.hasAdded("a b <y>"));
++    // a span over the first <x> and the <n>: those read as their characters; the last <x> (outside) stays the token
++    const prot = try t.encodeProtected(a, text, &.{ .{ 1, 4 }, .{ 6, 11 } });
++    defer a.free(prot);
++    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, prot, &.{8}));
++    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u32, prot, &.{9}));
++    for ([_]u32{ 3, 4, 5, 6 }) |c| try std.testing.expect(std.mem.indexOfScalar(u32, prot, c) != null);
++    for ([_][]const u32{ plain, prot }) |ids| {
++        const back = try t.decode(a, ids, false);
++        defer a.free(back);
++        try std.testing.expectEqualStrings(text, back);
++    }
++    // spans holding no added token: encode's ids
++    const same = try t.encodeProtected(a, text, &.{ .{ 0, 1 }, .{ 11, 12 } });
++    defer a.free(same);
++    try std.testing.expectEqualSlices(u32, plain, same);
++    // a span touching a token but not over it leaves it the token
++    const touch = try t.encodeProtected(a, text, &.{ .{ 4, 6 } });
++    defer a.free(touch);
++    try std.testing.expectEqualSlices(u32, plain, touch);
++}
+diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
+index ac92848..13c186d 100644
+--- a/zig/src/server/hf_text.zig
++++ b/zig/src/server/hf_text.zig
+@@ -212,9 +212,19 @@ pub const HfText = struct {
+             .render = renderFn,
+             .template_source = sourceFn,
+             .special = specialFn,
++            .added_in = addedInFn,
++            .encode_protected = encodeProtectedFn,
+         } };
+     }
+ 
++    fn addedInFn(ctx: *anyopaque, s: []const u8) bool {
++        return self(ctx).tok.hasAdded(s);
++    }
++
++    fn encodeProtectedFn(ctx: *anyopaque, a: Allocator, s: []const u8, spans: []const [2]usize) model_text.Error![]u32 {
++        return self(ctx).tok.encodeProtected(a, s, spans) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
++    }
++
+     fn specialFn(ctx: *anyopaque, id: u32) bool {
+         const t = self(ctx);
+         const piece = t.tok.id_to_token.get(id) orelse return false;
+diff --git a/zig/src/server/model_text.zig b/zig/src/server/model_text.zig
+index 4f54fe3..1d86eba 100644
+--- a/zig/src/server/model_text.zig
++++ b/zig/src/server/model_text.zig
+@@ -38,6 +38,11 @@ pub const Text = struct {
+         template_source: *const fn (ctx: *anyopaque) []const u8,
+         /// Whether an id is a special token (an added token flagged special); null: none are known.
+         special: ?*const fn (ctx: *anyopaque, id: u32) bool = null,
++        /// Whether a text holds an added token's text (one encode reads as that token); null: never asked.
++        added_in: ?*const fn (ctx: *anyopaque, text: []const u8) bool = null,
++        /// encode's ids (nothing prepended), but an added token's text overlapping one of ``spans`` (byte ranges of
++        /// the text, sorted, apart) is read as plain text.
++        encode_protected: ?*const fn (ctx: *anyopaque, a: Allocator, text: []const u8, spans: []const [2]usize) Error![]u32 = null,
+     };
+ 
+     pub fn encode(t: Text, a: Allocator, text: []const u8, add_special: bool) Error![]u32 {
+@@ -68,10 +73,27 @@ pub const Text = struct {
+         return t.vtable.render(t.ctx, a, messages, options, problem);
+     }
+ 
+-    /// The chat template's ids, as ``apply_chat_template(tokenize=True)`` gives them.
++    /// The chat template's ids, as ``apply_chat_template(tokenize=True)`` gives them, except that the text a message
++    /// carries (content, reasoning, a tool call's arguments) is read as text: an added token's characters in it (a file
++    /// holding "</think>", a log with the end-of-sentence marker) stay those characters instead of becoming the token
++    /// the template's own markup is. A prompt whose messages carry no such text gets the very ids it got before.
+     pub fn renderIds(t: Text, a: Allocator, messages: json.Value, options: RenderOptions, problem: *[]const u8) Error![]u32 {
+         const text = try t.render(a, messages, options, problem);
+-        return t.encode(a, text, false);
++        const added_in = t.vtable.added_in orelse return t.encode(a, text, false);
++        const protect = t.vtable.encode_protected orelse return t.encode(a, text, false);
++        var originals: std.ArrayList([]const u8) = .empty;
++        const marked = (try markStrings(a, messages, &originals, t.ctx, added_in)) orelse return t.encode(a, text, false);
++        // the template once more, each such string a placeholder; the strings put back where the placeholders landed
++        var ignored: []const u8 = "";
++        const placed = t.render(a, marked, options, &ignored) catch |e| switch (e) {
++            error.OutOfMemory => return error.OutOfMemory,
++            error.Template => return t.encode(a, text, false),
++        };
++        var spans: std.ArrayList([2]usize) = .empty;
++        const back = (try restore(a, placed, originals.items, &spans)) orelse return t.encode(a, text, false);
++        // only when the template wrote each placeholder as it writes its string (else it read the string: as before)
++        if (spans.items.len == 0 or !std.mem.eql(u8, back, text)) return t.encode(a, text, false);
++        return protect(t.ctx, a, text, spans.items);
+     }
+ 
+     pub fn templateSource(t: Text) []const u8 {
+@@ -84,3 +106,141 @@ pub const Text = struct {
+     }
+ 
+ };
++
++/// The placeholder a message's string becomes (markStrings): U+E000, its index, U+E001 (private use characters).
++const mark_open = "\u{E000}";
++const mark_close = "\u{E001}";
++
++/// A copy of ``messages`` in which each string a message carries that holds an added token's text (its content, or
++/// a content part's text; reasoning_content or reasoning; a tool call's arguments, or their string values when they
++/// are an object) is a placeholder; the strings go to ``originals`` in index order. Null when there is none, or when
++/// one of a message's strings holds the placeholder characters itself.
++fn markStrings(a: Allocator, messages: json.Value, originals: *std.ArrayList([]const u8), ctx: *anyopaque, added_in: *const fn (ctx: *anyopaque, text: []const u8) bool) Allocator.Error!?json.Value {
++    if (messages != .array) return null;
++    var m: Marker = .{ .a = a, .originals = originals, .ctx = ctx, .added_in = added_in };
++    const out = try a.alloc(json.Value, messages.array.len);
++    for (messages.array, out) |msg, *o| o.* = try m.message(msg);
++    if (m.clash or originals.items.len == 0) return null;
++    return .{ .array = out };
++}
++
++const Marker = struct {
++    a: Allocator,
++    originals: *std.ArrayList([]const u8),
++    ctx: *anyopaque,
++    added_in: *const fn (ctx: *anyopaque, text: []const u8) bool,
++    clash: bool = false,
++
++    fn str(m: *Marker, v: json.Value) Allocator.Error!json.Value {
++        if (v != .string) return v;
++        if (std.mem.indexOf(u8, v.string, mark_open) != null or std.mem.indexOf(u8, v.string, mark_close) != null) {
++            m.clash = true;
++            return v;
++        }
++        if (!m.added_in(m.ctx, v.string)) return v;
++        try m.originals.append(m.a, v.string);
++        return .{ .string = try std.fmt.allocPrint(m.a, mark_open ++ "{d}" ++ mark_close, .{m.originals.items.len - 1}) };
++    }
++
++    fn copy(m: *Marker, v: json.Value) Allocator.Error!*json.Object {
++        const o = try json.newObject(m.a);
++        var it = v.object.iterator();
++        while (it.next()) |e| try o.put(m.a, e.key_ptr.*, e.value_ptr.*);
++        return o;
++    }
++
++    fn message(m: *Marker, v: json.Value) Allocator.Error!json.Value {
++        if (v != .object) return v;
++        const o = try m.copy(v);
++        if (o.getPtr("content")) |c| switch (c.*) {
++            .string => c.* = try m.str(c.*),
++            .array => |parts| {
++                const out = try m.a.alloc(json.Value, parts.len);
++                for (parts, out) |p, *q| {
++                    q.* = p;
++                    if (p == .object) if (p.object.get("text")) |t| if (t == .string) {
++                        const po = try m.copy(p);
++                        try po.put(m.a, "text", try m.str(t));
++                        q.* = .{ .object = po };
++                    };
++                }
++                c.* = .{ .array = out };
++            },
++            else => {},
++        };
++        for ([_][]const u8{ "reasoning_content", "reasoning" }) |k| if (o.getPtr(k)) |r| {
++            r.* = try m.str(r.*);
++        };
++        if (o.getPtr("tool_calls")) |tc| if (tc.* == .array) {
++            const calls = try m.a.alloc(json.Value, tc.array.len);
++            for (tc.array, calls) |call, *out| {
++                out.* = call;
++                if (call != .object) continue;
++                const co = try m.copy(call);
++                if (co.getPtr("function")) |f| if (f.* == .object) {
++                    const fo = try m.copy(f.*);
++                    if (fo.getPtr("arguments")) |args| switch (args.*) {
++                        .string => args.* = try m.str(args.*),
++                        .object => {
++                            const ao = try m.copy(args.*);
++                            for (ao.values()) |*x| x.* = try m.str(x.*);
++                            args.* = .{ .object = ao };
++                        },
++                        else => {},
++                    };
++                    f.* = .{ .object = fo };
++                };
++                out.* = .{ .object = co };
++            }
++            tc.* = .{ .array = calls };
++        };
++        return .{ .object = o };
++    }
++};
++
++/// ``placed`` with each placeholder put back as its string, and the byte range each string lands at (in order, apart);
++/// null when a placeholder names no string.
++fn restore(a: Allocator, placed: []const u8, originals: []const []const u8, spans: *std.ArrayList([2]usize)) Allocator.Error!?[]u8 {
++    var out: std.ArrayList(u8) = .empty;
++    var i: usize = 0;
++    while (std.mem.indexOfPos(u8, placed, i, mark_open)) |p| {
++        try out.appendSlice(a, placed[i..p]);
++        const q = std.mem.indexOfPos(u8, placed, p + mark_open.len, mark_close) orelse return null;
++        const k = std.fmt.parseInt(usize, placed[p + mark_open.len .. q], 10) catch return null;
++        if (k >= originals.len) return null;
++        try spans.append(a, .{ out.items.len, out.items.len + originals[k].len });
++        try out.appendSlice(a, originals[k]);
++        i = q + mark_close.len;
++    }
++    try out.appendSlice(a, placed[i..]);
++    return out.items;
++}
++
++test "a message's strings holding an added token's text become placeholders, and come back where they land" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const parsed = (try json.parseText(a, "[{\"role\":\"user\",\"content\":\"read <T> here\"},{\"role\":\"assistant\",\"content\":\"plain\",\"reasoning_content\":\"so <T>\",\"tool_calls\":[{\"function\":{\"name\":\"f\",\"arguments\":{\"p\":\"x<T>\",\"n\":3}}}]},{\"role\":\"tool\",\"content\":[{\"type\":\"text\",\"text\":\"<T>!\"}]}]")).ok;
++    const has = struct {
++        fn f(_: *anyopaque, s: []const u8) bool {
++            return std.mem.indexOf(u8, s, "<T>") != null;
++        }
++    }.f;
++    var originals: std.ArrayList([]const u8) = .empty;
++    var dummy: u8 = 0;
++    const marked = (try markStrings(a, parsed, &originals, &dummy, has)).?;
++    try std.testing.expectEqual(@as(usize, 4), originals.items.len);
++    try std.testing.expectEqualStrings("plain", marked.array[1].object.get("content").?.string);
++    // a render that writes them in order between markup
++    const placed = try std.mem.concat(a, u8, &.{ "<U>", marked.array[0].object.get("content").?.string, "<A>", marked.array[1].object.get("reasoning_content").?.string, "</A>" });
++    var spans: std.ArrayList([2]usize) = .empty;
++    const back = (try restore(a, placed, originals.items, &spans)).?;
++    try std.testing.expectEqualStrings("<U>read <T> here<A>so <T></A>", back);
++    try std.testing.expectEqual(@as(usize, 2), spans.items.len);
++    try std.testing.expectEqualStrings("read <T> here", back[spans.items[0][0]..spans.items[0][1]]);
++    try std.testing.expectEqualStrings("so <T>", back[spans.items[1][0]..spans.items[1][1]]);
++    // none: null; a string holding the placeholder character: null
++    var none: std.ArrayList([]const u8) = .empty;
++    try std.testing.expect((try markStrings(a, (try json.parseText(a, "[{\"role\":\"user\",\"content\":\"hi\"}]")).ok, &none, &dummy, has)) == null);
++    try std.testing.expect((try markStrings(a, (try json.parseText(a, "[{\"role\":\"user\",\"content\":\"<T>\u{E000}\"}]")).ok, &none, &dummy, has)) == null);
++}

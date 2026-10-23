@@ -1,0 +1,16 @@
+A chat message's text tokenized as text (zig/patches/0037): an added token's characters in a message stay characters
+
+Before: the template's rendered text was tokenized whole, so "<think>", "</think>" or "<｜end▁of▁sentence｜>" inside a
+message (a file a tool read, a log, a question about the tags) became those tokens (128821, 128822, 1). Asked for a
+one-liner removing "<think>...</think>", the model at reasoning effort low quoted the tag inside its reasoning as the
+token 128822; the server took that for the end of the reasoning and sent the rest of it as the reply (finish length).
+
+The real tokenizer and chat template, renderIds against render + encode (a check run outside the image):
+  three agent conversations (tools, 25,255-41,871 ids), thinking on and off      6 of 6 the same ids
+  a user message with <think>x</think> (thinking on)                            128821 2 -> 1, 128822 1 -> 0
+  a tool result with the end-of-sentence text, ｜DSML｜ and </think>               1 2 -> 1, 128822 4 -> 3
+  a call's arguments (an object) and reasoning holding the tags                  128821 6 -> 4, 128822 4 -> 3
+  a content parts list with <think>                                             128821 1 -> 0
+  every changed prompt decodes back to the rendered text; what is left is the template's own markup
+Tests: the tokenizer's split with ranges (inside: characters; outside or touching: the token; no match inside: encode's
+ids), the placeholders' round trip; 230 of 230 in a clean build.
