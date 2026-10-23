@@ -1,8 +1,8 @@
 diff --git a/zig/src/core/tokenizer/tokenizer.zig b/zig/src/core/tokenizer/tokenizer.zig
-index 4a1ab4e..3160b1c 100644
+index 4a1ab4e..cca8a59 100644
 --- a/zig/src/core/tokenizer/tokenizer.zig
 +++ b/zig/src/core/tokenizer/tokenizer.zig
-@@ -124,8 +124,43 @@ pub const Tokenizer = struct {
+@@ -124,8 +124,51 @@ pub const Tokenizer = struct {
              valid = fixed.items;
          }
          var ids: std.ArrayList(u32) = .empty;
@@ -14,15 +14,23 @@ index 4a1ab4e..3160b1c 100644
 +        return a.dupe(u32, ids.items);
 +    }
 +
-+    /// Whether `s` holds an added token's text (one encode would read as that token).
-+    pub fn hasAdded(t: *const Tokenizer, s: []const u8) bool {
-+        return t.raw.next(s, 0) != null or t.normalized.next(s, 0) != null;
++    /// Whether `s` holds an added token's text (one encode would read as that token), one not in `keep` (ids).
++    pub fn hasAdded(t: *const Tokenizer, s: []const u8, keep: []const u32) bool {
++        for ([_]*const Trie{ &t.raw, &t.normalized }) |trie| {
++            var at: usize = 0;
++            while (trie.next(s, at)) |hit| {
++                if (std.mem.indexOfScalar(u32, keep, t.added[hit.token].id) == null) return true;
++                at = hit.end;
++            }
++        }
++        return false;
 +    }
 +
 +    /// Byte ranges of a text where added tokens are not matched: their text there is plain text.
 +    pub const Skip = struct {
 +        base: usize = 0, // where the text being split starts in the whole one
 +        spans: []const [2]usize, // [start, end) of the whole text, sorted by start, apart
++        keep: []const u32 = &.{}, // added tokens matched inside the spans too (ids)
 +
 +        fn inside(k: Skip, lo: usize, hi: usize) bool {
 +            for (k.spans) |sp| {
@@ -37,18 +45,18 @@ index 4a1ab4e..3160b1c 100644
 +    /// read as plain text, not as the token: a chat message's content keeps the characters it has. A text with no
 +    /// added token inside a span gets encode's ids exactly (the same split, the same pieces). Only a valid UTF-8 text
 +    /// (else encode, whose lossy read moves the offsets); a segment its normalizer changes keeps its matches.
-+    pub fn encodeProtected(t: *const Tokenizer, a: Allocator, text: []const u8, spans: []const [2]usize) Error![]u32 {
++    pub fn encodeProtected(t: *const Tokenizer, a: Allocator, text: []const u8, spans: []const [2]usize, keep: []const u32) Error![]u32 {
 +        if (spans.len == 0 or !std.unicode.utf8ValidateSlice(text)) return t.encode(a, text);
 +        var arena = std.heap.ArenaAllocator.init(a);
 +        defer arena.deinit();
 +        var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
 +        var ids: std.ArrayList(u32) = .empty;
-+        for (try t.splitAdded(&ctx, &t.raw, text, .{ .spans = spans })) |seg| {
-+            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, text[seg.start..seg.end], seg.start == 0, &ids, .{ .base = seg.start, .spans = spans });
++        for (try t.splitAdded(&ctx, &t.raw, text, .{ .spans = spans, .keep = keep })) |seg| {
++            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, text[seg.start..seg.end], seg.start == 0, &ids, .{ .base = seg.start, .spans = spans, .keep = keep });
          }
          return a.dupe(u32, ids.items);
      }
-@@ -154,7 +189,7 @@ pub const Tokenizer = struct {
+@@ -154,7 +197,7 @@ pub const Tokenizer = struct {
          var arena = std.heap.ArenaAllocator.init(a);
          defer arena.deinit();
          var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
@@ -57,7 +65,7 @@ index 4a1ab4e..3160b1c 100644
          var same: usize = 0;
          var same_ids: usize = 0;
          if (prev) |p| {
-@@ -176,7 +211,7 @@ pub const Tokenizer = struct {
+@@ -176,7 +219,7 @@ pub const Tokenizer = struct {
          };
          for (segs[same..], counts[same..]) |seg, *c| {
              const before = ids.items.len;
@@ -66,7 +74,7 @@ index 4a1ab4e..3160b1c 100644
              c.* = ids.items.len - before;
          }
          const out = try a.dupe(u32, ids.items);
-@@ -193,10 +228,12 @@ pub const Tokenizer = struct {
+@@ -193,10 +236,12 @@ pub const Tokenizer = struct {
          return out;
      }
  
@@ -81,7 +89,7 @@ index 4a1ab4e..3160b1c 100644
              if (seg.id) |id| {
                  try ids.append(ctx.a, id);
                  continue;
-@@ -210,12 +247,13 @@ pub const Tokenizer = struct {
+@@ -210,13 +255,15 @@ pub const Tokenizer = struct {
      }
  
      /// Added-token split with tokenizers' lstrip and rstrip rules.
@@ -92,11 +100,13 @@ index 4a1ab4e..3160b1c 100644
          var at: usize = 0;
          while (trie.next(s, at)) |hit| {
              at = hit.end;
-+            if (skip) |k| if (k.inside(hit.start, hit.end)) continue; // plain text there: it stays in the text segment
              const token = t.added[hit.token];
++            // plain text there (it stays in the text segment), unless a token kept as a token
++            if (skip) |k| if (k.inside(hit.start, hit.end) and std.mem.indexOfScalar(u32, k.keep, token.id) == null) continue;
              var start = hit.start;
              var stop = hit.end;
-@@ -474,3 +512,43 @@ test "encodeReusing gives encode's ids: texts that share a prefix, the added tok
+             if (token.lstrip) {
+@@ -474,3 +521,49 @@ test "encodeReusing gives encode's ids: texts that share a prefix, the added tok
      try memoCheck(&t2, 3);
      try memoCheck(&t2, 4);
  }
@@ -119,9 +129,10 @@ index 4a1ab4e..3160b1c 100644
 +    defer a.free(plain);
 +    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u32, plain, &.{8}));
 +    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, plain, &.{9}));
-+    try std.testing.expect(t.hasAdded(text) and t.hasAdded("b <n>") and !t.hasAdded("a b <y>"));
++    try std.testing.expect(t.hasAdded(text, &.{}) and t.hasAdded("b <n>", &.{}) and !t.hasAdded("a b <y>", &.{}));
++    try std.testing.expect(!t.hasAdded("a <x> b", &.{8}) and t.hasAdded("a <x> <n>", &.{8}));
 +    // a span over the first <x> and the <n>: those read as their characters; the last <x> (outside) stays the token
-+    const prot = try t.encodeProtected(a, text, &.{ .{ 1, 4 }, .{ 6, 11 } });
++    const prot = try t.encodeProtected(a, text, &.{ .{ 1, 4 }, .{ 6, 11 } }, &.{});
 +    defer a.free(prot);
 +    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, prot, &.{8}));
 +    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u32, prot, &.{9}));
@@ -132,16 +143,21 @@ index 4a1ab4e..3160b1c 100644
 +        try std.testing.expectEqualStrings(text, back);
 +    }
 +    // spans holding no added token: encode's ids
-+    const same = try t.encodeProtected(a, text, &.{ .{ 0, 1 }, .{ 11, 12 } });
++    const same = try t.encodeProtected(a, text, &.{ .{ 0, 1 }, .{ 11, 12 } }, &.{});
 +    defer a.free(same);
 +    try std.testing.expectEqualSlices(u32, plain, same);
 +    // a span touching a token but not over it leaves it the token
-+    const touch = try t.encodeProtected(a, text, &.{ .{ 4, 6 } });
++    const touch = try t.encodeProtected(a, text, &.{ .{ 4, 6 } }, &.{});
 +    defer a.free(touch);
 +    try std.testing.expectEqualSlices(u32, plain, touch);
++    // a kept token (a server's picture placeholder) stays the token inside a span; the other one there does not
++    const kept = try t.encodeProtected(a, text, &.{ .{ 0, 16 } }, &.{8});
++    defer a.free(kept);
++    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u32, kept, &.{8}));
++    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u32, kept, &.{9}));
 +}
 diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
-index ac92848..13c186d 100644
+index ac92848..216e1e0 100644
 --- a/zig/src/server/hf_text.zig
 +++ b/zig/src/server/hf_text.zig
 @@ -212,9 +212,19 @@ pub const HfText = struct {
@@ -153,34 +169,44 @@ index ac92848..13c186d 100644
          } };
      }
  
-+    fn addedInFn(ctx: *anyopaque, s: []const u8) bool {
-+        return self(ctx).tok.hasAdded(s);
++    fn addedInFn(ctx: *anyopaque, s: []const u8, keep: []const u32) bool {
++        return self(ctx).tok.hasAdded(s, keep);
 +    }
 +
-+    fn encodeProtectedFn(ctx: *anyopaque, a: Allocator, s: []const u8, spans: []const [2]usize) model_text.Error![]u32 {
-+        return self(ctx).tok.encodeProtected(a, s, spans) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
++    fn encodeProtectedFn(ctx: *anyopaque, a: Allocator, s: []const u8, spans: []const [2]usize, keep: []const u32) model_text.Error![]u32 {
++        return self(ctx).tok.encodeProtected(a, s, spans, keep) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
 +    }
 +
      fn specialFn(ctx: *anyopaque, id: u32) bool {
          const t = self(ctx);
          const piece = t.tok.id_to_token.get(id) orelse return false;
 diff --git a/zig/src/server/model_text.zig b/zig/src/server/model_text.zig
-index 4f54fe3..1d86eba 100644
+index 4f54fe3..50ab140 100644
 --- a/zig/src/server/model_text.zig
 +++ b/zig/src/server/model_text.zig
-@@ -38,6 +38,11 @@ pub const Text = struct {
+@@ -12,6 +12,9 @@ pub const RenderOptions = struct {
+     reasoning_effort: ?[]const u8 = null,
+     /// The family's number for that effort (Info.efforts): the template hears the number instead of the name.
+     reasoning_effort_value: ?i64 = null,
++    /// Added tokens whose text stays the token inside a message's text too: the picture placeholder a server put where
++    /// an image part was (it escapes a message's own copies of it before).
++    keep: []const []const u8 = &.{},
+ };
+ 
+ pub const Error = error{ Template, OutOfMemory };
+@@ -38,6 +41,11 @@ pub const Text = struct {
          template_source: *const fn (ctx: *anyopaque) []const u8,
          /// Whether an id is a special token (an added token flagged special); null: none are known.
          special: ?*const fn (ctx: *anyopaque, id: u32) bool = null,
 +        /// Whether a text holds an added token's text (one encode reads as that token); null: never asked.
-+        added_in: ?*const fn (ctx: *anyopaque, text: []const u8) bool = null,
++        added_in: ?*const fn (ctx: *anyopaque, text: []const u8, keep: []const u32) bool = null,
 +        /// encode's ids (nothing prepended), but an added token's text overlapping one of ``spans`` (byte ranges of
 +        /// the text, sorted, apart) is read as plain text.
-+        encode_protected: ?*const fn (ctx: *anyopaque, a: Allocator, text: []const u8, spans: []const [2]usize) Error![]u32 = null,
++        encode_protected: ?*const fn (ctx: *anyopaque, a: Allocator, text: []const u8, spans: []const [2]usize, keep: []const u32) Error![]u32 = null,
      };
  
      pub fn encode(t: Text, a: Allocator, text: []const u8, add_special: bool) Error![]u32 {
-@@ -68,10 +73,27 @@ pub const Text = struct {
+@@ -68,10 +76,29 @@ pub const Text = struct {
          return t.vtable.render(t.ctx, a, messages, options, problem);
      }
  
@@ -194,8 +220,10 @@ index 4f54fe3..1d86eba 100644
 -        return t.encode(a, text, false);
 +        const added_in = t.vtable.added_in orelse return t.encode(a, text, false);
 +        const protect = t.vtable.encode_protected orelse return t.encode(a, text, false);
++        var keep: std.ArrayList(u32) = .empty;
++        for (options.keep) |k| if (t.tokenId(k)) |id| try keep.append(a, id);
 +        var originals: std.ArrayList([]const u8) = .empty;
-+        const marked = (try markStrings(a, messages, &originals, t.ctx, added_in)) orelse return t.encode(a, text, false);
++        const marked = (try markStrings(a, messages, &originals, t.ctx, added_in, keep.items)) orelse return t.encode(a, text, false);
 +        // the template once more, each such string a placeholder; the strings put back where the placeholders landed
 +        var ignored: []const u8 = "";
 +        const placed = t.render(a, marked, options, &ignored) catch |e| switch (e) {
@@ -206,11 +234,11 @@ index 4f54fe3..1d86eba 100644
 +        const back = (try restore(a, placed, originals.items, &spans)) orelse return t.encode(a, text, false);
 +        // only when the template wrote each placeholder as it writes its string (else it read the string: as before)
 +        if (spans.items.len == 0 or !std.mem.eql(u8, back, text)) return t.encode(a, text, false);
-+        return protect(t.ctx, a, text, spans.items);
++        return protect(t.ctx, a, text, spans.items, keep.items);
      }
  
      pub fn templateSource(t: Text) []const u8 {
-@@ -84,3 +106,141 @@ pub const Text = struct {
+@@ -84,3 +111,142 @@ pub const Text = struct {
      }
  
  };
@@ -223,9 +251,9 @@ index 4f54fe3..1d86eba 100644
 +/// a content part's text; reasoning_content or reasoning; a tool call's arguments, or their string values when they
 +/// are an object) is a placeholder; the strings go to ``originals`` in index order. Null when there is none, or when
 +/// one of a message's strings holds the placeholder characters itself.
-+fn markStrings(a: Allocator, messages: json.Value, originals: *std.ArrayList([]const u8), ctx: *anyopaque, added_in: *const fn (ctx: *anyopaque, text: []const u8) bool) Allocator.Error!?json.Value {
++fn markStrings(a: Allocator, messages: json.Value, originals: *std.ArrayList([]const u8), ctx: *anyopaque, added_in: *const fn (ctx: *anyopaque, text: []const u8, keep: []const u32) bool, keep: []const u32) Allocator.Error!?json.Value {
 +    if (messages != .array) return null;
-+    var m: Marker = .{ .a = a, .originals = originals, .ctx = ctx, .added_in = added_in };
++    var m: Marker = .{ .a = a, .originals = originals, .ctx = ctx, .added_in = added_in, .keep = keep };
 +    const out = try a.alloc(json.Value, messages.array.len);
 +    for (messages.array, out) |msg, *o| o.* = try m.message(msg);
 +    if (m.clash or originals.items.len == 0) return null;
@@ -236,7 +264,8 @@ index 4f54fe3..1d86eba 100644
 +    a: Allocator,
 +    originals: *std.ArrayList([]const u8),
 +    ctx: *anyopaque,
-+    added_in: *const fn (ctx: *anyopaque, text: []const u8) bool,
++    added_in: *const fn (ctx: *anyopaque, text: []const u8, keep: []const u32) bool,
++    keep: []const u32,
 +    clash: bool = false,
 +
 +    fn str(m: *Marker, v: json.Value) Allocator.Error!json.Value {
@@ -245,7 +274,7 @@ index 4f54fe3..1d86eba 100644
 +            m.clash = true;
 +            return v;
 +        }
-+        if (!m.added_in(m.ctx, v.string)) return v;
++        if (!m.added_in(m.ctx, v.string, m.keep)) return v;
 +        try m.originals.append(m.a, v.string);
 +        return .{ .string = try std.fmt.allocPrint(m.a, mark_open ++ "{d}" ++ mark_close, .{m.originals.items.len - 1}) };
 +    }
@@ -330,13 +359,13 @@ index 4f54fe3..1d86eba 100644
 +    const a = arena.allocator();
 +    const parsed = (try json.parseText(a, "[{\"role\":\"user\",\"content\":\"read <T> here\"},{\"role\":\"assistant\",\"content\":\"plain\",\"reasoning_content\":\"so <T>\",\"tool_calls\":[{\"function\":{\"name\":\"f\",\"arguments\":{\"p\":\"x<T>\",\"n\":3}}}]},{\"role\":\"tool\",\"content\":[{\"type\":\"text\",\"text\":\"<T>!\"}]}]")).ok;
 +    const has = struct {
-+        fn f(_: *anyopaque, s: []const u8) bool {
++        fn f(_: *anyopaque, s: []const u8, _: []const u32) bool {
 +            return std.mem.indexOf(u8, s, "<T>") != null;
 +        }
 +    }.f;
 +    var originals: std.ArrayList([]const u8) = .empty;
 +    var dummy: u8 = 0;
-+    const marked = (try markStrings(a, parsed, &originals, &dummy, has)).?;
++    const marked = (try markStrings(a, parsed, &originals, &dummy, has, &.{})).?;
 +    try std.testing.expectEqual(@as(usize, 4), originals.items.len);
 +    try std.testing.expectEqualStrings("plain", marked.array[1].object.get("content").?.string);
 +    // a render that writes them in order between markup
@@ -349,6 +378,19 @@ index 4f54fe3..1d86eba 100644
 +    try std.testing.expectEqualStrings("so <T>", back[spans.items[1][0]..spans.items[1][1]]);
 +    // none: null; a string holding the placeholder character: null
 +    var none: std.ArrayList([]const u8) = .empty;
-+    try std.testing.expect((try markStrings(a, (try json.parseText(a, "[{\"role\":\"user\",\"content\":\"hi\"}]")).ok, &none, &dummy, has)) == null);
-+    try std.testing.expect((try markStrings(a, (try json.parseText(a, "[{\"role\":\"user\",\"content\":\"<T>\u{E000}\"}]")).ok, &none, &dummy, has)) == null);
++    try std.testing.expect((try markStrings(a, (try json.parseText(a, "[{\"role\":\"user\",\"content\":\"hi\"}]")).ok, &none, &dummy, has, &.{})) == null);
++    try std.testing.expect((try markStrings(a, (try json.parseText(a, "[{\"role\":\"user\",\"content\":\"<T>\u{E000}\"}]")).ok, &none, &dummy, has, &.{})) == null);
 +}
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index ac33ab1..801a751 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -25,6 +25,8 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
+         .enable_thinking = thinking,
+         .reasoning_effort = if (thinking) effort else null,
+         .reasoning_effort_value = if (thinking) srv.effortValue(effort) else null,
++        // the picture placeholder normalize put where an image part was stays its token in the message's text
++        .keep = if (srv.info.vision) |v| try cx.a.dupe([]const u8, &.{v.placeholder}) else &.{},
+     };
+     var ids = srv.text.renderIds(cx.a, normalized, options, &problem) catch |e| switch (e) {
+         error.OutOfMemory => return error.OutOfMemory,

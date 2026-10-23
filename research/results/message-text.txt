@@ -11,6 +11,10 @@ The real tokenizer and chat template, renderIds against render + encode (a check
   a tool result with the end-of-sentence text, ｜DSML｜ and </think>               1 2 -> 1, 128822 4 -> 3
   a call's arguments (an object) and reasoning holding the tags                  128821 6 -> 4, 128822 4 -> 3
   a content parts list with <think>                                             128821 1 -> 0
+  the picture placeholder alone (a server's image part): kept, the old path      the same ids
+  the picture placeholder with </think> text                                    129264 1 -> 1, 128822 1 -> 0
+(a first version left the placeholder out of the kept tokens: image input failed its check on the served engine, and
+was taken back within minutes; the placeholder is kept since)
   every changed prompt decodes back to the rendered text; what is left is the template's own markup
 Tests: the tokenizer's split with ranges (inside: characters; outside or touching: the token; no match inside: encode's
 ids), the placeholders' round trip; 230 of 230 in a clean build.
