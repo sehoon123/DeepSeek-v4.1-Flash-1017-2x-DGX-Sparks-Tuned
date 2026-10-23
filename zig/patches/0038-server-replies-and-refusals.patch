@@ -1,0 +1,77 @@
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 3f8cb3a..d32f6d1 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -177,6 +177,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
+         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
+         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
++        error.SamplingNeedsTopK => "sampling here draws from the top_k likeliest tokens: top_k 0 (or below) with a temperature above 0 is not supported; send top_k 1 to 56, or leave it unset for the server's",
++        error.TooManyCandidates => "top_k is at most 56 here (the sampler holds 64 candidates)",
+         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
+         else => null,
+     };
+diff --git a/zig/src/families/dsv41/sampling.zig b/zig/src/families/dsv41/sampling.zig
+index cfa6f2b..84f629c 100644
+--- a/zig/src/families/dsv41/sampling.zig
++++ b/zig/src/families/dsv41/sampling.zig
+@@ -135,7 +135,7 @@ pub fn argmax(row: []const f32) usize {
+ /// sample_rows for one row of fp32 logits at absolute position `position`: the token.
+ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
+     if (s.temperature <= 0) return @intCast(argmax(row));
+-    if (s.top_k == 0) return error.NotPortedYet; // the nucleus path (top_k off: a model setting only top_p)
++    if (s.top_k == 0) return error.SamplingNeedsTopK; // the nucleus path (top_k off: a model setting only top_p)
+     const count = @min(row.len, s.top_k + margin);
+     if (count > max_candidates) return error.TooManyCandidates;
+     var values: [max_candidates]f32 = undefined;
+@@ -148,7 +148,7 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
+ /// min(row_len, top_k + margin) of them) instead of the row: the same checks, the same choice.
+ pub fn sampleCandidates(values: []const f32, ids: []const i64, row_len: usize, position: u64, s: Sampling) !i64 {
+     if (s.temperature <= 0) return ids[0];
+-    if (s.top_k == 0) return error.NotPortedYet;
++    if (s.top_k == 0) return error.SamplingNeedsTopK;
+     const count = @min(row_len, s.top_k + margin);
+     if (count > max_candidates) return error.TooManyCandidates;
+     if (values.len < count or ids.len < count) return error.TooFewCandidates;
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index de52b3a..ba3db9c 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -9,6 +9,7 @@ const grammar = @import("grammar.zig");
+ const messages = @import("messages.zig");
+ const tool_specs = @import("tool_specs.zig");
+ const tool_parse = @import("tool_parse.zig");
++const reply_text = @import("reply_text.zig");
+ const tool_stream = @import("tool_stream.zig");
+ const ids = @import("ids.zig");
+ const log = @import("log.zig");
+@@ -302,11 +303,16 @@ const Run = struct {
+         const tools = r.plan.input.tools;
+         if (tools.len == 0) return null;
+         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
++        // a reply max_tokens cut inside a DSML call block: the block's unfinished markup is no content (a stream hides it)
++        const cut = std.mem.eql(u8, reply.finish_reason, "length") and tool_parse.beforeDsml(parsed.content).len < parsed.content.len;
++        const left = if (cut) reply_text.pyStrip(tool_parse.beforeDsml(parsed.content)) else parsed.content;
+         const calls = parsed.calls orelse {
+-            if (r.plan.policy.single) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
++            if (r.plan.policy.single) {
++                reply.content = try r.plan.policy.parsedContent(r.a, left);
++            } else if (cut) reply.content = left;
+             return null;
+         };
+-        reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
++        reply.content = try r.plan.policy.parsedContent(r.a, left);
+         reply.finish_reason = "tool_calls";
+         if (r.plan.policy.single) reply.tool_calls_streamed = false;
+         return if (r.plan.policy.single and calls.len > 1) calls[0..1] else calls;
+@@ -365,7 +371,9 @@ const Run = struct {
+         if (r.is_chat) {
+             const message = try json.newObject(a);
+             try message.put(a, "role", .{ .string = "assistant" });
+-            try message.put(a, "content", if (calls != null) .null else .{ .string = reply.content });
++            // with calls, the prose the reply had before them (as a stream sends it), null when there is none
++            const has_prose = calls == null or reply_text.pyStrip(reply.content).len > 0;
++            try message.put(a, "content", if (has_prose) .{ .string = reply.content } else .null);
+             if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
+             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
+             try choice.put(a, "message", .{ .object = message });
