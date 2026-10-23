@@ -22,7 +22,9 @@ the conversation's earlier state first. After a reply ending in tool calls the w
 (WARM_DELAY_TOOL, 0): the client runs the tools meanwhile, and the chunk computed is one its next request needs anyway. The state is the one the client's own request would compute (the same
 tokens, the same chunk boundaries), so replies are the same bits (checked: a resumed reply equal to the same request
 from an empty cache). A client request arriving while a warm-ahead runs closes it (the server stops at its current
-chunk). The reply is appended as the server sent it; a client is warmed ahead only once its next request has shown that
+chunk; a warm connection is opened before it is published and never reopened, so one closed this way stays closed). A client
+that goes while its own request runs (an interrupted turn) closes the server's connection too, so the server cancels
+that request at once instead of after its prompt pass. The reply is appended as the server sent it; a client is warmed ahead only once its next request has shown that
 it sends replies back that way, or in a way learned from it (reasoning dropped, tool-call arguments re-serialized, text
 trimmed), per client (a hash of its system prompt and tools); a client that sends them back otherwise is not. No
 harness is assumed.
@@ -34,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import select
 import socket
 import threading
 import time
@@ -458,7 +461,10 @@ def schedule(api, path, body, who, reply):
         with W.lock:
             if W.gen != gen or W.inflight > 0 or W.conn is not None:
                 return
-            conn = http.client.HTTPConnection(*BACKEND, timeout=900)
+            try:
+                conn = warm_conn()
+            except OSError:
+                return
             W.conn = conn
             W.stats["sent"] += 1
         t0 = time.time()
@@ -497,12 +503,24 @@ def quiet(seconds):
     return ok and server_idle()
 
 
+def warm_conn():
+    """A warm request's connection, connected now (under W.lock: a client request arriving after it closes a live
+    socket) and never reopened (http.client would open a new one for a request after close(), which nothing tracks)."""
+    conn = http.client.HTTPConnection(*BACKEND, timeout=900)
+    conn.connect()
+    conn.auto_open = 0
+    return conn
+
+
 def send_warm(route, data):
     """One warm request to the server, closed by any client request; True when it ran to its end."""
     with W.lock:
         if W.inflight > 0:
             return False
-        conn = http.client.HTTPConnection(*BACKEND, timeout=900)
+        try:
+            conn = warm_conn()
+        except OSError:
+            return False
         W.conn = conn
     ok = False
     try:
@@ -587,6 +605,26 @@ def client_left():
         W.inflight -= 1
 
 
+def watch_client(sock, bsock, done):
+    """While a client request is on the server: a client that closes its connection (an interrupted turn, a timeout)
+    closes the server's too, so the server cancels the request now, as it does for a client of its own (readable with
+    nothing to read: the server's peerGone), instead of after its prompt pass, when the first token finds no reader."""
+    while not done.wait(0.25):
+        try:
+            readable, _, _ = select.select([sock], [], [], 0)
+            if not readable or sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) != b"":
+                continue
+        except (BlockingIOError, InterruptedError):
+            continue
+        except (OSError, ValueError):
+            pass
+        try:
+            bsock.shutdown(socket.SHUT_RDWR)   # the socket itself: http.client drops conn.sock once a reply that closes begins
+        except (OSError, AttributeError):
+            pass
+        return
+
+
 # ------------------------------------------------------------------------------------------------------- the proxy
 class API(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -647,8 +685,10 @@ class API(BaseHTTPRequestHandler):
         backend = http.client.HTTPConnection(*BACKEND, timeout=3600)   # a 1M-token prefill takes ~16 minutes
         started = completed = False
         whole = b""
+        done = threading.Event()
         try:
             backend.request(self.command, self.path, body=body, headers=headers)
+            threading.Thread(target=watch_client, args=(self.connection, backend.sock, done), daemon=True).start()
             rep = backend.getresponse()
             self.send_response(rep.status)
             skip = HOP_HEADERS | {"server", "date"}
@@ -683,6 +723,7 @@ class API(BaseHTTPRequestHandler):
             if not started:
                 self.error(502, "The model API is unavailable (starting or stopped)")
         finally:
+            done.set()
             backend.close()
             self.close_connection = True
             client_left()
