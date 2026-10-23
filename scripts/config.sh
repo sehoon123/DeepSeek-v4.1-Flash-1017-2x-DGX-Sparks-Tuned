@@ -250,6 +250,11 @@ MIN_AVAIL_WAIT_S="${MIN_AVAIL_WAIT_S:-30}"
 MEMGUARD_GIB="${MEMGUARD_GIB:-2.5}"
 MEMGUARD_HOLD_S="${MEMGUARD_HOLD_S:-4}"
 MEMGUARD_HARD_GIB="${MEMGUARD_HARD_GIB:-1}"
+# MEMGUARD_SPARE=1: before a rank's container, the guard kills the largest other process of this user (resident plus GPU
+# memory, 512 MiB or more; no shell, terminal, session, agent or editor server, nothing of this recipe), up to 3 in one dip,
+# and the container only when that does not bring MemAvailable back over the floor (scripts/memguard.sh). For a head that
+# also runs an agent's tools or builds: one of those dies instead of the server.
+MEMGUARD_SPARE="${MEMGUARD_SPARE:-0}"
 
 # Colours only on a terminal.
 _c() { [[ -t "$1" ]] && printf '\033[%sm' "$2" || true; }

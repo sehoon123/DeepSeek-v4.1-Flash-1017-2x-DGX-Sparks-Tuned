@@ -5,9 +5,14 @@
 #   - MemAvailable under the HARD floor (default 1 GiB) in two samples in a row (0.25 s apart): at once;
 #   - MemAvailable under the (soft) floor for HOLD seconds without once coming back over it (default 4 s): a long prompt's workspace
 #     takes a few GiB for a moment and gives them back, which is not a rank in trouble. A dip that recovers is logged, not killed.
+# With spare (MEMGUARD_SPARE=1) the container is the last thing killed: first the largest process of this user (resident
+# memory plus GPU memory, 512 MiB or more) that is no shell, terminal, session, agent (Pi) or editor server and no part of
+# this recipe (its launcher, proxy, watchdog, this guard): a build or a tool another program ran on this Spark. The container
+# only goes when MemAvailable is not back over the floor 2 s later (0.5 s under the hard floor), after at most 3 such kills in
+# one dip, or when there is no such process.
 # Self-contained: start.sh copies it to the worker.
 #
-# Usage: memguard.sh start <container> <floor GiB> <log file> <pid file> [hold seconds [hard floor GiB]]
+# Usage: memguard.sh start <container> <floor GiB> <log file> <pid file> [hold seconds [hard floor GiB [spare: 0|1]]]
 #                                                       (replaces a guard already running for the pid file)
 #        memguard.sh stop <pid file>
 # The engine keeps its own reserve (TENSORFOLD_MEMORY_RESERVE_GIB, 12.2 GiB by default) free, so a healthy rank stays well
@@ -30,8 +35,32 @@ stop_guard() {
 # a sleep a signal ends at once (a plain sleep holds the guard's exit handler back until it is over)
 nap() { sleep "$1" & wait $!; }
 
+# The process spare kills instead of the container: "pid KiB comm args" (KiB: resident plus GPU memory), or nothing.
+# MEMGUARD_SPARE_ONLY (a regular expression over the arguments, for tests) narrows the choice further.
+spare_victim() {
+  local me gpu line pid exe
+  me=$(id -u)
+  gpu=$(timeout 3 nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+  while read -r line; do
+    pid=${line%% *}
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
+    [[ $exe == */pi-node/* ]] && continue                    # the Pi agent's own runtime
+    echo "$line"; return 0
+  done < <(ps -u "$me" -o pid=,rss=,comm=,args= 2>/dev/null | awk -v self=$$ -v gpu="$gpu" -v only="${MEMGUARD_SPARE_ONLY:-}" '
+      BEGIN { n = split(gpu, g, "\n"); for (i = 1; i <= n; i++) if (split(g[i], f, ",") == 2) gm[f[1]] = f[2] * 1024 }
+      { pid = $1; kib = $2 + gm[$1]; comm = $3
+        if (pid == self) next
+        if (comm ~ /^(pi|bash|sh|dash|zsh|fish|ssh|sshd|sudo|su|login|systemd|\(sd-pam\)|tmux.*|screen|SCREEN|dbus-.*|docker|dockerd|containerd.*|sleep|nohup|timeout|pipewire.*|wireplumber|Xorg|Xwayland|gnome-.*|gvfs.*|at-spi.*|memguard.*)$/) next
+        args = $0; sub(/^ *[0-9]+ +[0-9]+ +[^ ]+ +/, "", args)
+        if (args ~ /auth-proxy\.py|warm_ahead_proxy\.py|dsv41-watchdog\.py|memguard\.sh|start\.sh|wait-worker\.sh|\.vscode-server|code-server|\.cursor-server/) next
+        if (only != "" && args !~ only) next
+        if (kib < 524288) next
+        printf "%d %d %s %s\n", pid, kib, comm, substr(args, 1, 160) }' | sort -k2,2nr | head -n 10)
+}
+
 run_guard() {
-  local c=$1 floor_kb hard_kb log=$3 pidfile=$4 hold_us a snap now since=0 low_min=0 hard_low=0 floor_gib=$2 hold=${5:-4} hard_gib=${6:-1}
+  local c=$1 floor_kb hard_kb log=$3 pidfile=$4 hold_us a snap now since=0 since0=0 low_min=0 hard_low=0 floor_gib=$2 hold=${5:-4} hard_gib=${6:-1}
+  local spare=${7:-0} spared=0 hard v
   floor_kb=$(awk -v g="$floor_gib" 'BEGIN {printf "%d", g * 1048576}')
   hard_kb=$(awk -v g="$hard_gib" 'BEGIN {printf "%d", g * 1048576}')
   hold_us=$(awk -v h="$hold" 'BEGIN {printf "%d", h * 1000000}')
@@ -39,22 +68,33 @@ run_guard() {
   mkdir -p "$(dirname "$log")" "$(dirname "$pidfile")"
   echo $$ > "$pidfile"
   trap '[[ "$(cat "$pidfile" 2>/dev/null)" == "$$" ]] && rm -f "$pidfile"; rm -f "$snap"; exit 0' TERM INT
-  echo "$(stamp) memguard: watching $c, floor $floor_gib GiB for $hold s, hard floor $hard_gib GiB (MemAvailable $(( $(avail_kb) / 1048576 )) GiB now)" >> "$log"
+  echo "$(stamp) memguard: watching $c, floor $floor_gib GiB for $hold s, hard floor $hard_gib GiB$( [[ $spare == 1 ]] && echo ", sparing it: the largest other process first") (MemAvailable $(( $(avail_kb) / 1048576 )) GiB now)" >> "$log"
   while nap 0.25; do
     a=$(avail_kb)
     now=${EPOCHREALTIME/./}
     if (( a >= floor_kb )); then
-      if (( since )); then
-        echo "$(stamp) memguard: MemAvailable was under the $floor_gib GiB floor for $(( (now - since) / 1000 )) ms (lowest $(( low_min / 1024 )) MiB) and recovered: no kill" >> "$log"
+      if (( since0 && spared )); then
+        echo "$(stamp) memguard: MemAvailable back over the $floor_gib GiB floor after $(( (now - since0) / 1000 )) ms (lowest $(( low_min / 1024 )) MiB), $spared process(es) killed: container $c kept running" >> "$log"
+      elif (( since0 )); then
+        echo "$(stamp) memguard: MemAvailable was under the $floor_gib GiB floor for $(( (now - since0) / 1000 )) ms (lowest $(( low_min / 1024 )) MiB) and recovered: no kill" >> "$log"
       fi
-      since=0; hard_low=0; continue
+      since=0; since0=0; hard_low=0; spared=0; continue
     fi
-    if (( ! since )); then since=$now; low_min=$a; fi
+    if (( ! since )); then since=$now; (( since0 )) || { since0=$now; low_min=$a; }; fi
     (( a < low_min )) && low_min=$a
     if (( a < hard_kb )); then (( ++hard_low )); else hard_low=0; fi
     # the hard floor needs two samples (a single read can be a glitch), the soft floor needs HOLD seconds under it throughout
     if (( hard_low < 2 && now - since < hold_us )); then continue; fi
-    since=0; hard_low=0
+    hard=$(( hard_low >= 2 )); hard_low=0
+    # spare: the largest other process first; the next decision comes 2 s later (0.5 s: two more samples under the hard floor)
+    if [[ $spare == 1 ]] && (( spared < 3 )) && v=$(spare_victim) && [[ -n $v ]]; then
+      kill -9 "${v%% *}" 2>/dev/null
+      (( ++spared ))
+      echo "$(stamp) memguard: MemAvailable $(( a / 1024 )) MiB (lowest $(( low_min / 1024 )) MiB) under the $( (( hard )) && echo "$hard_gib GiB hard" || echo "$floor_gib GiB") floor: killed process $v instead of container $c ($spared of 3)" >> "$log"
+      since=$(( now - hold_us + 2000000 ))
+      continue
+    fi
+    since=0; since0=0; spared=0
     # Kill first, log afterwards: on a machine that is already thrashing every command ahead of the kill costs time. The
     # process snapshot runs beside it (it shows who else holds the memory); docker kill fails when the container is not running.
     ps -eo rss,pid,comm --sort=-rss 2>/dev/null | head -6 > "$snap" &
@@ -74,10 +114,11 @@ run_guard() {
 case "${1:-}" in
   start)
     shift
-    (( $# >= 4 && $# <= 6 )) || { echo "usage: memguard.sh start <container> <floor GiB> <log file> <pid file> [hold seconds [hard floor GiB]]" >&2; exit 2; }
+    (( $# >= 4 && $# <= 7 )) || { echo "usage: memguard.sh start <container> <floor GiB> <log file> <pid file> [hold seconds [hard floor GiB [spare: 0|1]]]" >&2; exit 2; }
     [[ "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "memguard: floor is a number of GiB (2 or 2.5), not $2" >&2; exit 2; }
     [[ -z "${5:-}" || "$5" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "memguard: hold is a number of seconds, not $5" >&2; exit 2; }
     [[ -z "${6:-}" || "$6" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "memguard: the hard floor is a number of GiB, not $6" >&2; exit 2; }
+    [[ -z "${7:-}" || "$7" =~ ^[01]$ ]] || { echo "memguard: spare is 0 or 1, not $7" >&2; exit 2; }
     stop_guard "$4"
     # detach: its own session, no terminal, so it outlives the ssh or shell that started it. Close fd 8, start.sh's lock
     # (flock on STATE_DIR/start.lock): a guard that kept it would hold the lock for as long as it runs.
