@@ -112,15 +112,22 @@ def load_state():
         pass
 
 
+SAVE_LOCK = threading.Lock()    # one writer of the state file at a time (they share its temporary file)
+
+
 def save_state():
-    try:
-        tmp = STATE_FILE + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump({"styles": W.styles, "seen": sorted(W.seen), "given_up": sorted(W.given_up)}, f)
-        os.replace(tmp, STATE_FILE)
-    except OSError:
-        pass
+    """The learned state to STATE_FILE: a copy taken under W.lock (request threads change it), written outside it."""
+    with W.lock:
+        data = {"styles": {k: dict(v) for k, v in W.styles.items()}, "seen": sorted(W.seen), "given_up": sorted(W.given_up)}
+    with SAVE_LOCK:
+        try:
+            tmp = STATE_FILE + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, STATE_FILE)
+        except OSError:
+            pass
 
 
 def jhash(obj):
@@ -307,8 +314,10 @@ def learn(api, body, who):
         return
     if jhash(echo) == jhash(ours):
         W.stats["echo_same"] += 1
-        if who not in W.seen:
+        with W.lock:
+            new = who not in W.seen
             W.seen.add(who)
+        if new:
             save_state()
         return
     style = dict(W.styles.get(who, {}))
@@ -332,17 +341,20 @@ def learn(api, body, who):
         if any(b.get("type") in ("thinking", "redacted_thinking") for b in raw.blocks):
             style["reasoning"] = any(isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking") for b in content)
     if style != before:
-        W.styles[who] = style
+        with W.lock:
+            W.styles[who] = style
         W.stats["echo_learned"] += 1
     # the learned style must explain the whole echo, else this client is not warmed ahead (a wrong prediction would
     # keep a state its next request cannot use)
     if jhash(echo) == jhash(raw.message(style)):
-        W.seen.add(who)
+        with W.lock:
+            W.seen.add(who)
         save_state()
         log(f"warm-ahead: client {who} echoes replies as {style or 'sent'}")
     else:
-        W.seen.discard(who)
-        W.given_up.add(who)
+        with W.lock:
+            W.seen.discard(who)
+            W.given_up.add(who)
         save_state()
         mine = raw.message(style)
         diff = {k: (len(json.dumps(mine.get(k), ensure_ascii=False)), len(json.dumps(echo.get(k), ensure_ascii=False)))
@@ -674,7 +686,10 @@ class API(BaseHTTPRequestHandler):
                 if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list) and parsed.get("n", 1) == 1:
                     api = route
                     who = client_of(api, parsed)
-                    learn(api, parsed, who)
+                    try:
+                        learn(api, parsed, who)
+                    except Exception as e:      # the echo's bookkeeping never fails a client request
+                        log(f"warm-ahead: client {who}: not learned ({type(e).__name__}: {e})")
                     reply = Reply(api)
             except (ValueError, TypeError, AttributeError, KeyError):
                 api = None
