@@ -1,0 +1,101 @@
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index b9055ef..983a260 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -413,7 +413,10 @@ pub const LaneHost = struct {
+         defer h.filling = null;
+         h.core.addStream(&job.stream) catch |e| {
+             if (e == error.Cancelled) return h.cancel(job);
+-            if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
++            // refused for room while other streams hold it: back to the queue, also inside another request's pass (a
++            // nested one): the filling job holds room, or the very state this one resumes (a warm-ahead extending it
++            // in place), and is no live stream yet
++            if (e == error.ContextFull and (h.core.activeCount() > 0 or h.outer != null)) return h.requeue(job);
+             return h.drop(job, h.words(e));
+         };
+         h.prefilled(job, began);
+@@ -996,4 +999,84 @@ test "prefill nesting: requests needing little fill inside a long pass, one afte
+     }
+ }
+ 
++test "prefill nesting: a request refused for room inside a long pass (the pass holds it) waits for that pass, not failing" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 3 });
++    host.interleave_ns = 5 * std.time.ns_per_ms;
++    host.nest_tokens = 4;
++    try host.start();
++    defer host.stop();
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        tokens: std.ArrayList(u32) = .empty,
++        done: ?Reason = null,
++        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
++                .finished => |f| b.done = f.reason,
++                else => {},
++            }
++        }
++        fn wait(b: *@This()) Reason {
++            while (true) {
++                b.mutex.lockUncancelable(std.testing.io);
++                const d = b.done;
++                b.mutex.unlock(std.testing.io);
++                if (d) |r| return r;
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++        }
++    };
++    const e = host.engine();
++    const prompt_a = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4 }; // ten tokens: not nested itself
++    const prompt_b = [_]u32{ 2, 7, 1 }; // three: nestable inside A's pass
++    const Watch = struct {
++        engine: Engine,
++        a_stream: ?*lanes.Stream = null,
++        b: *Box,
++        req_b: *const Request,
++        fn call(ctx: *anyopaque, s: *lanes.Stream, chunk: usize) void {
++            const w: *@This() = @ptrCast(@alignCast(ctx));
++            if (w.a_stream == null) w.a_stream = s;
++            if (s == w.a_stream and chunk == 1) w.engine.submit(2, w.req_b, .{ .ctx = w.b, .event = Box.event }) catch {};
++        }
++    };
++    target.prefill_chunks = 6;
++    // B's first pass, nested in A's, is refused for room while A (still filling, so no live stream yet) holds its lane:
++    // as a served request resuming the state a warm-ahead pass is extending in place is
++    target.refuse_full = 1;
++    var a: Box = .{};
++    defer a.tokens.deinit(gpa);
++    var b: Box = .{};
++    defer b.tokens.deinit(gpa);
++    const req_a: Request = .{ .prompt = &prompt_a, .max_tokens = 3 };
++    const req_b: Request = .{ .prompt = &prompt_b, .max_tokens = 5 };
++    var watch = Watch{ .engine = e, .b = &b, .req_b = &req_b };
++    target.prefill_hook = Watch.call;
++    target.prefill_hook_ctx = &watch;
++    try e.submit(1, &req_a, .{ .ctx = &a, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, b.wait());
++    try std.testing.expectEqual(Reason.length, a.wait());
++    try std.testing.expectEqual(@as(usize, 0), target.refuse_full);
++    try std.testing.expectEqual(@as(usize, 5), b.tokens.items.len);
++    var history: std.ArrayList(u32) = .empty;
++    defer history.deinit(gpa);
++    try history.appendSlice(gpa, &prompt_b);
++    for (b.tokens.items) |t| {
++        try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
++        try history.append(gpa, t);
++    }
++    while (target.lanes.count() > 0) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++}
++
+ test { _ = @import("lane_host_test.zig"); }
