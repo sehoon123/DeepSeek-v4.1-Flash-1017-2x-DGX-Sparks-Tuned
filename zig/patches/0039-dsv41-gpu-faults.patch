@@ -1,0 +1,415 @@
+diff --git a/zig/kernels/cuda/dsv41_ops.cu b/zig/kernels/cuda/dsv41_ops.cu
+index 574fb80..6e5a2ba 100644
+--- a/zig/kernels/cuda/dsv41_ops.cu
++++ b/zig/kernels/cuda/dsv41_ops.cu
+@@ -274,9 +274,12 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_cands_merge_kernel(cons
+     }
+     unsigned* rec = out + (long long)r * TF_CAND_REC;
+     if (t < C) {
+-        const unsigned id = 0xffffffffu - (unsigned)(sk[t] & 0xffffffffull);
++        // key 0 is no value: a NaN's (or no key left), so no id to read the row at (a key of a value, even -inf, is
++        // never 0); the row's NaN flag is set then, and the host does not draw from that row
++        const unsigned long long key = sk[t];
++        const unsigned id = key == 0ull ? 0u : 0xffffffffu - (unsigned)(key & 0xffffffffull);
+         rec[TF_CAND_MAX + t] = id;
+-        rec[t] = __float_as_uint(logits[(long long)r * ld + id]);
++        rec[t] = key == 0ull ? 0x7fc00000u : __float_as_uint(logits[(long long)r * ld + id]);
+     }
+     if (t == 0) {
+         int a = 0;
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 983a260..6e41dcc 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -256,7 +256,8 @@ pub const LaneHost = struct {
+             .@"error" => .failed,
+             else => .stop,
+         };
+-        h.finish(job, reason, "");
++        if (job.stream.fault != null) h.forgetFaulted(job);
++        h.finish(job, reason, job.stream.fault orelse "");
+         return true;
+     }
+ 
+@@ -417,6 +418,7 @@ pub const LaneHost = struct {
+             // nested one): the filling job holds room, or the very state this one resumes (a warm-ahead extending it
+             // in place), and is no live stream yet
+             if (e == error.ContextFull and (h.core.activeCount() > 0 or h.outer != null)) return h.requeue(job);
++            if (e == error.NanLogits) h.forgetFaulted(job);
+             return h.drop(job, h.words(e));
+         };
+         h.prefilled(job, began);
+@@ -566,6 +568,7 @@ pub const LaneHost = struct {
+         const handed = paused catch |e| {
+             if (!job.prefill_sent) emit(job, .{ .prefilled = 0 });
+             h.remove(job);
++            if (e == error.NanLogits) h.forgetFaulted(job);
+             h.finish(job, if (e == error.Cancelled) .cancelled else .failed, if (e == error.Cancelled) "" else h.words(e));
+             return true;
+         };
+@@ -579,6 +582,15 @@ pub const LaneHost = struct {
+         return true;
+     }
+ 
++    /// A request whose scores turned NaN: the kept states of its prompt go (one of them may hold the fault), so the
++    /// next request computes them again rather than resuming one.
++    fn forgetFaulted(h: *LaneHost, job: *Job) void {
++        if (!cacheable(job.request)) return;
++        const store = h.cache orelse return;
++        const n = store.forgetPrefixes(keyOf(job.request));
++        std.log.warn("{s}: its scores turned NaN: {d} kept states of its prompt dropped", .{ job.stream.id, n });
++    }
++
+     fn words(h: *const LaneHost, e: anyerror) []const u8 {
+         const x = h.explain orelse return @errorName(e);
+         return x.text(x.ctx, e) orelse @errorName(e);
+@@ -1080,3 +1092,70 @@ test "prefill nesting: a request refused for room inside a long pass (the pass h
+ }
+ 
+ test { _ = @import("lane_host_test.zig"); }
++
++test "a stream its backend faults (its scores turned NaN) ends alone with those words; the other stream's reply is whole" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa, .fault_first = 13, .fault_after = 5 };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    try host.start();
++    defer host.stop();
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        tokens: std.ArrayList(u32) = .empty,
++        message: std.ArrayList(u8) = .empty,
++        done: ?Reason = null,
++        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
++                .finished => |f| {
++                    b.message.appendSlice(gpa, f.message) catch {};
++                    b.done = f.reason;
++                },
++                else => {},
++            }
++        }
++        fn wait(b: *@This()) Reason {
++            while (true) {
++                b.mutex.lockUncancelable(std.testing.io);
++                const d = b.done;
++                b.mutex.unlock(std.testing.io);
++                if (d) |r| return r;
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++        }
++    };
++    const bad = [_]u32{ 13, 1, 4, 1, 5, 9, 2, 6 };
++    const good = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
++    var b1: Box = .{};
++    defer b1.tokens.deinit(gpa);
++    defer b1.message.deinit(gpa);
++    var b2: Box = .{};
++    defer b2.tokens.deinit(gpa);
++    defer b2.message.deinit(gpa);
++    const r1: Request = .{ .prompt = &bad, .max_tokens = 24 };
++    const r2: Request = .{ .prompt = &good, .max_tokens = 24 };
++    const e = host.engine();
++    try e.submit(2, &r2, .{ .ctx = &b2, .event = Box.event });
++    try e.submit(1, &r1, .{ .ctx = &b1, .event = Box.event });
++    try std.testing.expectEqual(Reason.failed, b1.wait());
++    try std.testing.expectEqual(Reason.length, b2.wait());
++    try std.testing.expectEqualStrings("the fake's scores turned NaN", b1.message.items);
++    try std.testing.expect(b1.tokens.items.len >= 5 and b1.tokens.items.len < 24);
++    try std.testing.expectEqual(@as(usize, 24), b2.tokens.items.len);
++    var history: std.ArrayList(u32) = .empty;
++    defer history.deinit(gpa);
++    try history.appendSlice(gpa, &good);
++    for (b2.tokens.items) |t| {
++        try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
++        try history.append(gpa, t);
++    }
++}
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index 30e8fae..59affc0 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -40,6 +40,8 @@ pub const Fake = struct {
+     prefill_hook_ctx: ?*anyopaque = null,
+     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
+     refuse_full: usize = 0, // prefill refuses this many times with error.ContextFull while another lane is live
++    fault_first: ?u32 = null, // a stream whose prompt starts with this token: its draws fault it (Stream.fault) once it has emitted fault_after tokens
++    fault_after: usize = 0,
+ 
+     pub fn deinit(x: *Fake) void {
+         var it = x.lanes.valueIterator();
+@@ -68,10 +70,17 @@ pub const Fake = struct {
+ 
+     fn draw(x: *Fake, l: *Lane, s: *Stream, position: u64) !u64 {
+         if (position != l.history.items.len) return error.PositionMismatch;
++        x.faultCheck(s);
+         try x.drawn.append(x.gpa, x.targetNext(l.history.items, s.sampling, position));
+         return x.drawn.items.len - 1;
+     }
+ 
++    /// fault_first's stream past fault_after tokens: its scores "turn NaN" (dsv41's draws mark it so; Stream.fault).
++    fn faultCheck(x: *const Fake, s: *Stream) void {
++        const t = x.fault_first orelse return;
++        if (s.prompt().len > 0 and s.prompt()[0] == t and s.emitted().len >= x.fault_after) s.fault = "the fake's scores turned NaN";
++    }
++
+     fn targetNext(x: *Fake, history: []const u32, sampling: ?Sampling, position: u64) u32 {
+         if (x.cycle_after) |start| if (history.len >= x.probe_prompt) {
+             const reply = history[x.probe_prompt..];
+@@ -183,6 +192,7 @@ pub const Fake = struct {
+                 while (at >= 0) : (at = parents[@intCast(at)]) try path.insert(x.gpa, 0, l.rows.items[@intCast(at)]);
+                 try l.history.appendSlice(x.gpa, path.items);
+                 if (w.positions[r] != l.history.items.len) return error.PositionMismatch;
++                x.faultCheck(w.stream);
+                 o.sampled[r] = x.targetNext(l.history.items, w.stream.sampling, w.positions[r]);
+             }
+             l.history.shrinkRetainingCapacity(l.base);
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index e4e4c06..e6c32b2 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -187,6 +187,7 @@ pub const Stream = struct {
+     cache_len: u64 = 0,
+     finished: bool = false,
+     reason: Reason = .none,
++    fault: ?[]const u8 = null, // the backend found the stream's scores unusable (NaN): it ends with reason .error and this message, committing nothing more
+     rounds: u64 = 0,
+     drafted: u64 = 0,
+     accepted: u64 = 0,
+@@ -331,6 +332,10 @@ pub const Stream = struct {
+ 
+     /// Append tokens until the stream finishes; how many landed (a prefix of `tokens`).
+     pub fn commit(s: *Stream, gpa: Allocator, tokens: []const u32) !usize {
++        if (s.fault != null and !s.finished) {
++            s.finished = true;
++            s.reason = .@"error";
++        }
+         var landed: usize = 0;
+         for (tokens) |t| {
+             if (s.finished) break;
+@@ -410,3 +415,14 @@ test "loop guard fires, closes thinking, and latches once" {
+     _ = try s.commit(gpa, &.{8});
+     try std.testing.expect(!s.finished and s.loop_period.? == 1);
+ }
++
++test "a stream its backend faulted ends with an error and commits nothing" {
++    const gpa = std.testing.allocator;
++    var s = try Stream.init(gpa, .{ .id = "f", .prompt = &.{ 1, 2 }, .max_new = 8, .eos = &.{9} });
++    defer s.deinit(gpa);
++    try std.testing.expectEqual(@as(usize, 2), try s.commit(gpa, &.{ 5, 6 }));
++    s.fault = "scores turned NaN";
++    try std.testing.expectEqual(@as(usize, 0), try s.commit(gpa, &.{ 7, 8 }));
++    try std.testing.expect(s.finished and s.reason == .@"error");
++    try std.testing.expectEqualSlices(u32, &.{ 5, 6 }, s.emitted());
++}
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 58f8875..47976c4 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -181,6 +181,22 @@ pub const Store = struct {
+         };
+     }
+ 
++    /// Every kept state the request with this prompt could have kept or resumed (its tokens, lookahead and all, begin
++    /// the prompt): the request's scores turned NaN, and one of them may hold the fault. How many went.
++    pub fn forgetPrefixes(s: *Store, prompt: []const u32) usize {
++        var gone: usize = 0;
++        var i: usize = 0;
++        while (i < s.entries.items.len) {
++            const e = s.entries.items[i];
++            if (e.tokens.len <= prompt.len and std.mem.eql(u32, e.tokens, prompt[0..e.tokens.len])) {
++                s.counts.failed += 1;
++                s.remove(i);
++                gone += 1;
++            } else i += 1;
++        }
++        return gone;
++    }
++
+     fn sharedKey(tokens: []const u32) u64 {
+         return std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(tokens));
+     }
+diff --git a/zig/src/core/prompt_cache_test.zig b/zig/src/core/prompt_cache_test.zig
+index 2a74cd6..6ccdacb 100644
+--- a/zig/src/core/prompt_cache_test.zig
++++ b/zig/src/core/prompt_cache_test.zig
+@@ -494,3 +494,24 @@ test "past the learned-state cap the least recently used state is forgotten, and
+     try std.testing.expectEqual(fresh(&p3), g.pass(&t, &p3, plan));
+     try std.testing.expect(im.has(imprint.Imprint.keyOf(&two))); // learned again by that pass
+ }
++
++test "a faulted prompt drops the states it could have kept or resumed, and only those" {
++    const gpa = std.testing.allocator;
++    var arena: std.heap.ArenaAllocator = .init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f: Fake = .{ .gpa = gpa };
++    var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 0 }, 1 << 20);
++    defer s.deinit();
++    const t1 = [_]u32{ 1, 2, 3, 4, 5, 9 };
++    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null)); // keeps [1 2 3 4] + 5
++    const other = [_]u32{ 7, 7, 7, 7, 5, 9 };
++    _ = f.pass(&s, &other, try s.begin(a, &other, 4, &.{}, &.{}, null)); // keeps [7 7 7 7] + 5
++    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
++    try std.testing.expectEqual(@as(usize, 0), s.forgetPrefixes(&.{ 1, 2, 3, 4, 8, 9 })); // not after its lookahead
++    try std.testing.expectEqual(@as(usize, 0), s.forgetPrefixes(&.{ 1, 2 })); // shorter than every state
++    try std.testing.expectEqual(@as(usize, 1), s.forgetPrefixes(&.{ 1, 2, 3, 4, 5, 6, 6, 9 }));
++    try std.testing.expect(s.find(&.{ 1, 2, 3, 4, 5, 6 }, &.{}) == null);
++    try std.testing.expectEqual(@as(u32, 4), s.find(&.{ 7, 7, 7, 7, 5, 6 }, &.{}).?.at);
++    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
++}
+diff --git a/zig/src/cuda/driver.zig b/zig/src/cuda/driver.zig
+index 79bc6ec..d227a18 100644
+--- a/zig/src/cuda/driver.zig
++++ b/zig/src/cuda/driver.zig
+@@ -53,6 +53,12 @@ pub const Driver = struct {
+         if (res == abi.success) return;
+         if (res == abi.error_not_ready) return error.NotReady;
+         std.log.err("{s}: {s} ({d}) {s}", .{ what, self.errorName(res), res, self.errorText(res) });
++        if (lost(res)) {
++            // every later call fails the same way: end the process now, for its service to start it again, rather
++            // than fail each later request until something notices
++            std.log.err("the GPU context is lost ({s} after {s}): exiting with status 70 for the service to restart", .{ self.errorName(res), what });
++            std.c._exit(70);
++        }
+         return switch (res) {
+             2 => error.OutOfDeviceMemory,
+             abi.error_not_found => error.NotFound,
+@@ -60,6 +66,16 @@ pub const Driver = struct {
+         };
+     }
+ 
++    /// Codes after which the context cannot be used again (the driver's documentation: "the process must be
++    /// terminated and relaunched"): an illegal or misaligned address, a device assert, a launch failure or timeout, a
++    /// hardware stack error, an illegal instruction or PC, an invalid address space, an uncorrectable ECC error.
++    pub fn lost(res: abi.Result) bool {
++        return switch (res) {
++            214, 700, 702, 710, 714, 715, 716, 717, 718, 719 => true,
++            else => false,
++        };
++    }
++
+     pub fn errorName(self: *const Driver, res: abi.Result) []const u8 {
+         var s: ?[*:0]const u8 = null;
+         if (self.api.cuGetErrorName(res, &s) != abi.success) return "CUDA_ERROR_UNKNOWN_CODE";
+@@ -96,3 +112,8 @@ pub const Driver = struct {
+         return @intCast(10 * major + minor);
+     }
+ };
++
++test "the codes after which a context is lost, and some it survives" {
++    for ([_]abi.Result{ 214, 700, 702, 710, 714, 715, 716, 717, 718, 719 }) |r| try std.testing.expect(Driver.lost(r));
++    for ([_]abi.Result{ 0, 1, 2, 98, 200, 400, 600, 701, 720, 999 }) |r| try std.testing.expect(!Driver.lost(r));
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 56888fa..539820b 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -247,18 +247,48 @@ pub fn place(used: []const [2]usize, size: usize, cap: usize) ?usize {
+ /// The token a row's logits draw at absolute position `position`: greedy without sampling (or at temperature 0),
+ /// else the served sampler with the stream's key.
+ pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
++    if (hasNan(row)) return error.NanLogits;
+     const sm = s orelse return @intCast(sampling.argmax(row));
+     if (sm.temperature <= 0) return @intCast(sampling.argmax(row));
+     const t = try sampling.sampleRow(row, position, .{ .seed = sm.seed, .temperature = sm.temperature, .top_k = sm.top_k, .top_p = sm.top_p, .min_p = sm.min_p });
+     return @intCast(t);
+ }
+ 
++/// A NaN anywhere in a row of next-token scores: the computation that made them faulted (finite weights and a finite
++/// state score finitely), so no token is drawn from it (error.NanLogits: the stream ends with an error instead).
++pub fn hasNan(row: []const f32) bool {
++    const L = 16;
++    const bits: []const u32 = @ptrCast(row);
++    const mag: @Vector(L, u32) = @splat(0x7fffffff);
++    const inf: @Vector(L, u32) = @splat(0x7f800000);
++    var i: usize = 0;
++    while (i + L <= bits.len) : (i += L) {
++        const v: @Vector(L, u32) = bits[i..][0..L].*;
++        if (@reduce(.Or, (v & mag) > inf)) return true;
++    }
++    while (i < bits.len) : (i += 1) if ((bits[i] & 0x7fffffff) > 0x7f800000) return true;
++    return false;
++}
++
++/// The words a stream whose scores turned NaN ends with (native.zig explains error.NanLogits the same).
++pub const nan_fault = "the model's next-token scores turned NaN (a numerical fault in this request's computation): the reply stops here, and the kept states of its prompt were dropped, so a retry computes them again";
++
++/// A round row whose scores hold a NaN: its stream ends with an error at the round's commit (core Stream.fault), the
++/// other streams' draws go on; the row's token is a placeholder nothing commits.
++fn faulted(s: *lanes.Stream, position: u64) u32 {
++    if (s.fault == null) {
++        std.log.warn("stream {s}: NaN in its next-token scores at position {d}: it ends with an error", .{ s.id, position });
++        s.fault = nan_fault;
++    }
++    return 0;
++}
++
+ /// draw's token for round row `row` from its device candidates (Model.roundCandidates' records, `count` of them a
+-/// row), or from its whole row if the row holds a NaN.
++/// row); error.NanLogits if the row holds a NaN.
+ fn drawCandidates(m: anytype, recs: []const u32, count: usize, row: usize, position: u64, s: ?lanes.Sampling) !u32 {
+     const W = ops_mod.cand_max;
+     const rec = recs[row * ops_mod.cand_rec ..][0..ops_mod.cand_rec];
+-    if (rec[2 * W] != 0) return draw(try m.roundLogitsRow(row), position, s);
++    if (rec[2 * W] != 0) return error.NanLogits;
+     var ids: [W]i64 = undefined;
+     for (rec[W..][0..count], 0..) |id, j| ids[j] = id;
+     const sm = s orelse return @intCast(ids[0]);
+@@ -943,7 +973,7 @@ pub const Lanes = struct {
+         };
+         for (windows, out, 0..) |w, *o, k| {
+             const row0 = self.built.wins[k].row;
+-            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else if (recs.len == 0) try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling) else try drawCandidates(m, recs, count, row0 + r, w.positions[r], w.stream.sampling);
++            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else (if (recs.len == 0) draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling) else drawCandidates(m, recs, count, row0 + r, w.positions[r], w.stream.sampling)) catch |e| if (e == error.NanLogits) faulted(w.stream, w.positions[r]) else return e;
+             const l = self.streams.getPtr(w.stream).?;
+             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
+             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
+@@ -1481,6 +1511,26 @@ test "a round's rows: each window at its positions, its ids written over the rej
+     try std.testing.expectError(error.SequenceGap, b.build(gpa, &seqs, &.{.{ .slot = 1, .base = 0, .end = 2048, .start = 3, .absorb = false, .ids = &.{1} }}));
+ }
+ 
++test "no draw from a row of scores holding a NaN, greedy or sampled; NaN found anywhere in a row" {
++    var row: [40]f32 = undefined;
++    for (&row, 0..) |*v, i| v.* = @floatFromInt(i % 7);
++    try std.testing.expect(!hasNan(&row));
++    row[3] = -std.math.inf(f32);
++    row[30] = std.math.inf(f32);
++    try std.testing.expect(!hasNan(&row));
++    for ([_]usize{ 0, 15, 16, 31, 32, 39 }) |at| {
++        const keep = row[at];
++        row[at] = std.math.nan(f32);
++        try std.testing.expect(hasNan(&row));
++        try std.testing.expectError(error.NanLogits, draw(&row, 9, null));
++        try std.testing.expectError(error.NanLogits, draw(&row, 9, .{ .seed = 3, .temperature = 1, .top_k = 20, .top_p = 0.95 }));
++        row[at] = -std.math.nan(f32);
++        try std.testing.expect(hasNan(&row));
++        row[at] = keep;
++    }
++    try std.testing.expect(!hasNan(&row));
++}
++
+ test "greedy draws take the first largest logit" {
+     const row = [_]f32{ 0.5, 2.0, -1.0, 2.0 };
+     try std.testing.expectEqual(@as(u32, 1), try draw(&row, 9, null));
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index d32f6d1..0542482 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -179,6 +179,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
+         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
+         error.SamplingNeedsTopK => "sampling here draws from the top_k likeliest tokens: top_k 0 (or below) with a temperature above 0 is not supported; send top_k 1 to 56, or leave it unset for the server's",
+         error.TooManyCandidates => "top_k is at most 56 here (the sampler holds 64 candidates)",
++        error.NanLogits => lanes_mod.nan_fault,
+         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
+         else => null,
+     };

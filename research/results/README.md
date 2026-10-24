@@ -42,6 +42,7 @@ Measured 2026-10-19 and 20 (Korea time) on the setup in [../README.md](../README
 | `tokenize-memo.txt` | the server's tokenize reusing the previous request's ids (`zig/patches/0030`): checks and times |
 | `sampler-pinned.txt` | sampled decoding's host side: the logits copy and the draws a round, before and after `zig/patches/0029` |
 | `policy-long-sampled.txt` | the draft policy's switches on long-context sampled decode (Round 20) |
+| `kernel-check.txt` | the recipe's own kernels under compute-sanitizer: the candidates merge kernel's out-of-bounds read on a NaN row (fixed in 0039), the rest clean |
 
 The traces (Nsight Systems exports) and the drafter dumps (`TF_DS_CALIB_FILE`: the confidence head's inputs, i.e. the
 model's hidden states) are not included: they are large, and the dumps are derived from the model.

@@ -35,3 +35,6 @@ local sparkDash checkout (not included). Nothing here is needed to run the recip
   TTFT and decode tok/s a turn (`results/multiturn-t1.txt`).
 
 - `topk-bench.cu`: `zig/patches/0034`'s top-k kernels against the one-block kernel they replace, sets and times.
+- `kcheck.cu`: the recipe's own kernels (0034 top-k, 0035 sampling candidates) against CPU references, for a plain run and
+  for compute-sanitizer (memcheck, racecheck, initcheck, synccheck); `quick` (fewer cases), `allnan` (a row of NaN only)
+  (`results/kernel-check.txt`).

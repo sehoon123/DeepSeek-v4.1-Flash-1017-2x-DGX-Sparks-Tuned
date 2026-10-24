@@ -1,0 +1,36 @@
+This recipe's own CUDA kernels under compute-sanitizer (research/tools/kcheck.cu), 2026-10-24
+=============================================================================================
+
+What: the kernels the recipe adds to dsv41_ops.cu (0034: tf_ds_topk_i64_regs_kernel, tf_ds_topk_i64_slices_kernel;
+0035: tf_ds_cands_slices_kernel, tf_ds_cands_merge_kernel; and upstream's tf_ds_topk_i64_kernel past 32768 keys),
+launched as ops.zig launches them, each output row compared with a CPU reference (bit for bit for the candidates:
+ids in "larger value, then lower id" order, -0.0 equal to +0.0, each value's own bits; as a set for the topk).
+Rows: plain, many ties, 100 finite among -inf, all equal, +-0.0 mixtures, a few NaN (the flag only), extremes and
+denormals, the 32 slices' edges, an all-NaN row ("allnan"); vocabulary 129280 at strides V and V + 128, 48 rows (the
+served ROUND_ROWS), counts 1/9/28/64; topk n 1..32768 around each register path's edge, ties on the high bits, the
+slices path at 4097..32768 keys with 1-8 rows, upstream's at 32769 and 65536.
+
+Build: nvcc -arch=sm_121 -O3 -lineinfo --fmad=false --ftz=false -DKSRC='"dsv41_ops.cu"' kcheck.cu (in the recipe's
+image, --gpus all --memory=4g --cpus=4).
+
+Results (GB10, CUDA in the image):
+
+  plain run, 0035 as shipped (0035-0038)        PASS 699 of 699 rows
+  plain run, with 0039                          PASS 699 of 699 rows (and with the all-NaN row)
+  memcheck, all-NaN row, 0035 as shipped        29 errors: "Invalid __global__ read of size 4 bytes at
+                                                tf_ds_cands_merge_kernel ... Access to ... is out of bounds"
+  memcheck, all-NaN row, with 0039              0 errors
+  memcheck, every case, with 0039               0 errors
+  synccheck, every case, with 0039              0 errors
+  racecheck, quick cases, with 0039             0 hazards (0 errors, 0 warnings)
+  initcheck, every case, with 0039              no kernel read of uninitialized memory; the reports are all the
+                                                harness's own cudaMemcpy of whole candidate records, whose slots
+                                                past `count` no kernel writes and the engine never reads
+
+The bug 0039 fixes: a row holding a NaN makes keys 0 (a NaN has no key); with fewer than `count` keys left (a row of
+NaN: the usual shape of a numerical fault) the merge kernel read logits at id 0xffffffff, 16 GiB past the row. Where
+that address is unmapped it is an illegal address, a context-wide sticky error that ends every stream of the
+engine; where it is mapped, a stray read whose value the host ignored (it drew a NaN row from the whole row).
+0039: no read at a key 0; a row holding a NaN ends its own stream with an error (core Stream.fault; the other
+streams' draws go on), and the prompt's kept states are dropped; a lost CUDA context exits the process (status 70)
+for the service to restart it.
