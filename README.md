@@ -489,6 +489,13 @@ answering and has to be power-cycled (this happened once, with the engine's rese
   hard floor; the long-prompt runs in Status used 2.5): a lower floor or a longer hold trades the kill for the risk of freezing the Spark. `ENGINE=jl` does check at run time: it refuses admissions under a 4 GiB hard floor, falls
   back to 2K prompt segments and runs a missing graph eagerly instead of capturing it ([docs/jl-engine.md](docs/jl-engine.md)); its boot check also sizes the pool to what the
   head can spare.
+- the kernel's OOM killer does not see a rank's GPU memory (it is not the process's resident memory), and a tmpfs file is
+  no process's at all: once a shared-memory writer takes what is left (here once: Nsight Compute's buffers in `/dev/shm`,
+  run inside the engine), the killer ends the desktop and session processes, the user's systemd, then the rank, and frees
+  nothing. `/dev/shm` is half the RAM by default; capped, such a writer gets `ENOSPC` instead: add
+  `tmpfs /dev/shm tmpfs rw,nosuid,nodev,inode64,size=4G 0 0` to `/etc/fstab` (systemd-remount-fs applies it at boot) and
+  run `sudo mount -o remount,size=4G /dev/shm` for now. The engine's container shares the host's (`--ipc=host`) and uses
+  some 33 MiB of it. Do not profile with Nsight Compute, or run compute-sanitizer on the engine, beside a loaded rank;
 - the KV cache is small (compressed FP4 with block scales; about 0.5 GiB at 262,144 tokens and ~1.8 GiB at the full window,
   by two memory readings); it is sized from `CONTEXT` when the model loads and shared by the streams. Most of the
   memory is the weights (~99 GiB, of which ~3.5 GiB are the drafter's), so the head's other software decides what is left.
