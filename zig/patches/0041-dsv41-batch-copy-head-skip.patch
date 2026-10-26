@@ -1,0 +1,273 @@
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index 49d71f0..8f0e004 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -33,6 +33,7 @@ pub const Model = struct {
+     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
+     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
+     copy_skips_head: bool = false, // a lone stream's fully accepted copy window skips the head's next pass
++    copy_batch_skips_head: bool = false, // extend that rule to fully accepted copy windows in shared rounds
+     copy_self_cap: u32 = 0, // a sampling stream's copy of its own reply at most this many tokens (0: no cap)
+     copy_multi: u32 = 0, // when every live stream copies, a copy of the prompt keeps its ramp, at most this many tokens (0: off)
+     enter_match: i64 = 8, // matching tokens a copy window needs
+@@ -68,6 +69,7 @@ pub const Config = struct {
+     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
+     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
+     copy_skips_head: bool = false, // Model.copy_skips_head
++    copy_batch_skips_head: bool = false, // Model.copy_batch_skips_head (requires copy_skips_head)
+     copy_self_cap: u32 = 0, // Model.copy_self_cap
+     copy_multi: u32 = 0, // Model.copy_multi
+     k: Constants = .{},
+@@ -124,6 +126,7 @@ pub const Config = struct {
+             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
+             .mtp_step_ms = m.mtp_step_ms,
+             .copy_skips_head = m.copy_skips_head,
++            .copy_batch_skips_head = m.copy_batch_skips_head,
+             .copy_self_cap = m.copy_self_cap,
+             .copy_multi = m.copy_multi,
+             .enter_match = m.enter_match,
+diff --git a/zig/src/core/lanes/copy_batch_test.zig b/zig/src/core/lanes/copy_batch_test.zig
+new file mode 100644
+index 0000000..d3bc326
+--- /dev/null
++++ b/zig/src/core/lanes/copy_batch_test.zig
+@@ -0,0 +1,155 @@
++//! Shared copy windows can omit speculative heads, never target verification or rollback.
++const std = @import("std");
++const config = @import("config.zig");
++const Engine = @import("engine.zig").Engine;
++const sm = @import("stream.zig");
++const fake = @import("fake.zig");
++const proposer = @import("proposer.zig");
++const Sampling = @import("sampling.zig").Sampling;
++const gpa = std.testing.allocator;
++
++const Mode = enum { copies, transition, mixed, rejected, budget, no_copies, single_copy_end };
++
++/// A deterministic proposer, including deliberate misses and an abrupt end of copying. Its guesses do not bypass
++/// the fake target, whose outputs depend on the full history and keyed position (including sampled requests).
++const Copies = struct {
++    enabled: bool = true,
++    stop: usize = std.math.maxInt(usize),
++    reject: bool = false,
++    sampling: ?Sampling = null,
++    out: [32]u32 = undefined,
++
++    fn interface(c: *Copies) proposer.Proposer {
++        return .{ .ptr = c, .vtable = &.{ .propose = propose, .last_match = match } };
++    }
++    fn match(_: *anyopaque) i64 {
++        return 64;
++    }
++    fn propose(ptr: *anyopaque, context: []const u32, max: i64) ![]const u32 {
++        const c: *Copies = @ptrCast(@alignCast(ptr));
++        if (!c.enabled or context.len >= c.stop or max <= 0) return &.{};
++        var h: std.ArrayList(u32) = .empty;
++        defer h.deinit(gpa);
++        try h.appendSlice(gpa, context);
++        const n: usize = @intCast(@min(max, c.out.len));
++        for (c.out[0..n], 0..) |*t, i| {
++            t.* = fake.next(h.items, c.sampling, h.items.len);
++            if (c.reject and i == 0) t.* = (t.* + 1) % fake.vocab;
++            try h.append(gpa, t.*);
++        }
++        return c.out[0..n];
++    }
++};
++
++const Result = struct {
++    tokens: [4][]u32 = .{ &.{}, &.{}, &.{}, &.{} },
++    reasons: [4]sm.Reason = undefined,
++    calls: usize = 0,
++    drafted: usize = 0,
++    fn deinit(r: Result) void {
++        for (r.tokens) |t| gpa.free(t);
++    }
++};
++
++fn run(n: usize, mode: Mode, sampled: bool, skip: bool, master: bool) !Result {
++    var costs: [16]config.Cost = undefined;
++    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 0.8 * @as(f64, @floatFromInt(w)) };
++    var cfg = try config.Config.init(gpa, .{
++        .exact_width = 16,
++        .first_copy_rows = 6,
++        .gpu_tokens = true,
++        .mtp = true,
++        .speculate = true,
++        .speculate_early = false,
++        .drafts = 4,
++        .window_costs = &costs,
++        .mtp_step_ms = 0.5,
++        .hidden_rows = true,
++        .batch_rows = 32,
++        .max_streams = 4,
++        .draft_streams = true,
++        .copy_skips_head = master,
++        .copy_batch_skips_head = skip,
++        .copy_multi = 15,
++    }, 16, 15);
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var e = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer e.deinit();
++    var copies: [4]Copies = undefined;
++    var streams: [4]sm.Stream = undefined;
++    var made: usize = 0;
++    defer for (streams[0..made]) |*s| s.deinit(gpa);
++    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
++    for (0..n) |i| {
++        const sampling: ?Sampling = if (sampled) .{ .seed = 17 + i, .temperature = 1.0 } else null;
++        copies[i] = .{
++            .enabled = mode != .no_copies and (mode != .mixed or i % 2 == 0),
++            .stop = if (mode == .transition) prompt.len + 25 + i else if (mode == .single_copy_end) prompt.len + 7 else std.math.maxInt(usize),
++            .reject = mode == .rejected,
++            .sampling = sampling,
++        };
++        streams[i] = try sm.Stream.init(gpa, .{
++            .id = "copy-test",
++            .prompt = &prompt,
++            .max_new = @intCast(56 + i * 11),
++            .eos = &.{},
++            .sampling = sampling,
++            .drafts = true,
++            .proposer = copies[i].interface(),
++            .loop_guard = false,
++            .think_budget = if (mode == .budget and i % 2 == 0) 17 else 0,
++            .think_close = &.{ 90, 91, 92 },
++            .think_end = 91,
++        });
++        made += 1;
++        try e.addStream(&streams[i]);
++    }
++    var steps: usize = 0;
++    while (e.activeCount() > 0 and steps < 512) : (steps += 1) try e.step();
++    try std.testing.expectEqual(@as(usize, 0), e.activeCount());
++    var result: Result = .{ .calls = target.draft_calls, .drafted = target.drafted_streams };
++    errdefer result.deinit();
++    for (streams[0..n], 0..) |*s, i| {
++        result.tokens[i] = try gpa.dupe(u32, s.emitted());
++        result.reasons[i] = s.reason;
++    }
++    return result;
++}
++
++fn compare(a: Result, b: Result, n: usize) !void {
++    for (0..n) |i| {
++        try std.testing.expectEqualSlices(u32, a.tokens[i], b.tokens[i]);
++        try std.testing.expectEqual(a.reasons[i], b.reasons[i]);
++    }
++}
++
++test "batch copy skip preserves tokens/finishes through misses, cuts, mixed streams and copy-to-head transitions" {
++    for ([_]usize{ 2, 4 }) |n| for ([_]bool{ false, true }) |sampled| {
++        for (std.enums.values(Mode)) |mode| {
++            const baseline = try run(n, mode, sampled, false, true);
++            defer baseline.deinit();
++            const candidate = try run(n, mode, sampled, true, true);
++            defer candidate.deinit();
++            try compare(baseline, candidate, n);
++            if (mode == .rejected or mode == .no_copies or mode == .single_copy_end) {
++                try std.testing.expectEqual(baseline.drafted, candidate.drafted);
++                try std.testing.expectEqual(baseline.calls, candidate.calls);
++            } else {
++                try std.testing.expect(candidate.drafted < baseline.drafted);
++            }
++        }
++    };
++}
++
++test "batch skip is opt-in and requires the existing copy-skip master switch" {
++    const baseline = try run(4, .copies, true, false, false);
++    defer baseline.deinit();
++    const disabled = try run(4, .copies, true, true, false);
++    defer disabled.deinit();
++    try compare(baseline, disabled, 4);
++    try std.testing.expectEqual(baseline.drafted, disabled.drafted);
++    try std.testing.expectEqual(baseline.calls, disabled.calls);
++}
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index e030e3b..c9b82b2 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -327,8 +327,15 @@ pub const Engine = struct {
+             p.stream.min_rows = if (p.stream.min_rows == 0) rows else @min(p.stream.min_rows, rows);
+         }
+         var heads: std.ArrayList(usize) = .empty;
+-        for (plans, 0..) |p, i| {
+-            if (e.cfg.family_mtp and p.stream.drafts) try heads.append(a, i);
++        for (plans, windows, outcomes, 0..) |p, w, o, i| {
++            // No head result survives the next copy plan. Confirm that continuation BEFORE omitting the pass,
++            // so leaving a copied span retains ordinary drafts rather than paying a target-only recovery round.
++            // The verify still absorbs every row and keep still runs below; rejected/cut copies draft normally.
++            const next_who = win.who(p.stream);
++            const copy_next = e.cfg.copy_skips_head and e.cfg.copy_batch_skips_head and
++                p.kind == .copy and o.path.len == w.rows() and o.cut == null and !p.stream.finished and
++                win.copyAhead(e, &next_who);
++            if (e.cfg.family_mtp and p.stream.drafts and !copy_next) try heads.append(a, i);
+         }
+         const whos = try a.alloc(depth.Who, heads.items.len);
+         for (whos, heads.items) |*w, i| w.* = win.who(plans[i].stream);
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index 59affc0..13748f9 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -30,6 +30,8 @@ pub const Fake = struct {
+     lanes: std.AutoHashMapUnmanaged(*Stream, Lane) = .empty,
+     drawn: std.ArrayList(u32) = .empty, // handle -> token
+     rounds: u64 = 0,
++    draft_calls: usize = 0, // test instrumentation: calls and nonzero-depth streams actually drafted
++    drafted_streams: usize = 0,
+     cycle_after: ?usize = null,
+     probe_prompt: usize = 0,
+     pattern: []const u32 = &.{ 11, 12, 13 },
+@@ -211,7 +213,9 @@ pub const Fake = struct {
+ 
+     fn draft(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
+         const x = self(ptr);
++        x.draft_calls += 1;
+         for (requests) |r| {
++            x.drafted_streams += @intFromBool(r.depth > 0);
+             const l = x.lane(r.stream);
+             // the head reads the last verify's kept rows (a shared round drafts before its rollback)
+             var guess: std.ArrayList(u32) = .empty;
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 74ca8e1..a430ef5 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -31,5 +31,6 @@ pub const SuffixLookup = proposer.SuffixLookup;
+ test {
+     std.testing.refAllDecls(@This());
+     _ = @import("engine_test.zig");
++    _ = @import("copy_batch_test.zig");
+     _ = @import("gpu_full_test.zig");
+ }
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 539820b..173e7e9 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -416,6 +416,7 @@ pub const Lanes = struct {
+     policy_log: bool = false,
+     copy_rows: usize = window_rows, // TF_DS_COPY_ROWS: a lone stream's widest copy window (6: the stock width, off)
+     copy_skip: bool = false, // TF_DS_COPY_SKIP=1: no drafter pass after a lone stream's fully accepted copy window
++    copy_batch_skip: bool = false, // TF_DS_COPY_BATCH_SKIP=1: the same rule for shared copy windows (opt-in)
+     platt: [draft.max_block][2]f64 = undefined, // (identity until Lanes.init) TF_DS_CALIB_PLATT: each draft position's (scale, shift) of the confidence logit
+     platt_on: bool = false,
+     calib_out: ?*CFile = null, // TF_DS_CALIB_FILE: each draft's confidence-head features and fate, for an offline refit of the head
+@@ -495,6 +496,7 @@ pub const Lanes = struct {
+             if (self.copy_rows < window_rows or self.copy_rows > max_window or self.copy_rows > self.m.eng.round_rows) return error.BadCopyRows;
+         }
+         if (envVar("TF_DS_COPY_SKIP")) |t| self.copy_skip = std.mem.eql(u8, t, "1");
++        if (envVar("TF_DS_COPY_BATCH_SKIP")) |t| self.copy_batch_skip = std.mem.eql(u8, t, "1");
+         if (envVar("TF_DS_COPY_ENTER")) |t| {
+             self.enter_match = std.fmt.parseInt(i64, t, 10) catch return error.BadCopyRows;
+             if (self.enter_match < 2 or self.enter_match > 64) return error.BadCopyRows;
+@@ -614,6 +616,7 @@ pub const Lanes = struct {
+             .exact_width = @intCast(@max(window_rows, self.copy_rows)),
+             .first_copy_rows = if (self.copy_rows > window_rows) @as(u32, window_rows) else 0,
+             .copy_skips_head = self.copy_skip,
++            .copy_batch_skips_head = self.copy_batch_skip,
+             .copy_self_cap = copySelfCap(),
+             .copy_multi = copyMulti(),
+             .enter_match = self.enter_match,

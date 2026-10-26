@@ -79,10 +79,12 @@ for v in THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_K
 [[ -z "${TF_DS_PROBE_THRESHOLD:-}" || "${TF_DS_PROBE_THRESHOLD}" =~ ^[0-5]([.][0-9]+)?$ ]] || die "TF_DS_PROBE_THRESHOLD is empty or 0 to 5"
 [[ "$TF_DS_COPY_ROWS" =~ ^[0-9]+$ ]] && (( TF_DS_COPY_ROWS >= 6 && TF_DS_COPY_ROWS <= ${ROUND_ROWS:-16} )) || die "TF_DS_COPY_ROWS is 6 (the engine's own copy windows) to ROUND_ROWS (${ROUND_ROWS:-16}; 48 at most), not '$TF_DS_COPY_ROWS'"
 [[ "$TF_DS_COPY_SKIP" =~ ^[01]$ ]] || die "TF_DS_COPY_SKIP is 0 or 1, not '$TF_DS_COPY_SKIP'"
+[[ -z "${TF_DS_COPY_BATCH_SKIP:-}" || "${TF_DS_COPY_BATCH_SKIP}" =~ ^[01]$ ]] || die "TF_DS_COPY_BATCH_SKIP is empty, 0 or 1, not '${TF_DS_COPY_BATCH_SKIP:-}'"
 [[ "$TF_DS_COPY_SELF_CAP" =~ ^[0-9]+$ ]] && (( TF_DS_COPY_SELF_CAP <= 47 )) || die "TF_DS_COPY_SELF_CAP is 0 (no cap) to 47, not '$TF_DS_COPY_SELF_CAP'"
 [[ "$TF_DS_COPY_MULTI" =~ ^[0-9]+$ ]] && (( TF_DS_COPY_MULTI <= 47 )) || die "TF_DS_COPY_MULTI is 0 (off) to 47, not '$TF_DS_COPY_MULTI'"
 [[ "$TF_DS_GRAPH_CAP" =~ ^[0-9]+$ ]] || die "TF_DS_GRAPH_CAP is a number of graphs (0: no cap), not '$TF_DS_GRAPH_CAP'"
 [[ "$TF_DS_PAIR" =~ ^[01]$ ]] || die "TF_DS_PAIR is 0 or 1, not '$TF_DS_PAIR'"
+[[ -z "${TF_DS_HC_PF_RB:-}" || "${TF_DS_HC_PF_RB}" =~ ^(2|4|8)$ ]] || die "TF_DS_HC_PF_RB is empty, 2, 4 or 8, not '${TF_DS_HC_PF_RB:-}'"
 [[ "$TF_DS_ENGRAM_DEDUP" =~ ^[01]$ ]] || die "TF_DS_ENGRAM_DEDUP is 0 or 1, not '$TF_DS_ENGRAM_DEDUP'"
 [[ "$TF_DS_ENGRAM_CACHE_MB" =~ ^[0-9]+$ ]] || die "TF_DS_ENGRAM_CACHE_MB is a number of MiB (0: no cache), not '$TF_DS_ENGRAM_CACHE_MB'"
 nccl_extra_collect

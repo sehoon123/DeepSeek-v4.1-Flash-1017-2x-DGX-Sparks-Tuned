@@ -1,0 +1,28 @@
+diff --git a/zig/src/families/dsv41/tri_hc.zig b/zig/src/families/dsv41/tri_hc.zig
+--- a/zig/src/families/dsv41/tri_hc.zig
++++ b/zig/src/families/dsv41/tri_hc.zig
+@@ -9,8 +9,9 @@ const u = tri.u;
+ const p = aot.ptr;
+ const hc_blocks = @import("tri_basic.zig").hc_blocks;
+ 
+-/// kernels.HC_PF_RB: hc_mix_pf's rows a program (TF_DS_HC_PF_RB is unset in the served build).
+-pub const hc_pf_rb = 8;
++/// kernels.HC_PF_RB: hc_mix_pf's rows a program. The served default stays 8; model open may select an existing
++/// AOT variant (2 or 4) for controlled, bit-exact occupancy experiments, before any CUDA graphs are captured.
++pub var hc_pf_rb: usize = 8;
+ 
+ /// kernels.HC_RB: _hc_mix_part's rows a program for windows of 1 to 8 rows.
+ const hc_rb = [_]usize{ 1, 2, 3, 2, 3, 2, 4, 4 };
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -174,6 +174,9 @@ pub const Model = struct {
+         m.gpa = gpa;
+         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
+         prompt.idx_split = if (std.c.getenv("TF_DS_IDX_SPLIT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false; // every rank alike
++        const hc_rb = if (std.c.getenv("TF_DS_HC_PF_RB")) |v| std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadHcRows else 8;
++        if (hc_rb != 2 and hc_rb != 4 and hc_rb != 8) return error.BadHcRows;
++        @import("tri_hc.zig").hc_pf_rb = hc_rb;
+         m.spans = .empty;
+         m.img_buf = null;
+         m.logits_pin = null;
