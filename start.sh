@@ -86,6 +86,9 @@ for v in THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_K
 [[ "$TF_DS_PAIR" =~ ^[01]$ ]] || die "TF_DS_PAIR is 0 or 1, not '$TF_DS_PAIR'"
 [[ -z "${TF_DS_PAIR_REUSE:-}" || "${TF_DS_PAIR_REUSE}" =~ ^[01]$ ]] || die "TF_DS_PAIR_REUSE is empty, 0 or 1, not '${TF_DS_PAIR_REUSE:-}'"
 [[ "${TF_DS_PAIR_REUSE:-0}" != 1 || "$TF_DS_PAIR" == 1 ]] || die 'TF_DS_PAIR_REUSE=1 requires TF_DS_PAIR=1'
+[[ -z "${TF_DS_PHASE_ARENA:-}" || "${TF_DS_PHASE_ARENA}" =~ ^[01]$ ]] || die "TF_DS_PHASE_ARENA is empty, 0 or 1, not '${TF_DS_PHASE_ARENA:-}'"
+[[ -z "${TF_DS_PHASE_POISON:-}" || "${TF_DS_PHASE_POISON}" =~ ^[01]$ ]] || die "TF_DS_PHASE_POISON is empty, 0 or 1, not '${TF_DS_PHASE_POISON:-}'"
+[[ "${TF_DS_PHASE_POISON:-0}" != 1 || "${TF_DS_PHASE_ARENA:-0}" == 1 ]] || die 'TF_DS_PHASE_POISON=1 requires TF_DS_PHASE_ARENA=1 (diagnostic only)'
 [[ -z "${TF_DS_HC_PF_RB:-}" || "${TF_DS_HC_PF_RB}" =~ ^(2|4|8)$ ]] || die "TF_DS_HC_PF_RB is empty, 2, 4 or 8, not '${TF_DS_HC_PF_RB:-}'"
 [[ "$TF_DS_ENGRAM_DEDUP" =~ ^[01]$ ]] || die "TF_DS_ENGRAM_DEDUP is 0 or 1, not '$TF_DS_ENGRAM_DEDUP'"
 [[ "$TF_DS_ENGRAM_CACHE_MB" =~ ^[0-9]+$ ]] || die "TF_DS_ENGRAM_CACHE_MB is a number of MiB (0: no cache), not '$TF_DS_ENGRAM_CACHE_MB'"

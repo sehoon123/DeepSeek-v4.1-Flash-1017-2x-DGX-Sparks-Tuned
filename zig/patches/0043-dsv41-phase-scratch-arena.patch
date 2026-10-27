@@ -1,0 +1,321 @@
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index 7d2e266..f0aad4d 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -78,6 +78,7 @@ test {
+     refAll(exl3_experts);
+     refAll(exl3_experts_rec);
+     refAll(prompt);
++    refAll(@import("phase_arena.zig"));
+     refAll(exact);
+     refAll(rdma_seq);
+     refAll(rdma);
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 3465832..b28f438 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -241,6 +241,9 @@ pub const Chunk = struct {
+     gm: u64, // fp32 [world, cap, D]: its gather (the pending post)
+     xs: exl3_experts.Scratch,
+     xs_z_bytes: usize, // actual allocation bound; pair attention may borrow z before its MoE phase
++    phase_base: u64 = 0, // TF_DS_PHASE_ARENA: attention temporaries share storage with xg/xu/xd, never z
++    phase_bytes: usize = 0,
++    phase_poison: bool = false, // diagnostic overwrite before experts to check scratch lifetimes
+     // Model._moe_scratch's decode scratch: windows under 64 rows (a prompt's small chunk, every decode round), one for
+     // every layer of the same slots and experts, its epoch carried from call to call
+     xsd: exl3_experts.DecodeScratch,
+@@ -279,7 +282,64 @@ pub const Chunk = struct {
+         const o_lora = l0.wo_a[0].n;
+         const ex = l0.experts;
+         const sl = e.slots();
++        // Plan the two disjoint lifetimes before allocating either. The MoE z accumulator is deliberately NOT
++        // included: paired attention may borrow it for 0042's unpack cache while these attention temporaries live.
++        const xs_rows = @max(cap, pair_rows);
++        const sz = exl3_experts.Scratch.sizes(xs_rows, sl, ex.dims, ex.width, ex.count);
++        var min_ratio: usize = 0;
++        var max_xk: usize = 0;
++        var max_kn: usize = 0;
++        for (e.w.layers) |lay| {
++            if (lay.ratio != 0 and (min_ratio == 0 or lay.ratio < min_ratio)) min_ratio = lay.ratio;
++            var ls: [16]?weights.Linear = @splat(null);
++            ls[0] = lay.wq_a;
++            ls[1] = lay.wkv;
++            ls[2] = lay.wq_b;
++            ls[3] = lay.wo_b;
++            for (lay.wo_a[0..lay.groups], 0..) |wo, g| ls[4 + g] = wo;
++            ls[8] = lay.comp_wkv;
++            ls[9] = lay.comp_wgate;
++            ls[10] = lay.idx_wq_b;
++            ls[11] = lay.idx_wk;
++            ls[12] = lay.engram_wkv;
++            for (ls) |ol| {
++                const l = ol orelse continue;
++                max_xk = @max(max_xk, l.k);
++                max_kn = @max(max_kn, @as(usize, l.k) * l.n);
++            }
++        }
++        var phase: @import("phase_arena.zig").Pool = .{};
++        const phase_on = if (std.c.getenv("TF_DS_PHASE_ARENA")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
++        if (phase_on) {
++            if (e.two != null or e.world != 2) return error.PhaseArenaNeedsTp2;
++            var sizes: [10]usize = @splat(0);
++            if (min_ratio != 0) {
++                const max_comp = tokens / min_ratio;
++                const ke: usize = @min(cap * max_comp, key_elems);
++                sizes[0] = ke * 8;
++                sizes[1] = ke * 4;
++                sizes[2] = (ke / tri_index.tile + cap) * 8;
++                sizes[3] = cap * c.index_topk * 8;
++                const cb = c.candidate_block;
++                const pool_ms = (max_comp + cb - 1) / cb;
++                if (pool_ms > c.candidate_blocks) {
++                    sizes[4] = @max(16 * pool_ms, key_elems / cb + cap) * 4;
++                    sizes[5] = cap * c.candidate_blocks * 8;
++                }
++                if (tri_index.prunes(max_comp, c.index_topk)) {
++                    sizes[6] = pruned_rows * c.index_topk * 8;
++                    sizes[7] = pruned_rows * c.index_topk * tri_index.tile * 8;
++                }
++            }
++            sizes[8] = cap * max_xk * 2;
++            sizes[9] = max_kn * 2;
++            phase = try @import("phase_arena.zig").Pool.init(a, &sizes, sz[0..3]);
++        }
+         var ch: Chunk = undefined;
++        ch.phase_base = phase.base;
++        ch.phase_bytes = phase.capacity;
++        ch.phase_poison = if (std.c.getenv("TF_DS_PHASE_POISON")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
++        if (ch.phase_poison and !phase_on) return error.PhasePoisonNeedsArena;
+         ch.spans = &.{};
+         ch.img_rows = 0;
+         ch.cap = cap;
+@@ -325,10 +385,6 @@ pub const Chunk = struct {
+         ch.pm = try a.take(cap * d * 4);
+         ch.gm = try a.take(e.world * cap * d * 4);
+         // compressed layers: the smallest ratio sets the most compressed entries a row can see
+-        var min_ratio: usize = 0;
+-        for (e.w.layers) |lay| {
+-            if (lay.ratio != 0 and (min_ratio == 0 or lay.ratio < min_ratio)) min_ratio = lay.ratio;
+-        }
+         if (min_ratio != 0) {
+             const ih = c.index_heads * c.index_head_dim;
+             ch.max_comp = tokens / min_ratio;
+@@ -348,19 +404,19 @@ pub const Chunk = struct {
+             ch.vis_blk = try a.take(cap * 8);
+             // the indexer's row blocks keep rows * n_comp under 2^24 (model.py rb), so their keys under key_elems
+             const ke: usize = @min(cap * ch.max_comp, key_elems); // (typed: @min with a comptime bound narrows)
+-            ch.keys = try a.take(ke * 8);
+-            ch.score = try a.take(ke * 4);
+-            ch.tmax = try a.take((ke / tri_index.tile + cap) * 8);
++            ch.keys = try phase.take(a, .attention, ke * 8);
++            ch.score = try phase.take(a, .attention, ke * 4);
++            ch.tmax = try phase.take(a, .attention, (ke / tri_index.tile + cap) * 8);
+             ch.cidx = try a.take(cap * c.index_topk * 8);
+-            ch.ktop = try a.take(cap * c.index_topk * 8);
++            ch.ktop = try phase.take(a, .attention, cap * c.index_topk * 8);
+             ch.cidxp = try a.take(cap * (c.index_topk + 16) * 8);
+             // the pool: only past candidate_blocks blocks, so a row block holds at most key_elems / 2048 rows there
+             const cb = c.candidate_block;
+             ch.pool_ms = (ch.max_comp + cb - 1) / cb;
+             if (ch.pool_ms > c.candidate_blocks) {
+                 ch.pool = try a.take(cap * ch.pool_ms);
+-                ch.bmax = try a.take(@max(16 * ch.pool_ms, key_elems / cb + cap) * 4);
+-                ch.pidx = try a.take(cap * c.candidate_blocks * 8);
++                ch.bmax = try phase.take(a, .attention, @max(16 * ch.pool_ms, key_elems / cb + cap) * 4);
++                ch.pidx = try phase.take(a, .attention, cap * c.candidate_blocks * 8);
+             }
+             ch.every = try a.take(cap * 8);
+             {
+@@ -371,7 +427,7 @@ pub const Chunk = struct {
+                 try e.s.synchronize(); // (the host copy is freed next)
+             }
+             if (tri_index.prunes(ch.max_comp, c.index_topk)) {
+-                ch.pbufs = .{ .tpos = try a.take(pruned_rows * c.index_topk * 8), .cand = try a.take(pruned_rows * c.index_topk * tri_index.tile * 8), .every = ch.every };
++                ch.pbufs = .{ .tpos = try phase.take(a, .attention, pruned_rows * c.index_topk * 8), .cand = try phase.take(a, .attention, pruned_rows * c.index_topk * tri_index.tile * 8), .every = ch.every };
+             }
+         }
+         for (e.w.layers) |lay| {
+@@ -383,40 +439,20 @@ pub const Chunk = struct {
+             ch.kv = try a.take(cap * en * 2);
+             break;
+         }
+-        const xs_rows = @max(cap, pair_rows);
+-        const sz = exl3_experts.Scratch.sizes(xs_rows, sl, ex.dims, ex.width, ex.count);
+         var xs: exl3_experts.Scratch = undefined;
+         xs.rows = xs_rows;
+         xs.slots = sl;
+         inline for (.{ "xg", "xu", "xd", "z", "no_y", "ids", "count", "counts", "members", "work_gu", "work_d" }, 0..) |f, j| {
+-            @field(xs, f) = try a.take(sz[j]);
++            @field(xs, f) = if (j < 3) try phase.take(a, .experts, sz[j]) else try a.take(sz[j]);
+         }
+         ch.xs = xs;
+         ch.xs_z_bytes = sz[3];
+         ch.xsd = try decodeScratch(e, a, ex, sl);
+         ch.gl = try a.take(16 * (d / 256) * c.experts * 4);
+         // prefill.Workspace: the largest prompt GEMM's rotated input and W_q (fp16) over every layer, and the Hadamard
+-        var max_xk: usize = 0;
+-        var max_kn: usize = 0;
+-        for (e.w.layers) |lay| {
+-            var ls: [16]?weights.Linear = @splat(null);
+-            ls[0] = lay.wq_a;
+-            ls[1] = lay.wkv;
+-            ls[2] = lay.wq_b;
+-            ls[3] = lay.wo_b;
+-            for (lay.wo_a[0..lay.groups], 0..) |wo, g| ls[4 + g] = wo;
+-            ls[8] = lay.comp_wkv;
+-            ls[9] = lay.comp_wgate;
+-            ls[10] = lay.idx_wq_b;
+-            ls[11] = lay.idx_wk;
+-            ls[12] = lay.engram_wkv;
+-            for (ls) |ol| {
+-                const l = ol orelse continue;
+-                max_xk = @max(max_xk, l.k);
+-                max_kn = @max(max_kn, @as(usize, l.k) * l.n);
+-            }
+-        }
+-        ch.ws = .{ .xh = try a.take(cap * max_xk * 2), .w = try a.take(max_kn * 2), .h = try a.take(128 * 128 * 2) };
++        ch.ws = .{ .xh = try phase.take(a, .attention, cap * max_xk * 2), .w = try phase.take(a, .attention, max_kn * 2), .h = try a.take(128 * 128 * 2) };
++        try phase.finish();
++        if (phase_on) std.log.info("{{\"phase_arena\": {d}, \"attention_bytes\": {d}, \"expert_input_bytes\": {d}, \"saved_bytes\": {d}}}", .{ phase.capacity, phase.used[0], phase.used[1], phase.used[0] + phase.used[1] - phase.capacity });
+         ch.blas_ws = try a.take(cublas.Blas.workspace_bytes);
+         // grouped linears: every layer's counters (int32 [8 N / 128], zeros, left zero by each launch), the largest
+         // group's rotated rows and partials at 128 rows
+@@ -756,9 +792,19 @@ pub fn moeGate(e: *const Engine, ch: *Chunk, li: usize, pick: u64, wts: u64) !vo
+ /// TF_DS_PAIR: the routed experts of a pair's `rows` rows (PairMoe's x, pick, wts) into its pm, on the first chunk's
+ /// scratch.
+ pub fn pairExperts(e: *const Engine, ch: *const Chunk, pr: *const PairMoe, li: usize, rows: usize) !void {
++    try poisonPhase(e, ch);
+     try exl3_experts.prompt(e.ex, e.s, e.w.layers[li].experts, ch.xs, pr.x, e.c.hidden, pr.pick, pr.wts, pr.pm, rows, e.c.swiglu_limit);
+ }
+ 
++/// Attention's consumers have completed on this stream. Experts rotate every routed xg/xu row and write every
++/// routed xd row before reading them; unrouted slots are not read. The z accumulator (0042's cache), persistent
++/// cidx/pool selections, actual attention state, and side-stream gather buffers are outside this allocation.
++fn poisonPhase(e: *const Engine, ch: *const Chunk) !void {
++    if (!ch.phase_poison) return;
++    try fill(e, ch.phase_base, 0xff, ch.phase_bytes);
++    std.log.info("{{\"phase_poisoned\": {d}}}", .{ch.phase_bytes});
++}
++
+ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
+     const lay = e.w.layers[li];
+     const c = e.c;
+@@ -1164,6 +1210,7 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
+     if (e.two) |t| return t.experts(e, ch, lay); // 2D: gate / up here, the intermediate's exchange, down here
+     // routed(): a chunk of fewer than EXACT_ROWS rows takes the decode window's fused path and scratch
+     if (n < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
++    try poisonPhase(e, ch);
+     try exl3_experts.prompt(e.ex, e.s, lay.experts, ch.xs, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
+ }
+ 
+diff --git a/zig/src/families/dsv41/phase_arena.zig b/zig/src/families/dsv41/phase_arena.zig
+new file mode 100644
+index 0000000..ca428be
+--- /dev/null
++++ b/zig/src/families/dsv41/phase_arena.zig
+@@ -0,0 +1,105 @@
++//! Two mutually exclusive scratch lifetimes sharing one allocation. This is an allocation-time layout only:
++//! callers, not this helper, must prove same-stream completion and overwrite-before-read at every phase boundary.
++const std = @import("std");
++
++pub const Phase = enum { attention, experts };
++pub const Pool = struct {
++    base: u64 = 0, // zero: disabled, keep the caller's original allocation sequence
++    capacity: usize = 0,
++    expected: [2]usize = .{ 0, 0 },
++    used: [2]usize = .{ 0, 0 },
++
++    fn aligned(n: usize) !usize {
++        return (try std.math.add(usize, n, 255)) & ~@as(usize, 255);
++    }
++
++    pub fn footprint(sizes: []const usize) !usize {
++        var end: usize = 0;
++        for (sizes) |bytes| {
++            if (bytes == 0) continue;
++            end = try std.math.add(usize, try aligned(end), bytes);
++        }
++        return end;
++    }
++
++    pub fn init(a: anytype, attention: []const usize, experts: []const usize) !Pool {
++        const sizes = [2]usize{ try footprint(attention), try footprint(experts) };
++        const capacity = @max(sizes[0], sizes[1]);
++        if (capacity == 0) return error.EmptyPhasePool;
++        _ = try aligned(capacity); // the backing allocator must be able to round its allocation up, too
++        const base = try a.take(capacity);
++        if (base == 0 or base % 256 != 0) return error.BadPhaseBase;
++        _ = try std.math.add(u64, base, capacity);
++        return .{ .base = base, .capacity = capacity, .expected = sizes };
++    }
++
++    pub fn take(p: *Pool, a: anytype, phase: Phase, bytes: usize) !u64 {
++        if (p.base == 0) return a.take(bytes);
++        if (bytes == 0) return p.base;
++        const i = @backingInt(phase);
++        const at = try aligned(p.used[i]);
++        const end = try std.math.add(usize, at, bytes);
++        if (end > p.expected[i] or end > p.capacity) return error.PhasePoolFull;
++        p.used[i] = end;
++        return p.base + at;
++    }
++
++    pub fn finish(p: *const Pool) !void {
++        if (p.base != 0 and !std.meta.eql(p.used, p.expected)) return error.PhasePoolIncomplete;
++    }
++};
++
++const Fake = struct {
++    next: u64 = 4096,
++    calls: usize = 0,
++    bytes: usize = 0,
++    pub fn take(a: *Fake, bytes: usize) !u64 {
++        const at = a.next;
++        a.next += (bytes + 255) & ~@as(u64, 255);
++        a.calls += 1;
++        a.bytes += bytes;
++        return at;
++    }
++};
++
++test "phase pool shares only across lifetimes and consumes one maximum-sized allocation" {
++    var a: Fake = .{};
++    var p = try Pool.init(&a, &.{ 17, 512, 3 }, &.{ 600, 10 });
++    try std.testing.expectEqual(@as(usize, 778), p.capacity);
++    const a0 = try p.take(&a, .attention, 17);
++    const a1 = try p.take(&a, .attention, 512);
++    const a2 = try p.take(&a, .attention, 3);
++    const e0 = try p.take(&a, .experts, 600);
++    const e1 = try p.take(&a, .experts, 10);
++    try std.testing.expectEqual(a0, e0);
++    try std.testing.expect(a1 >= a0 + 17 and a2 >= a1 + 512 and e1 >= e0 + 600);
++    for ([_]u64{ a0, a1, a2, e0, e1 }) |addr| try std.testing.expectEqual(@as(u64, 0), addr % 256);
++    try p.finish();
++    try std.testing.expectEqual(@as(usize, 1), a.calls);
++    try std.testing.expectEqual(@as(usize, 778), a.bytes);
++    try std.testing.expectError(error.PhasePoolFull, p.take(&a, .experts, 1));
++}
++
++test "disabled phase pool leaves allocations independent and in their original order" {
++    var a: Fake = .{};
++    var p: Pool = .{};
++    const x = try p.take(&a, .attention, 1024);
++    const y = try p.take(&a, .experts, 512);
++    try std.testing.expectEqual(x + 1024, y);
++    try std.testing.expectEqual(@as(usize, 2), a.calls);
++    try std.testing.expectEqual(@as(usize, 1536), a.bytes);
++    try p.finish();
++}
++
++test "phase pool detects overflow, incomplete plans, zero-sized entries, and exact bounds" {
++    try std.testing.expectError(error.Overflow, Pool.footprint(&.{ std.math.maxInt(usize) - 256, 512 }));
++    var a: Fake = .{};
++    try std.testing.expectError(error.EmptyPhasePool, Pool.init(&a, &.{0}, &.{}));
++    var p = try Pool.init(&a, &.{ 0, 257, 0 }, &.{256});
++    _ = try p.take(&a, .attention, 257);
++    _ = try p.take(&a, .attention, 0);
++    try std.testing.expectError(error.PhasePoolIncomplete, p.finish());
++    _ = try p.take(&a, .experts, 256);
++    try p.finish();
++    try std.testing.expectError(error.PhasePoolFull, p.take(&a, .attention, 1));
++}
