@@ -1,0 +1,287 @@
+diff --git a/zig/src/families/dsv41/exl3_prefill.zig b/zig/src/families/dsv41/exl3_prefill.zig
+index d912c90..cc07595 100644
+--- a/zig/src/families/dsv41/exl3_prefill.zig
++++ b/zig/src/families/dsv41/exl3_prefill.zig
+@@ -96,14 +96,86 @@ fn dtypeBytes(t: DType) usize {
+ 
+ /// prefill.Workspace: one rotated input xh (fp16, at least M * K) and one W_q (fp16, at least K * N), each the
+ /// largest call's, reused by every call on the stream, and the bf16 Hadamard (hadamard()).
+-pub const Workspace = struct { xh: u64, w: u64, h: u64 };
++pub const Workspace = struct { xh: u64, w: u64, h: u64, cache: ?*UnpackCache = null };
++
++/// Bounded, layer-local storage of immutable unpack results. A pair shares it on the SAME main CUDA stream; only
++/// unpack is omitted on a hit, never rotIn or the GEMM. PairReuse borrows the existing prompt MoE z scratch only
++/// before its expert kernels overwrite it; no additional device allocation or change to chunk boundaries.
++pub const UnpackCache = struct {
++    const Key = struct { words: u64, k: u32, n: u32, k2: u32 };
++    const Entry = struct { key: Key, ptr: u64 };
++    pub const Choice = struct { ptr: u64, hit: bool };
++    base: u64,
++    capacity: usize,
++    used: usize = 0,
++    count: usize = 0,
++    entries: [24]Entry = undefined,
++    hits: usize = 0,
++    saved_bytes: u64 = 0,
++    peak_used: usize = 0,
++
++    pub fn reset(c: *UnpackCache) void {
++        c.used = 0;
++        c.count = 0;
++    }
++
++    /// A full cache never evicts a still-used entry: missing shapes use the original workspace instead.
++    pub fn choose(c: *UnpackCache, l: weights.Linear, fallback: u64) Choice {
++        const key: Key = .{ .words = l.words, .k = l.k, .n = l.n, .k2 = l.k2 };
++        for (c.entries[0..c.count]) |entry| if (std.meta.eql(key, entry.key)) {
++            c.hits += 1;
++            c.saved_bytes += @as(u64, l.k) * l.n * 2;
++            return .{ .ptr = entry.ptr, .hit = true };
++        };
++        const miss: Choice = .{ .ptr = fallback, .hit = false };
++        const elems = std.math.mul(usize, l.k, l.n) catch return miss;
++        const bytes = std.math.mul(usize, elems, 2) catch return miss;
++        // Real EXL3 dimensions are multiples of 128, so every stored matrix keeps the arena's alignment.
++        if (l.k % 128 != 0 or l.n % 128 != 0 or bytes == 0 or
++            c.count == c.entries.len or bytes > c.capacity - c.used) return miss;
++        const ptr = c.base + c.used;
++        c.entries[c.count] = .{ .key = key, .ptr = ptr };
++        c.count += 1;
++        c.used += bytes;
++        c.peak_used = @max(c.peak_used, c.used);
++        return .{ .ptr = ptr, .hit = false };
++    }
++};
++
++/// A pair's attention-only borrow of prompt MoE z. The expert kernels overwrite every routed z value before
++/// reading it (unrouted slots do not read z); both phases are queued on the same main stream. NCCL gathers read
++/// the combined pm/gm, not z. End the borrow before pairExperts and begin anew before any next-layer lookup.
++/// Workspace references are cleared even on failure; neither a single chunk nor a nested request inherits them.
++/// Keep this owner at a stable address between begin/end.
++pub const PairReuse = struct {
++    enabled: bool,
++    first: *Workspace,
++    second: *Workspace,
++    cache: UnpackCache,
++
++    pub fn begin(r: *PairReuse) !void {
++        if (!r.enabled) return;
++        if (r.first.cache != null or r.second.cache != null) return error.UnpackCacheAlreadyBound;
++        r.cache.reset();
++        r.first.cache = &r.cache;
++        r.second.cache = &r.cache;
++    }
++
++    pub fn end(r: *PairReuse) void {
++        if (!r.enabled) return;
++        if (r.first.cache == &r.cache) r.first.cache = null;
++        if (r.second.cache == &r.cache) r.second.cache = null;
++        r.cache.reset(); // the next owner (MoE) may overwrite every byte
++    }
++};
+ 
+ /// prefill.matmul without a bias (no DeepSeek-V4.1 linear has one): out [M, N] (row stride os elements) =
+ /// x [M, K] (row stride ldx) @ W, the prompt path's arithmetic.
+ pub fn matmul(k: *const Kernels, t: tri.Tri, ws: Workspace, l: weights.Linear, x: u64, x_dtype: DType, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize, m: usize) !void {
+     try rotIn(k, t.stream, x, x_dtype, ldx, l.suh, ws.xh, m, l.k);
+-    try unpack(k, t.stream, l, ws.w);
+-    try tri_markov.matmul(t, ws.xh, ws.w, ws.h, l.svh, null, out, out_type, os, m, l.k, l.n);
++    const choice: UnpackCache.Choice = if (ws.cache) |cache| cache.choose(l, ws.w) else .{ .ptr = ws.w, .hit = false };
++    if (!choice.hit) try unpack(k, t.stream, l, choice.ptr);
++    try tri_markov.matmul(t, ws.xh, choice.ptr, ws.h, l.svh, null, out, out_type, os, m, l.k, l.n);
+ }
+ 
+ /// prefill.Workspace.hadamard: H [128, 128] bf16, 1 - 2 * parity(i & j) (the bits of +-1.0).
+@@ -127,6 +199,96 @@ test "the prompt GEMM's Hadamard: +-1, symmetric, orthogonal rows" {
+     }
+ }
+ 
++test "layer-local unpack cache: exact keys, capacity fallback and reset" {
++    var c: UnpackCache = .{ .base = 0x100000, .capacity = 2 * 128 * 128 * 2 };
++    const l: weights.Linear = .{ .words = 0x200000, .suh = 1, .svh = 2, .k = 128, .n = 128, .k2 = 6 };
++    const fallback = 0x300000;
++    try std.testing.expectEqualDeep(UnpackCache.Choice{ .ptr = c.base, .hit = false }, c.choose(l, fallback));
++    try std.testing.expectEqualDeep(UnpackCache.Choice{ .ptr = c.base, .hit = true }, c.choose(l, fallback));
++    var other = l;
++    other.words += 256;
++    const second = c.choose(other, fallback);
++    try std.testing.expect(!second.hit and second.ptr == c.base + 32768);
++    other.k2 += 1;
++    try std.testing.expectEqualDeep(UnpackCache.Choice{ .ptr = fallback, .hit = false }, c.choose(other, fallback));
++    try std.testing.expect(c.choose(l, fallback).hit); // fallback did not evict the first matrix
++    try std.testing.expectEqual(@as(u64, 65536), c.saved_bytes);
++    c.reset();
++    try std.testing.expect(!c.choose(other, fallback).hit);
++    try std.testing.expect(!c.choose(l, fallback).hit);
++    c.reset();
++    other = l;
++    other.k = std.math.maxInt(u32);
++    other.n = std.math.maxInt(u32);
++    try std.testing.expectEqualDeep(UnpackCache.Choice{ .ptr = fallback, .hit = false }, c.choose(other, fallback));
++    try std.testing.expectEqual(@as(usize, 0), c.count);
++    other = l;
++    other.n *= 4;
++    try std.testing.expectEqualDeep(UnpackCache.Choice{ .ptr = fallback, .hit = false }, c.choose(other, fallback));
++}
++
++test "unpack cache key covers shape and bit width; scale vectors remain outside unpack" {
++    var c: UnpackCache = .{ .base = 0x100000, .capacity = 1 << 20 };
++    var l: weights.Linear = .{ .words = 0x200000, .suh = 1, .svh = 2, .k = 128, .n = 128, .k2 = 6 };
++    _ = c.choose(l, 0);
++    l.suh += 1;
++    l.svh += 1;
++    try std.testing.expect(c.choose(l, 0).hit);
++    l.n *= 2;
++    try std.testing.expect(!c.choose(l, 0).hit);
++    l.k *= 2;
++    try std.testing.expect(!c.choose(l, 0).hit);
++    l.k2 += 1;
++    try std.testing.expect(!c.choose(l, 0).hit);
++    c.reset();
++    for (0..c.entries.len) |i| {
++        l.words = 0x400000 + i * 256;
++        l.k = 128;
++        l.n = 128;
++        try std.testing.expect(c.choose(l, 0).ptr != 0);
++    }
++    l.words = 0x800000;
++    try std.testing.expectEqualDeep(UnpackCache.Choice{ .ptr = 0, .hit = false }, c.choose(l, 0));
++}
++
++test "pair reuse ends before MoE overwrites scratch and never inherits stale entries" {
++    var a: Workspace = .{ .xh = 1, .w = 2, .h = 3 };
++    var b = a; // partner shares ordinary scratch, including its original unpack workspace
++    var r: PairReuse = .{ .enabled = true, .first = &a, .second = &b, .cache = .{ .base = 0x100000, .capacity = 1 << 20 } };
++    const l: weights.Linear = .{ .words = 0x200000, .suh = 1, .svh = 2, .k = 128, .n = 128, .k2 = 6 };
++    try r.begin();
++    try std.testing.expect(!a.cache.?.choose(l, a.w).hit);
++    try std.testing.expect(b.cache.?.choose(l, b.w).hit);
++    r.end();
++    try std.testing.expect(a.cache == null and b.cache == null);
++    try std.testing.expectEqual(@as(usize, 0), r.cache.count);
++    try std.testing.expectEqual(@as(usize, 32768), r.cache.peak_used);
++    // MoE has reused these bytes. A new borrow must unpack again, despite identical addresses and dimensions.
++    try r.begin();
++    try std.testing.expect(!b.cache.?.choose(l, b.w).hit);
++    r.end();
++    r.enabled = false;
++    try r.begin();
++    try std.testing.expect(a.cache == null and b.cache == null);
++    r.end();
++}
++
++test "pair reuse rejects reentrancy and does not clear another owner's workspace" {
++    var a: Workspace = .{ .xh = 1, .w = 2, .h = 3 };
++    var b = a;
++    var r: PairReuse = .{ .enabled = true, .first = &a, .second = &b, .cache = .{ .base = 0x100000, .capacity = 32768 } };
++    var other = r;
++    try other.begin();
++    try std.testing.expectError(error.UnpackCacheAlreadyBound, r.begin());
++    r.end();
++    try std.testing.expect(a.cache == &other.cache and b.cache == &other.cache);
++    other.end();
++    try r.begin();
++    try std.testing.expectError(error.UnpackCacheAlreadyBound, r.begin());
++    r.end();
++    try std.testing.expect(a.cache == null and b.cache == null);
++}
++
+ test "unpack kernels by template arguments" {
+     try std.testing.expectEqualDeep([2]u32{ 7, 2 }, template2("ILi7ELi2EEEvPKjP6__halfill").?);
+     try std.testing.expectEqualDeep([2]u32{ 16, 2 }, template2("ILi16ELi2EEEvPKjP6__halfill").?);
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 2c16259..a8cfc95 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -132,6 +132,7 @@ pub const Model = struct {
+     // experts in one call (fillPair); the second chunk's own state (prompt.partner), the pair's MoE rows and a second
+     // Engram host for the second chunk's rows
+     pair_on: bool = false,
++    pair_reuse: bool = false, // TF_DS_PAIR_REUSE=1: borrow existing MoE z for attention unpack reuse, no allocation
+     ch2: ?prompt.Chunk = null,
+     pair: ?prompt.PairMoe = null,
+     eh2: ?prompt.EngramHost = null,
+@@ -211,6 +212,7 @@ pub const Model = struct {
+         m.eh = null;
+         m.ahead = null;
+         m.pair_on = false;
++        m.pair_reuse = false;
+         m.ch2 = null;
+         m.pair = null;
+         m.eh2 = null;
+@@ -319,6 +321,8 @@ pub const Model = struct {
+         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
+         m.eng.round_rows = o.round_rows;
+         m.pair_on = sp.pair == null and (if (std.c.getenv("TF_DS_PAIR")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false); // every rank alike
++        m.pair_reuse = if (std.c.getenv("TF_DS_PAIR_REUSE")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
++        if (m.pair_reuse and !m.pair_on) return error.PairReuseNeedsPairs;
+         if (m.pair_on) prompt.pair_rows = 2 * chunk_rows;
+         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, o.pool);
+         if (m.pair_on) {
+@@ -869,6 +873,8 @@ pub const Model = struct {
+         const ch1 = &m.ch;
+         const ch2 = &m.ch2.?;
+         const pr = &m.pair.?;
++        var reuse: exl3_prefill.PairReuse = .{ .enabled = m.pair_reuse, .first = &ch1.ws, .second = &ch2.ws, .cache = .{ .base = ch1.xs.z, .capacity = ch1.xs_z_bytes } };
++        defer reuse.end();
+         const image_id: i64 = if (c.image_token) |t| t else 0;
+         for (0..n1) |j| m.ids64[j] = if (seq[start + j] < 0) image_id else seq[start + j];
+         for (0..n2) |j| m.ids64_2[j] = if (seq[start + n1 + j] < 0) image_id else seq[start + n1 + j];
+@@ -905,6 +911,7 @@ pub const Model = struct {
+         const ev_gm1 = m.gev[5];
+         const ev_gm2 = m.gev[6];
+         for (0..c.layers / 2) |li| {
++            try reuse.begin(); // same-stream attention finishes before pairExperts overwrites this scratch
+             // the side's MoE gathers of the layer before: the pending posts read them, and an NCCL call on this stream
+             // (an Engram layer's) runs only with the side idle
+             if (m.gs != null and li > 0 and e.w.layers[li].engram_wkv != null) {
+@@ -940,6 +947,7 @@ pub const Model = struct {
+                 if (li > 0) try ms.wait(ev_gm2);
+                 try prompt.attnMixes(e, ch2, li);
+                 try prompt.attention(e, ch2, &m.view, &sh2, li, m.ring_view[li], 0, false);
++                reuse.end();
+                 try ev_a2.record(ms);
+                 try gs.wait(ev_a2);
+                 try prompt.gatherOn(e, ch2, ch2.pa, ch2.ga, gs);
+@@ -968,6 +976,7 @@ pub const Model = struct {
+                 try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(pr.x, ch1.x, n1 * d * 2, e.s.handle), "cuMemcpyDtoDAsync");
+                 try prompt.attnMixes(e, ch2, li);
+                 try prompt.attention(e, ch2, &m.view, &sh2, li, m.ring_view[li], 0, false);
++                reuse.end();
+                 try prompt.gather(e, ch2, ch2.pa, ch2.ga);
+                 try prompt.ffnMixes(e, ch2, li);
+                 try prompt.moeGate(e, ch2, li, pr.pick + n1 * sl * 4, pr.wts + n1 * sl * 4);
+@@ -984,9 +993,13 @@ pub const Model = struct {
+             try ms.wait(ev_gm1);
+             try ms.wait(ev_gm2);
+         }
++        // The last MoE overwrote z. A fresh borrow for the replay cut (which never runs experts).
++        try reuse.begin();
+         // the decoder's first layer: each chunk's mixes and kv-source update, and the cut that ends an encoder-only chunk
+         if (try prompt.replayCut(e, ch1, &m.view, &sh1, c.layers / 2, replay, m.host_pos)) return error.BadChunk;
+         if (try prompt.replayCut(e, ch2, &m.view, &sh2, c.layers / 2, replay, m.host_pos2)) return error.BadChunk;
++        if (std.c.getenv("TF_DS_PAIR_REUSE_STATS")) |v| if (std.mem.eql(u8, std.mem.span(v), "1"))
++            std.debug.print("{{\"pair_reuse_hits\": {d}, \"saved_fp16_bytes\": {d}, \"borrowed_capacity\": {d}, \"peak_used\": {d}}}\n", .{ reuse.cache.hits, reuse.cache.saved_bytes, reuse.cache.capacity, reuse.cache.peak_used });
+     }
+ 
+     /// The prompt's logits (its last row's, the ranks' columns in rank order) after a fill's last chunk.
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 8ea7fa0..3465832 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -240,6 +240,7 @@ pub const Chunk = struct {
+     pm: u64, // fp32 [cap, D]: the MoE partial
+     gm: u64, // fp32 [world, cap, D]: its gather (the pending post)
+     xs: exl3_experts.Scratch,
++    xs_z_bytes: usize, // actual allocation bound; pair attention may borrow z before its MoE phase
+     // Model._moe_scratch's decode scratch: windows under 64 rows (a prompt's small chunk, every decode round), one for
+     // every layer of the same slots and experts, its epoch carried from call to call
+     xsd: exl3_experts.DecodeScratch,
+@@ -391,6 +392,7 @@ pub const Chunk = struct {
+             @field(xs, f) = try a.take(sz[j]);
+         }
+         ch.xs = xs;
++        ch.xs_z_bytes = sz[3];
+         ch.xsd = try decodeScratch(e, a, ex, sl);
+         ch.gl = try a.take(16 * (d / 256) * c.experts * 4);
+         // prefill.Workspace: the largest prompt GEMM's rotated input and W_q (fp16) over every layer, and the Hadamard
