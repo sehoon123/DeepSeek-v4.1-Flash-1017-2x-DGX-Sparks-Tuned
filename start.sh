@@ -63,6 +63,7 @@ for v in CONTEXT PARALLEL MAX_TOKENS TOP_K; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] ||
 [[ "$RDMA_IDLE_S" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v value="$RDMA_IDLE_S" 'BEGIN { exit !(value <= 3600) }' || die "RDMA_IDLE_S is 0 to 3600 seconds (0 turns the nap off), not $RDMA_IDLE_S"
 [[ "$RDMA_NAP_US" =~ ^[1-9][0-9]*$ ]] && awk -v value="$RDMA_NAP_US" 'BEGIN { exit !(value <= 1000000) }' || die "RDMA_NAP_US is 1 to 1000000 microseconds, not $RDMA_NAP_US"
 [[ "$PREFILL_NEST_TOKENS" =~ ^[0-9]+$ ]] && (( PREFILL_NEST_TOKENS <= 65536 )) || die "PREFILL_NEST_TOKENS is 0 to 65536 tokens, not $PREFILL_NEST_TOKENS"
+[[ "$PROMPT_PROGRESS_TOKENS" =~ ^[0-9]+$ ]] && (( PROMPT_PROGRESS_TOKENS == 0 || (PROMPT_PROGRESS_TOKENS >= 8192 && PROMPT_PROGRESS_TOKENS <= 1048576) )) || die "PROMPT_PROGRESS_TOKENS is 0 (off) or 8192 to 1048576 tokens, not $PROMPT_PROGRESS_TOKENS"
 for v in THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_KEY; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "${RANK1_PROFILE:-}" =~ ^[012]?$ ]] || die "RANK1_PROFILE is empty, 0, 1 or 2, not '${RANK1_PROFILE:-}'"
 [[ -z "${TF_DS_FIX_K:-}" || "${TF_DS_FIX_K}" =~ ^[0-5]$ ]] || die "TF_DS_FIX_K is empty or 0 to 5, not '${TF_DS_FIX_K:-}'"
@@ -252,7 +253,8 @@ ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDM
 [[ -z "$ROUND_ROWS" ]] || ENGINE_ENV+=("TF_DS_ROUND_ROWS=$ROUND_ROWS")
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
 (( PREFILL_NEST_TOKENS == 0 || PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_NEST_TOKENS=$PREFILL_NEST_TOKENS")
-while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_EXL3)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' || true)
+(( PROMPT_PROGRESS_TOKENS == 0 )) || ENGINE_ENV+=("TF_DS_PROMPT_PROGRESS_TOKENS=$PROMPT_PROGRESS_TOKENS")
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_EXL3)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|PROMPT_PROGRESS_TOKENS)=' || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
 DATA=/hf/$DATA_SUB

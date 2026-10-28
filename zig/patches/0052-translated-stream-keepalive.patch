@@ -1,0 +1,59 @@
+diff --git a/zig/src/server/anthropic.zig b/zig/src/server/anthropic.zig
+index 4821e0f..4b4ac42 100644
+--- a/zig/src/server/anthropic.zig
++++ b/zig/src/server/anthropic.zig
+@@ -105,7 +105,15 @@ const Wire = struct {
+     payload: Value = .null,
+ 
+     fn out(w: *Wire) openai.Out {
+-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole } };
++        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .pulse = pulse } };
++    }
++
++    /// While the engine sends nothing (a long prompt pass, a queue): Anthropic's own `ping` event between whole events, once the stream
++    /// is open, so a client's body-idle timer sees the stream alive. Never a delta, token, usage item or first token.
++    fn pulse(ctx: *anyopaque) error{Closed}!void {
++        const w: *Wire = @ptrCast(@alignCast(ctx));
++        if (!w.opened) return;
++        return sse.ping(w.reply.conn);
+     }
+ 
+     fn open(ctx: *anyopaque) error{Closed}!void {
+diff --git a/zig/src/server/responses.zig b/zig/src/server/responses.zig
+index 309aade..77b90af 100644
+--- a/zig/src/server/responses.zig
++++ b/zig/src/server/responses.zig
+@@ -203,7 +203,15 @@ const Wire = struct {
+     payload: Value = .null,
+ 
+     fn out(w: *Wire) openai.Out {
+-        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole } };
++        return .{ .ctx = w, .vt = &.{ .open = open, .event = event, .reply = whole, .pulse = pulse } };
++    }
++
++    /// While the engine sends nothing (a long prompt pass, a queue): an SSE comment between whole events, once the stream
++    /// is open, so a client's body-idle timer sees the stream alive. Never a delta, token, usage item or first token.
++    fn pulse(ctx: *anyopaque) error{Closed}!void {
++        const w: *Wire = @ptrCast(@alignCast(ctx));
++        if (!w.opened) return;
++        return sse.keepalive(w.reply.conn);
+     }
+ 
+     fn open(ctx: *anyopaque) error{Closed}!void {
+diff --git a/zig/src/server/sse.zig b/zig/src/server/sse.zig
+index 05182c2..00018c0 100644
+--- a/zig/src/server/sse.zig
++++ b/zig/src/server/sse.zig
+@@ -29,6 +29,12 @@ pub fn keepalive(conn: *Conn) error{Closed}!void {
+     return conn.writeAll(": keep-alive\n\n");
+ }
+ 
++/// Anthropic Messages' own keepalive event (its streams "may include any number of ping events"): transport-only, as
++/// `keepalive`, for clients of that format. No allocation and no model/request data.
++pub fn ping(conn: *Conn) error{Closed}!void {
++    return conn.writeAll("event: ping\ndata: {\"type\":\"ping\"}\n\n");
++}
++
+ /// ``event: KIND`` then its data line (Responses and Messages events).
+ pub fn event(conn: *Conn, a: Allocator, kind: []const u8, payload: json.Value) error{Closed}!void {
+     const text = json.stringify(a, payload, .{}) catch return error.Closed;

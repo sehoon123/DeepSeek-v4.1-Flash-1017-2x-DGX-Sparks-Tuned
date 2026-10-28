@@ -12,6 +12,7 @@ pruned). Read every number as this pair's. The tools keep the original machines'
 
 | | |
 | --- | --- |
+| [PROGRESS-STATES.md](PROGRESS-STATES.md) | 10-29: qualified/deployed 0051–0053; an interrupted long prompt pass resumes from its last progress state (0 → 65,536 after a 45 s disconnect, identical output), −0.09/+0.21% cold prefill; Anthropic/Responses stream keep-alives; overflow wording Pi compacts on |
 | [CACHE-PLACEMENT-SSE.md](CACHE-PLACEMENT-SSE.md) | 10-28: qualified/deployed 0048–0050; blocked placement preserves 679,936 tokens, 850K cold SDK stream survives >300s prefill, 34 complete output comparisons; limitations and rollback provenance |
 | [CACHE-LIFECYCLE.md](CACHE-LIFECYCLE.md) | 10-28: earlier qualified/deployed 0046/0047; snapshot validity, refresh, nesting and save rollback |
 | [FINDINGS.md](FINDINGS.md) | the notebook of 10-20: profiling, the confidence-head diagnosis, copy windows, depth-policy ceilings, the round's kernels, bandwidth and RDMA; corrections are marked where they were made |

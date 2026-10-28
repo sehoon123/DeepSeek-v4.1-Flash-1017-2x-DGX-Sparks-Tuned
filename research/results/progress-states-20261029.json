@@ -1,0 +1,114 @@
+{
+  "complete": true,
+  "checked_at": "2026-10-29T03:09:07.485223+09:00",
+  "production_promoted": true,
+  "image": "tensorfold-dsv41:exl3-tp2-b35b0716c6f3",
+  "image_id": "sha256:5c78cd4d66f95b93146213cf957c0f4c5803a2011fda5f0e327c342c4d043ade",
+  "native_sha256": "c5f62536da6c214000265a742e44ac05d7c3c33a09682e566cd990f627747f30",
+  "baseline": {
+    "image": "tensorfold-dsv41:exl3-tp2-67309ead97da",
+    "source": "complete promoted 0050 run of 2026-10-28 (qual2 candidate)",
+    "reused_not_rerun": true
+  },
+  "cpu": {
+    "host": 273,
+    "server": 69,
+    "seam": 55,
+    "overlap": true,
+    "intended_negative_controls": 3,
+    "native_build_steps": 28,
+    "translated_http_fixture": true,
+    "source_reproduction_files": 1279,
+    "source_reproduction_differences": 0,
+    "patches": 49
+  },
+  "actual_model": {
+    "full_array_comparisons": 34,
+    "complete_responses": 68,
+    "long": 9,
+    "ordinary": 20,
+    "features": 5,
+    "progress_resume": {
+      "resumed_at": 65536,
+      "gap": 65536,
+      "disconnect_after_seconds": 45.0,
+      "retry_prefill_seconds": 52.441209222,
+      "baseline_retry_prefill_s": 76.305736774,
+      "candidate_retry_prefill_s": 52.441209222
+    },
+    "cold_prefill_overhead": {
+      "seed-large": {
+        "input": 648878,
+        "baseline_prefill_s": 280.207103863,
+        "candidate_prefill_s": 279.964816145,
+        "ratio": 0.9991353262830964
+      },
+      "cold-over-300": {
+        "input": 850123,
+        "baseline_prefill_s": 381.914988633,
+        "candidate_prefill_s": 382.723333756,
+        "ratio": 1.002116557734205
+      }
+    },
+    "placement": {
+      "cached": 679936,
+      "prefill": 2.422846719
+    },
+    "sdk_cold_pass": {
+      "prefill": 382.723333756,
+      "comments": 25,
+      "max_body_gap_seconds": 15.081217521
+    },
+    "translated": [
+      {
+        "route": "/v1/messages",
+        "input_tokens": 149915,
+        "keepalives": 14,
+        "first_text_s": 210.8,
+        "max_gap_s": 15.05,
+        "json_text_equal": true
+      },
+      {
+        "route": "/v1/responses",
+        "input_tokens": 149926,
+        "keepalives": 28,
+        "first_text_s": 434.7,
+        "max_gap_s": 15.05,
+        "json_text_equal": true
+      }
+    ],
+    "decode_disconnect_exact_recovery": true,
+    "video": "skipped: PyAV unavailable"
+  },
+  "window": {
+    "start": "2026-10-29T02:19:12+09:00",
+    "promoted": "2026-10-29T03:01:14+09:00",
+    "memory_minima_MiB": {
+      "head": 5232,
+      "worker": 7027
+    }
+  },
+  "environment_delta": [
+    "TF_DS_PROMPT_PROGRESS_TOKENS=65536 on both ranks"
+  ],
+  "services": {
+    "restart": "on-failure",
+    "nrestarts": 0,
+    "public_unauthenticated_status": 401
+  },
+  "site_proxy": {
+    "change": "CLIENT_DEAD_S=60: SO_KEEPALIVE + TCP_USER_TIMEOUT on accepted client sockets",
+    "installed": true,
+    "keepalive_timer_observed": true,
+    "published": false,
+    "reason": "site-local file, not part of the recipe"
+  },
+  "observations": [
+    "Fresh synthetic prose on the translated routes prefilled at ~711 and ~345 tok/s vs ~2,500 tok/s for previously processed prompts; cold Engram I/O is the leading hypothesis, not verified."
+  ],
+  "limitations": [
+    "Cold or changed long prompts still need full computation.",
+    "A restart still loses all KV; two long sessions that do not fit the pool together still recompute on each switch.",
+    "No GPU/transport fault injection; follower save-copy acknowledgement open."
+  ]
+}

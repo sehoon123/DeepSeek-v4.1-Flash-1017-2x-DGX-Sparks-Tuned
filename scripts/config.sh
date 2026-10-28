@@ -192,6 +192,13 @@ PREFILL_INTERLEAVE_MS="${PREFILL_INTERLEAVE_MS:-250}"
 # TF_DS_PREFILL_NEST_TOKENS, read by rank 0 only, with the interleave above. 0: it waits for the whole pass, as before.
 # 8192: about four chunks (a few seconds) the long pass waits for each request that comes in.
 PREFILL_NEST_TOKENS="${PREFILL_NEST_TOKENS:-8192}"
+# zig/patches/0051: a long prompt pass also keeps a rolling state every this many tokens (whole 2,048-token chunks, at least
+# 8,192), so a pass that ends early (its client left or timed out, a network drop, an abort, a proxy restart) resumes near
+# where it stopped on the retry instead of from the history's last state: TF_DS_PROMPT_PROGRESS_TOKENS, read by rank 0 only.
+# A newer state of the conversation retires the one before (at most about one extra state while a long pass runs, none
+# after it), and a progress state never evicts another conversation's. Same chunk ends: a resumed pass computes the same
+# bits. 0: off, as before.
+PROMPT_PROGRESS_TOKENS="${PROMPT_PROGRESS_TOKENS:-65536}"
 
 # ---------------------------------------------------------------- files
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"

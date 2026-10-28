@@ -21,17 +21,19 @@ or off, and **DSpark** speculative decoding from the checkpoint's own draft bloc
 - Optional `ABLIT=1`: keeps Mia EAQ 2.9 bpw and applies the matching [Keys overlay by drowzeys](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated).
   Requires your Hugging Face token and access to that gated repository; see [Abliterated mode](#abliterated-mode).
 
-## Latest stability release — 2026-10-28
+## Latest stability release — 2026-10-29
 
-Patches **0046–0050** harden saved-cache ownership, preserve valid prefixes when placement is temporarily blocked by
-live streams, and send 15-second native OpenAI SSE keep-alives during long waits. The 0048–0050 follow-up passed
-**34 complete output-token-array comparisons** against 0047, including a real 850K-token SDK/proxy request with
-381.91 seconds of cold prefill and no retry. Model, quantization, arithmetic, limits and cache budget are unchanged.
-See [the qualification report and its limits](research/CACHE-PLACEMENT-SSE.md),
-[0046/0047 lifecycle details](research/CACHE-LIFECYCLE.md), and the
-[source/evidence release](https://github.com/sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned/releases/tag/cache-placement-sse-20261028).
-Cold prefill can still take minutes; SSE comments do not override absolute client deadlines. This is not a claim
-that every client-side stall is resolved. The decode measurements below retain their original dates and baselines.
+Patches **0046–0053** harden saved-cache ownership, preserve valid prefixes when placement is temporarily blocked by
+live streams, keep long streams alive (15-second keep-alives on the OpenAI, Anthropic and Responses routes), and keep
+rolling progress states during long prompt passes so that an interrupted pass (client timeout, network drop, abort)
+resumes near where it stopped on the retry instead of recomputing from zero. Qualified on the actual model against the
+deployed predecessor: every complete output token array identical, a retry 45 s into a 196,608-token cold pass resumed
+at 65,536, and cold prefill within −0.09/+0.21%. Model, quantization, arithmetic, limits and cache budget unchanged.
+See [PROGRESS-STATES.md](research/PROGRESS-STATES.md), [CACHE-PLACEMENT-SSE.md](research/CACHE-PLACEMENT-SSE.md) and
+[CACHE-LIFECYCLE.md](research/CACHE-LIFECYCLE.md), and the
+[source/evidence release](https://github.com/sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned/releases/tag/progress-states-20261029).
+Cold prefill can still take minutes; keep-alives do not override absolute client deadlines. This is not a claim that
+every client-side stall is resolved. The decode measurements below retain their original dates and baselines.
 
 ## What this recipe adds
 
@@ -120,7 +122,7 @@ hashes: 62 of 62 copy-window runs (copies 0-90 % wrong, three streams at once, t
 different ([research/](research/README.md)).
 
 The runtime uses the full ordered [patch chain](zig/patches/README.md) and kit overlays in `zig/Dockerfile`.
-The currently qualified local image is `tensorfold-dsv41:exl3-tp2-67309ead97da`; its exact build/deployment scope is
+The currently qualified local image is `tensorfold-dsv41:exl3-tp2-b35b0716c6f3`; its exact build/deployment scope is
 recorded in the stability report above. No container-registry image is published: `./start.sh` builds a missing
 local image on the head and copies it to the worker. Source/evidence releases do not include model weights.
 

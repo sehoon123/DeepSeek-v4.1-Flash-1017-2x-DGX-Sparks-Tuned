@@ -1,5 +1,8 @@
 # Cache placement and long-stream stability — 2026-10-28
 
+Follow-up: [PROGRESS-STATES.md](PROGRESS-STATES.md) (0051–0053, 2026-10-29) adds rolling prompt progress states, keep-alives on the
+Anthropic/Responses stream routes and overflow wording, qualified and deployed.
+
 This follow-up carries patches **0048–0050**, on top of the previously qualified 0046/0047 lifecycle fixes.
 It addresses a reproduced server-side cache-loss path and an independently tested HTTP body-idle risk.
 It does **not** establish every cause of the original client incident or claim that all stalls are eliminated.
