@@ -1,0 +1,99 @@
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 10a3b59..32902a2 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -1227,11 +1227,17 @@ pub const Lanes = struct {
+         const s: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
+         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+         if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+-        const sn = try self.gpa.create(Snap);
+-        errdefer self.gpa.destroy(sn);
+-        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
+-        errdefer sn.buf.free();
+-        try self.snaps.append(self.gpa, sn);
++        const sn = blk: {
++            const sn = try self.gpa.create(Snap);
++            errdefer self.gpa.destroy(sn);
++            sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
++            errdefer sn.buf.free();
++            try self.snaps.append(self.gpa, sn);
++            break :blk sn;
++        };
++        // Once registered, rollback must remove the list entry before freeing it, and send the peer a drop
++        // in case it already mirrored the save. A failed save must never leave a dangling validity/placement key.
++        errdefer snapDropFn(ptr, sn);
+         self.next_snap += 1;
+         if (try self.begin(.snap_save)) {
+             try self.wire.int(self.gpa, u64, sn.id);
+@@ -1636,6 +1642,71 @@ test "placement invalidation reaches the cache validity probe without touching G
+     try std.testing.expect(Lanes.snapValidFn(&ln, &snapshots[2]));
+ }
+ 
++test "failed snapshot save unregisters before freeing and a later save still works" {
++    // Exercise the real Lanes/Model save path, with driver function pointers replaced by CPU fakes.
++    // No CUDA library, context or device is opened. NOT_READY is a recoverable, silent injected error.
++    const Fake = struct {
++        var held: usize = 0;
++        var copies: usize = 0;
++        var fail_copy = true;
++        fn alloc(p: *cuda.abi.DevicePtr, _: usize) callconv(.c) cuda.abi.Result {
++            std.debug.assert(held == 0);
++            held += 1;
++            p.* = 4096;
++            return cuda.abi.success;
++        }
++        fn free(p: cuda.abi.DevicePtr) callconv(.c) cuda.abi.Result {
++            std.debug.assert(p == 4096 and held == 1);
++            held -= 1;
++            return cuda.abi.success;
++        }
++        fn copy(_: cuda.abi.DevicePtr, _: cuda.abi.DevicePtr, _: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
++            copies += 1;
++            return if (fail_copy) cuda.abi.error_not_ready else cuda.abi.success;
++        }
++    };
++    Fake.held = 0;
++    Fake.copies = 0;
++    Fake.fail_copy = true;
++    var driver: cuda.Driver = undefined;
++    driver.api.cuMemAlloc_v2 = Fake.alloc;
++    driver.api.cuMemFree_v2 = Fake.free;
++    driver.api.cuMemcpyDtoDAsync_v2 = Fake.copy;
++    var ctx: cuda.Context = undefined;
++    ctx.d = &driver;
++    var m: Model = undefined;
++    m.ctx = &ctx;
++    m.cfg.window = 128;
++    m.cfg.head_dim = 8;
++    m.cfg.layers = 0;
++    m.eng.c = &m.cfg;
++    m.stream.handle = null;
++    var rings = [_]u64{8192};
++    m.rings = &rings;
++    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
++    defer ln.snaps.deinit(std.testing.allocator);
++    defer ln.streams.deinit(std.testing.allocator);
++    var stream: lanes.Stream = undefined;
++    stream.prompt_len = 2 * model.chunk_rows;
++    try ln.streams.put(std.testing.allocator, &stream, .{ .slot = 0, .base = 0, .end = 4 * model.chunk_rows });
++    const bytes0 = cuda.usage(false).device;
++    for (0..32) |_| {
++        try std.testing.expectError(error.NotReady, Lanes.snapSaveFn(&ln, &stream, model.chunk_rows));
++        try std.testing.expectEqual(@as(usize, 0), ln.snaps.items.len);
++        try std.testing.expectEqual(@as(usize, 0), Fake.held);
++        try std.testing.expectEqual(bytes0, cuda.usage(false).device);
++    }
++    Fake.fail_copy = false;
++    const saved = try Lanes.snapSaveFn(&ln, &stream, model.chunk_rows);
++    try std.testing.expect(Lanes.snapValidFn(&ln, saved));
++    try std.testing.expectEqual(@as(usize, 1), ln.snaps.items.len);
++    try std.testing.expectEqual(@as(usize, 33), Fake.copies);
++    Lanes.snapDropFn(&ln, saved);
++    try std.testing.expectEqual(@as(usize, 0), ln.snaps.items.len);
++    try std.testing.expectEqual(@as(usize, 0), Fake.held);
++    try std.testing.expectEqual(bytes0, cuda.usage(false).device);
++}
++
+ fn envVar(name: [:0]const u8) ?[]const u8 {
+     return std.mem.span(std.c.getenv(name) orelse return null);
+ }

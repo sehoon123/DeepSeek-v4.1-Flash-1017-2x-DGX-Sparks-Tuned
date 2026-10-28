@@ -1,0 +1,604 @@
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 6e41dcc..89ada6b 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -88,7 +88,7 @@ pub const LaneHost = struct {
+         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
+         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+         kept0: u64 = 0, // the store's kept count when the job looked it up
+-        nest_left: ?u32 = null, // what its pass would prefill, as nestable() found it once
++        nest_left: ?u32 = null, // cached negative estimate; eligible work is rechecked before nesting
+ 
+         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+@@ -452,7 +452,9 @@ pub const LaneHost = struct {
+         const job = h.queued.items[0];
+         const r = job.request;
+         if (r.images.len > 0) return false;
+-        if (job.nest_left == null) {
++        // A previously short estimate can outlive its snapshot's rows. Revalidate eligible work before
++        // nesting it; otherwise a supposedly short pass can unexpectedly recompute a whole long history.
++        if (job.nest_left == null or job.nest_left.? <= h.nest_tokens) {
+             const key = keyOf(r);
+             var at: usize = 0;
+             if (cacheable(r)) if (h.cache) |store| if (store.find(key, r.chunks)) |e| {
+@@ -468,6 +470,9 @@ pub const LaneHost = struct {
+     fn between(ptr: *anyopaque) anyerror!void {
+         const h: *LaneHost = @ptrCast(@alignCast(ptr));
+         if (h.core.log != null) return; // a step resets the core's arena, which a trail's open events live in
++        // The outer pass has consumed (or rejected) its saved state before yielding. Retire that reference
++        // before a nested lookup/keep can evict or refresh the entry. A backend not yet resolved keeps it.
++        if (h.filling) |job| if (job.entry) |e| if (job.stream.reuse_failed or job.stream.cached == e.at) job.reported();
+         // requests needing little wait: their whole passes now, inside this one, one after another, first tokens out
+         if (h.nestable()) {
+             const outer = h.filling;
+@@ -1091,7 +1096,97 @@ test "prefill nesting: a request refused for room inside a long pass (the pass h
+     while (target.lanes.count() > 0) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+ }
+ 
+-test { _ = @import("lane_host_test.zig"); }
++test {
++    _ = @import("lane_host_test.zig");
++}
++
++test "nested admission rechecks a short estimate after its saved rows become invalid" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    const Snaps = struct {
++        short_valid: bool = true,
++        long_valid: bool = true,
++        fn bytes(_: *anyopaque, _: u32) u64 {
++            return 1;
++        }
++        fn save(ptr: *anyopaque, _: ?*anyopaque, at: u32) anyerror!pc.Saved {
++            const f: *@This() = @ptrCast(@alignCast(ptr));
++            return switch (at) {
++                12 => &f.short_valid,
++                28 => &f.long_valid,
++                else => error.BadMark,
++            };
++        }
++        fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
++            return error.BackendRestores;
++        }
++        fn drop(_: *anyopaque, _: pc.Saved) void {}
++        fn valid(_: *anyopaque, saved: pc.Saved) bool {
++            return @as(*bool, @ptrCast(saved)).*;
++        }
++        fn event(_: *anyopaque, _: Id, _: *const Event) void {}
++    };
++    var snaps: Snaps = .{};
++    var store = pc.Store.init(gpa, .{ .ptr = &snaps, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop, .valid = Snaps.valid } }, .{ .min_prompt = 0 }, 10);
++    defer store.deinit();
++    const prompt: [32]u32 = @splat(3);
++    try std.testing.expect(store.keep(&prompt, 12, null, &.{}));
++    try std.testing.expect(store.keep(&prompt, 28, null, &.{}));
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    host.cache = &store;
++    host.nest_tokens = 8;
++    const request: Request = .{ .prompt = &prompt, .max_tokens = 1 };
++    var outer: LaneHost.Job = .{ .host = &host, .id = 1, .request = &request, .sink = .{ .ctx = &host, .event = Snaps.event } };
++    var queued: LaneHost.Job = .{ .host = &host, .id = 2, .request = &request, .sink = .{ .ctx = &host, .event = Snaps.event } };
++    host.filling = &outer;
++    try host.admitted.append(gpa, &outer);
++    defer host.admitted.deinit(gpa);
++    try host.queued.append(gpa, &queued);
++    defer host.queued.deinit(gpa);
++    try std.testing.expect(LaneHost.nestable(&host));
++    try std.testing.expectEqual(@as(?u32, 4), queued.nest_left);
++    snaps.long_valid = false;
++    // Do not clear nest_left: this specifically tests the formerly cached positive decision.
++    try std.testing.expect(!LaneHost.nestable(&host));
++    try std.testing.expectEqual(@as(?u32, 20), queued.nest_left);
++    try std.testing.expectEqual(@as(usize, 2), store.entries.items.len); // a probe cannot free another job's entry
++
++    // Before a nested pass can refresh/evict the outer pass's entry, resolve the outer's consumed reference.
++    // Pending restores remain referenced; successful and failed restores both retire the reference exactly once.
++    host.queued.clearRetainingCapacity();
++    host.nest_tokens = 0;
++    outer.started = true;
++    outer.stream = try lanes.Stream.init(gpa, .{ .id = "outer", .prompt = &prompt, .max_new = 1 });
++    defer outer.stream.deinit(gpa);
++    outer.entry = store.find(&prompt, &.{}).?;
++    outer.stream.reuse.saved = outer.entry.?.saved;
++    outer.stream.reuse.at = outer.entry.?.at;
++    try LaneHost.between(&host);
++    try std.testing.expect(outer.entry != null); // not restored yet: do not report or release it early
++    outer.stream.cached = 12;
++    try LaneHost.between(&host);
++    try std.testing.expect(outer.entry == null); // must precede any nested mutation of the store
++    try std.testing.expect(outer.stream.reuse.saved == null);
++    try std.testing.expectEqual(@as(u64, 1), store.counts.hits);
++    store.forget(&prompt, 12); // a nested request could free it now
++    outer.reported(); // no second report and no dereference of the freed entry
++    try std.testing.expectEqual(@as(u64, 1), store.counts.hits);
++    outer.entry = store.entries.items[0]; // the invalid longer snapshot, as if placement invalidated a selection
++    outer.stream.reuse.saved = outer.entry.?.saved;
++    outer.stream.reuse.at = outer.entry.?.at;
++    outer.stream.cached = 0;
++    outer.stream.reuse_failed = true;
++    try LaneHost.between(&host);
++    try std.testing.expect(outer.entry == null and outer.stream.reuse.saved == null);
++    try std.testing.expectEqual(@as(usize, 0), store.entries.items.len);
++    try std.testing.expectEqual(@as(u64, 2), store.counts.failed); // explicit forget plus the failed restore
++}
+ 
+ test "a stream its backend faults (its scores turned NaN) ends alone with those words; the other stream's reply is whole" {
+     const gpa = std.testing.allocator;
+diff --git a/zig/src/core/prompt_cache.zig b/zig/src/core/prompt_cache.zig
+index 47976c4..1925d2d 100644
+--- a/zig/src/core/prompt_cache.zig
++++ b/zig/src/core/prompt_cache.zig
+@@ -19,6 +19,10 @@ pub const Snapshots = struct {
+         /// Make the live state `saved`'s: the next prompt chunk starts at its position.
+         restore: *const fn (ptr: *anyopaque, owner: ?*anyopaque, saved: Saved) anyerror!void,
+         drop: *const fn (ptr: *anyopaque, saved: Saved) void,
++        /// Whether externally held rows are still valid (null: valid until dropped). Pure, engine-thread-only:
++        /// no GPU calls, allocation or mutation. False means permanently invalid, not merely busy; restore must
++        /// still recheck its own state because placement can invalidate rows after a lookup.
++        valid: ?*const fn (ptr: *anyopaque, saved: Saved) bool = null,
+         /// The storage a kept state holds: new storage up to `bytes`, or the spare storage it took (null: `bytes`).
+         charged: ?*const fn (ptr: *anyopaque, saved: Saved) u64 = null,
+         /// Free storage the family keeps for later saves, inside the budget (null: none).
+@@ -122,12 +126,18 @@ pub const Store = struct {
+         return at > 0 and (!s.rules.planned or std.mem.indexOfScalar(u32, starts, at) != null);
+     }
+ 
+-    /// The longest kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row and `tail` left.
++    fn stateValid(s: *const Store, e: *const Entry) bool {
++        return if (s.family.vtable.valid) |f| f(s.family.ptr, e.saved) else true;
++    }
++
++    /// The longest valid kept state `prompt` resumes exactly: its tokens a prefix of the prompt, at least one row
++    /// and `tail` left. This is a read-only probe too (nested admission calls it): never free an entry here.
+     pub fn find(s: *Store, prompt: []const u32, starts: []const u32) ?*Entry {
+         var best: ?*Entry = null;
+         for (s.entries.items) |e| {
+             if (e.tokens.len > prompt.len or e.at >= prompt.len or @as(usize, e.at) + s.rules.tail > prompt.len or !s.usable(e.at, starts)) continue;
+             if (best != null and e.at <= best.?.at) continue;
++            if (!s.stateValid(e)) continue;
+             const n = e.tokens.len;
+             if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
+             best = e;
+@@ -270,11 +280,18 @@ pub const Store = struct {
+         const n = @as(usize, at) + s.rules.lookahead;
+         if (at == 0 or n > prompt.len) return false;
+         s.clock += 1;
+-        const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
+-        for (s.entries.items) |e| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n])) {
+-            e.used = s.clock; // the same state again: no copy
+-            e.shared = e.shared or shared;
+-            return true;
++        var shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
++        for (s.entries.items, 0..) |e, i| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n])) {
++            if (s.stateValid(e)) {
++                e.used = s.clock; // the same usable state again: no copy
++                e.shared = e.shared or shared;
++                return true;
++            }
++            // An index entry cannot stand in for lost rows. Retire that dead state before allocating its
++            // replacement, under the existing budget; preserve shared-cut status even after shared_keys rotates.
++            shared = shared or e.shared;
++            s.remove(i);
++            break;
+         };
+         const bytes = s.family.vtable.bytes(s.family.ptr, at);
+         if (bytes > s.budget) {
+@@ -427,4 +444,5 @@ fn floorStart(starts: []const u32, at: u32) u32 {
+ 
+ test {
+     _ = @import("prompt_cache_test.zig");
++    _ = @import("prompt_cache_validity_test.zig");
+ }
+diff --git a/zig/src/core/prompt_cache_validity_test.zig b/zig/src/core/prompt_cache_validity_test.zig
+new file mode 100644
+index 0000000..067fe66
+--- /dev/null
++++ b/zig/src/core/prompt_cache_validity_test.zig
+@@ -0,0 +1,282 @@
++//! External-row invalidation with no GPU: the saved state is a position and a rolling checksum.
++//! Tests also run against the old Store: its vtable lacks `valid`, so the intended prefix/refresh assertions fail.
++const std = @import("std");
++const pc = @import("prompt_cache.zig");
++const A = std.testing.allocator;
++const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
++
++const Fake = struct {
++    at: u32 = 0,
++    sum: u64 = 0,
++    live: usize = 0,
++    saves: usize = 0,
++    fail_save: bool = false,
++    defer_peer_drop: bool = false,
++    peer_held: u64 = 0,
++    peer_pending: u64 = 0,
++    peer_peak: u64 = 0,
++
++    const State = struct { at: u32, sum: u64, valid: bool = true };
++    fn state(saved: pc.Saved) *State {
++        return @ptrCast(@alignCast(saved));
++    }
++    fn of(ptr: *anyopaque) *Fake {
++        return @ptrCast(@alignCast(ptr));
++    }
++    fn snapshots(f: *Fake, checked: bool) pc.Snapshots {
++        if (@hasField(pc.Snapshots.VTable, "valid")) {
++            if (checked) return .{ .ptr = f, .vtable = &.{ .bytes = bytes, .save = save, .restore = restore, .drop = drop, .valid = valid } };
++        }
++        return .{ .ptr = f, .vtable = &.{ .bytes = bytes, .save = save, .restore = restore, .drop = drop } };
++    }
++    fn bytes(_: *anyopaque, at: u32) u64 {
++        return 100 + @as(u64, at);
++    }
++    fn valid(_: *anyopaque, saved: pc.Saved) bool {
++        return state(saved).valid;
++    }
++    fn save(ptr: *anyopaque, _: ?*anyopaque, at: u32) anyerror!pc.Saved {
++        const f = of(ptr);
++        if (f.fail_save) return error.CopyFailed;
++        if (at != f.at) return error.NotAtMark;
++        const st = try A.create(State);
++        st.* = .{ .at = at, .sum = f.sum };
++        f.live += 1;
++        f.saves += 1;
++        f.peer_held += bytes(ptr, at);
++        f.peer_peak = @max(f.peer_peak, f.peer_held);
++        return st;
++    }
++    fn restore(ptr: *anyopaque, _: ?*anyopaque, saved: pc.Saved) anyerror!void {
++        const st = state(saved);
++        if (!st.valid) return error.StaleRows;
++        const f = of(ptr);
++        f.at = st.at;
++        f.sum = st.sum;
++    }
++    fn drop(ptr: *anyopaque, saved: pc.Saved) void {
++        const f = of(ptr);
++        const st = state(saved);
++        if (f.defer_peer_drop) f.peer_pending += bytes(ptr, st.at) else f.peer_held -= bytes(ptr, st.at);
++        A.destroy(st);
++        f.live -= 1;
++    }
++    fn pass(f: *Fake, s: *pc.Store, prompt: []const u32, plan: pc.Plan) u64 {
++        if (plan.from == 0) {
++            f.at = 0;
++            f.sum = 0;
++        }
++        std.debug.assert(f.at == plan.from);
++        for (prompt[plan.from..]) |t| {
++            f.sum = f.sum *% 31 +% t;
++            f.at += 1;
++            if (std.mem.indexOfScalar(u32, plan.marks, f.at) != null) _ = s.keep(prompt, f.at, null, &.{});
++        }
++        return f.sum;
++    }
++};
++
++fn fresh(prompt: []const u32) u64 {
++    var sum: u64 = 0;
++    for (prompt) |t| sum = sum *% 31 +% t;
++    return sum;
++}
++
++fn populate(f: *Fake, s: *pc.Store) !void {
++    try std.testing.expectEqual(fresh(&tokens), f.pass(s, &tokens, .{ .marks = &.{ 4, 8 } }));
++    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
++}
++
++test "validity: find skips an invalid longer snapshot and resumes the next exact prefix" {
++    var f: Fake = .{};
++    var s = pc.Store.init(A, f.snapshots(true), .{ .min_prompt = 0 }, 1000);
++    defer s.deinit();
++    try populate(&f, &s);
++    Fake.state(s.entries.items[1].saved).valid = false;
++    try std.testing.expectEqual(@as(u32, 4), s.find(&tokens, &.{}).?.at);
++    var arena: std.heap.ArenaAllocator = .init(A);
++    defer arena.deinit();
++    const plan = try s.begin(arena.allocator(), &tokens, 8, &.{}, &.{}, null);
++    try std.testing.expectEqual(@as(u32, 4), plan.from);
++    try std.testing.expectEqual(fresh(&tokens), f.pass(&s, &tokens, plan));
++    try std.testing.expectEqual(@as(u64, 1), s.counts.hits);
++    try std.testing.expectEqual(@as(u64, 0), s.counts.failed);
++}
++
++test "validity: keep refreshes an invalid duplicate and preserves shared-cut status" {
++    var f: Fake = .{};
++    var s = pc.Store.init(A, f.snapshots(true), .{ .min_prompt = 0 }, 1000);
++    defer s.deinit();
++    try populate(&f, &s);
++    const old = s.entries.items[1];
++    old.shared = true; // shared_keys no longer records this cut
++    Fake.state(old.saved).valid = false;
++    const held = s.held;
++    f.at = 8;
++    f.sum = fresh(tokens[0..8]);
++    try std.testing.expect(s.keep(&tokens, 8, null, &.{}));
++    try std.testing.expectEqual(@as(usize, 3), f.saves);
++    const next = s.find(&tokens, &.{}).?;
++    try std.testing.expectEqual(@as(u32, 8), next.at);
++    try std.testing.expect(Fake.state(next.saved).valid);
++    try std.testing.expect(next.shared);
++    try std.testing.expectEqual(held, s.held);
++    try std.testing.expectEqual(@as(usize, 2), f.live);
++    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
++    try std.testing.expectEqual(@as(u64, 0), s.counts.evicted);
++}
++
++test "validity: valid duplicate still takes no new snapshot or allocation" {
++    var f: Fake = .{};
++    var s = pc.Store.init(A, f.snapshots(true), .{ .min_prompt = 0 }, 1000);
++    defer s.deinit();
++    try populate(&f, &s);
++    const old = s.find(&tokens, &.{}).?;
++    f.fail_save = true; // any accidental new copy would fail
++    try std.testing.expect(s.keep(&tokens, 8, null, &.{}));
++    try std.testing.expect(s.find(&tokens, &.{}).? == old);
++    try std.testing.expectEqual(@as(usize, 2), f.saves);
++    try std.testing.expectEqual(@as(u64, 0), s.counts.failed);
++}
++
++test "validity: failed refresh never reports a dead duplicate as saved" {
++    var f: Fake = .{};
++    var s = pc.Store.init(A, f.snapshots(true), .{ .min_prompt = 0 }, 1000);
++    defer s.deinit();
++    try populate(&f, &s);
++    Fake.state(s.entries.items[1].saved).valid = false;
++    f.fail_save = true;
++    try std.testing.expect(!s.keep(&tokens, 8, null, &.{}));
++    try std.testing.expectEqual(@as(u64, 1), s.counts.failed);
++    try std.testing.expectEqual(@as(u32, 4), s.find(&tokens, &.{}).?.at);
++    try std.testing.expectEqual(@as(usize, 1), f.live);
++}
++
++test "validity: read-only lookup probes leave entries, storage, clocks and counters alone" {
++    var f: Fake = .{};
++    var s = pc.Store.init(A, f.snapshots(true), .{ .min_prompt = 0 }, 1000);
++    defer s.deinit();
++    try populate(&f, &s);
++    Fake.state(s.entries.items[1].saved).valid = false;
++    const before_clock = s.clock;
++    const before_held = s.held;
++    const before_counts = s.counts;
++    for (0..100) |_| try std.testing.expectEqual(@as(u32, 4), s.find(&tokens, &.{}).?.at);
++    try std.testing.expectEqual(before_clock, s.clock);
++    try std.testing.expectEqual(before_held, s.held);
++    try std.testing.expectEqualDeep(before_counts, s.counts);
++    try std.testing.expectEqual(@as(usize, 2), s.entries.items.len);
++    try std.testing.expectEqual(@as(usize, 2), f.live);
++    Fake.state(s.entries.items[0].saved).valid = false;
++    try std.testing.expect(s.find(&tokens, &.{}) == null);
++}
++
++test "validity: token equality, lookahead, tail and planned starts remain mandatory" {
++    var f: Fake = .{};
++    var s = pc.Store.init(A, f.snapshots(true), .{ .lookahead = 1, .tail = 3, .planned = true, .min_prompt = 0 }, 1000);
++    defer s.deinit();
++    try populate(&f, &s);
++    try std.testing.expectEqual(@as(u32, 8), s.find(&tokens, &.{ 4, 8 }).?.at);
++    try std.testing.expectEqual(@as(u32, 4), s.find(&tokens, &.{4}).?.at);
++    try std.testing.expectEqual(@as(u32, 4), s.find(tokens[0..10], &.{ 4, 8 }).?.at);
++    try std.testing.expect(s.find(&tokens, &.{}) == null);
++    var changed = tokens;
++    changed[0] = 42;
++    try std.testing.expect(s.find(&changed, &.{ 4, 8 }) == null);
++    changed = tokens;
++    changed[4] = 42; // the shorter state's lookahead, not just the longer state's history
++    try std.testing.expect(s.find(&changed, &.{ 4, 8 }) == null);
++    changed = tokens;
++    changed[8] = 42;
++    try std.testing.expectEqual(@as(u32, 4), s.find(&changed, &.{ 4, 8 }).?.at);
++}
++
++test "validity: families without a predicate retain the original restore-failure path" {
++    var f: Fake = .{};
++    var s = pc.Store.init(A, f.snapshots(false), .{ .min_prompt = 0 }, 1000);
++    defer s.deinit();
++    try populate(&f, &s);
++    Fake.state(s.entries.items[1].saved).valid = false;
++    try std.testing.expectEqual(@as(u32, 8), s.find(&tokens, &.{}).?.at);
++    var arena: std.heap.ArenaAllocator = .init(A);
++    defer arena.deinit();
++    const plan = try s.begin(arena.allocator(), &tokens, 8, &.{}, &.{}, null);
++    try std.testing.expectEqual(@as(u32, 0), plan.from);
++    try std.testing.expectEqual(@as(u64, 1), s.counts.failed);
++    try std.testing.expectEqual(fresh(&tokens), f.pass(&s, &tokens, plan));
++}
++
++test "validity: invalidation after selection still fails closed at restore" {
++    var f: Fake = .{};
++    var s = pc.Store.init(A, f.snapshots(true), .{ .min_prompt = 0 }, 1000);
++    defer s.deinit();
++    try populate(&f, &s);
++    var arena: std.heap.ArenaAllocator = .init(A);
++    defer arena.deinit();
++    const l = try s.lookup(arena.allocator(), &tokens, 8, &.{}, &.{});
++    const e = l.entry.?;
++    try std.testing.expectEqual(@as(u32, 8), e.at);
++    Fake.state(e.saved).valid = false;
++    try std.testing.expectError(error.StaleRows, Fake.restore(&f, null, e.saved));
++    s.resumed(e, &tokens, false);
++    try std.testing.expectEqual(@as(u64, 1), s.counts.failed);
++    try std.testing.expectEqual(@as(u32, 4), s.find(&tokens, &.{}).?.at);
++}
++
++test "validity: a refresh stays in the reserved budget even when a peer delays the old drop" {
++    var f: Fake = .{};
++    var s = pc.Store.init(A, f.snapshots(true), .{ .min_prompt = 0 }, 320);
++    defer s.deinit();
++    try populate(&f, &s); // 104 + 108 held; the next pass reserves another 108
++    Fake.state(s.entries.items[1].saved).valid = false;
++    var arena: std.heap.ArenaAllocator = .init(A);
++    defer arena.deinit();
++    const plan = try s.begin(arena.allocator(), &tokens, 8, &.{}, &.{}, null);
++    try std.testing.expectEqual(@as(u32, 4), plan.from);
++    f.defer_peer_drop = true;
++    try std.testing.expectEqual(fresh(&tokens), f.pass(&s, &tokens, plan));
++    f.defer_peer_drop = false;
++    try std.testing.expect(f.peer_peak <= s.budget);
++    f.peer_held -= f.peer_pending;
++    f.peer_pending = 0;
++    try std.testing.expectEqual(s.held, f.peer_held);
++    try std.testing.expectEqual(@as(usize, 2), f.live);
++}
++
++test "validity: repeated invalidation and refresh do not leak snapshots or exceed the budget" {
++    var f: Fake = .{};
++    var s = pc.Store.init(A, f.snapshots(true), .{ .min_prompt = 0 }, 108);
++    defer s.deinit();
++    f.at = 8;
++    f.sum = fresh(tokens[0..8]);
++    try std.testing.expect(s.keep(&tokens, 8, null, &.{}));
++    for (0..1000) |_| {
++        Fake.state(s.entries.items[0].saved).valid = false;
++        try std.testing.expect(s.find(&tokens, &.{}) == null);
++        try std.testing.expect(s.keep(&tokens, 8, null, &.{}));
++        try std.testing.expectEqual(@as(u32, 8), s.find(&tokens, &.{}).?.at);
++        try std.testing.expectEqual(@as(usize, 1), f.live);
++        try std.testing.expectEqual(@as(u64, 108), s.held);
++        try std.testing.expect(f.peer_held <= s.budget);
++    }
++    try std.testing.expectEqual(@as(usize, 1001), f.saves);
++}
++
++test "validity: long history falls back to its valid 491520-token snapshot, never to changed tokens" {
++    var f: Fake = .{};
++    var s = pc.Store.init(A, f.snapshots(true), .{ .min_prompt = 0, .tail = 128 }, 4 << 20);
++    defer s.deinit();
++    const prompt = try A.alloc(u32, 516919);
++    defer A.free(prompt);
++    for (prompt, 0..) |*t, i| t.* = @intCast(3 + i % 3571);
++    try std.testing.expectEqual(fresh(prompt), f.pass(&s, prompt, .{ .marks = &.{ 8192, 491520, 512000 } }));
++    Fake.state(s.entries.items[2].saved).valid = false;
++    try std.testing.expectEqual(@as(u32, 491520), s.find(prompt, &.{}).?.at);
++    const e = s.find(prompt, &.{}).?;
++    try Fake.restore(&f, null, e.saved);
++    try std.testing.expectEqual(fresh(prompt), f.pass(&s, prompt, .{ .from = e.at }));
++    prompt[65000] += 1;
++    try std.testing.expectEqual(@as(u32, 8192), s.find(prompt, &.{}).?.at);
++    prompt[1000] += 1;
++    try std.testing.expect(s.find(prompt, &.{}) == null);
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 173e7e9..10a3b59 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -1140,11 +1140,15 @@ pub const Lanes = struct {
+         return true;
+     }
+ 
++    fn validSnap(self: *const Lanes, sn: *const Snap) bool {
++        // Membership is checked before reading the state. The host owns this list and its stale flags.
++        return std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) != null and !sn.stale;
++    }
++
+     /// Whether a kept state still restores for a prompt of `len` tokens: live, not stale, a chunk end before the
+     /// prompt's replay (the rows before it ran the encoder layers alone, as a fresh pass of this prompt runs them).
+     fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
+-        if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
+-        return !sn.stale and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
++        return self.validSnap(sn) and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
+     }
+ 
+     /// The first extent that fits around the live streams and the kept states. Kept states give their room oldest
+@@ -1206,6 +1210,11 @@ pub const Lanes = struct {
+         };
+     }
+ 
++    /// A host-only probe for the prompt cache. The final usable/placement checks in prefillFn remain authoritative.
++    pub fn snapValidFn(ptr: *anyopaque, saved: *anyopaque) bool {
++        return of(ptr).validSnap(@ptrCast(@alignCast(saved)));
++    }
++
+     /// The prompt cache's Snapshots functions (native.zig hands them to the CUDA host).
+     pub fn snapBytesFn(ptr: *anyopaque, at: u32) u64 {
+         _ = at;
+@@ -1585,6 +1594,48 @@ test "a prefix two conversations share: the second one resuming it in place woul
+     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
+ }
+ 
++test "snapshot validity is host-only and final restore checks still reject stale or ineligible rows" {
++    var m: Model = undefined;
++    m.cfg.window = 128;
++    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
++    defer ln.snaps.deinit(std.testing.allocator);
++    var sn: Snap = .{ .id = 1, .at = model.chunk_rows, .base = 0, .buf = undefined };
++    try std.testing.expect(!Lanes.snapValidFn(&ln, &sn));
++    try ln.snaps.append(std.testing.allocator, &sn);
++    try std.testing.expect(Lanes.snapValidFn(&ln, &sn));
++    try std.testing.expect(ln.usable(&sn, 2 * model.chunk_rows));
++    // A valid snapshot alone does not bypass the replay tail or chunk-position restrictions.
++    try std.testing.expect(!ln.usable(&sn, model.chunk_rows + 127));
++    sn.at += 1;
++    try std.testing.expect(!ln.usable(&sn, 2 * model.chunk_rows));
++    sn.at -= 1;
++    sn.stale = true; // may happen after lookup, during placement
++    try std.testing.expect(!Lanes.snapValidFn(&ln, &sn));
++    try std.testing.expect(!ln.usable(&sn, 2 * model.chunk_rows));
++    sn.stale = false;
++    ln.snaps.clearRetainingCapacity();
++    try std.testing.expect(!Lanes.snapValidFn(&ln, &sn));
++}
++
++test "placement invalidation reaches the cache validity probe without touching GPU buffers" {
++    const c = model.chunk_rows;
++    var m: Model = undefined;
++    m.pool_cap = 16 * c;
++    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
++    defer ln.snaps.deinit(std.testing.allocator);
++    var snapshots: [3]Snap = undefined;
++    for (&snapshots, 0..) |*sn, i| {
++        sn.* = .{ .id = i, .at = 4 * c, .base = i * 4 * c, .end = (i + 1) * 4 * c, .buf = undefined };
++        try ln.snaps.append(std.testing.allocator, sn);
++        try std.testing.expect(Lanes.snapValidFn(&ln, sn));
++    }
++    const live = [_][2]usize{.{ 12 * c, 16 * c }};
++    try std.testing.expectEqual(@as(usize, 0), try ln.placeKept(&live, 5 * c, null));
++    try std.testing.expect(!Lanes.snapValidFn(&ln, &snapshots[0]));
++    try std.testing.expect(!Lanes.snapValidFn(&ln, &snapshots[1]));
++    try std.testing.expect(Lanes.snapValidFn(&ln, &snapshots[2]));
++}
++
+ fn envVar(name: [:0]const u8) ?[]const u8 {
+     return std.mem.span(std.c.getenv(name) orelse return null);
+ }
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index 0542482..ab2ac70 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -71,6 +71,8 @@ pub const Snaps = struct {
+     save: *const fn (*anyopaque, ?*anyopaque, u32) anyerror!*anyopaque,
+     restore: *const fn (*anyopaque, ?*anyopaque, *anyopaque) anyerror!void,
+     drop: *const fn (*anyopaque, *anyopaque) void,
++    /// Host-only validity of the compressed rows held outside the snapshot buffer.
++    valid: ?*const fn (*anyopaque, *anyopaque) bool = null,
+     /// Rows a resumed prompt pass must still run past a kept state (core/prompt_cache Rules.tail).
+     tail: u32 = 0,
+ };
+@@ -152,7 +154,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     st.lanes.vision = st.vision;
+     // the pool is the model's (preallocated): a stream takes no device memory of its own
+     const L = lanes_mod.Lanes;
+-    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .tail = @intCast(st.m.cfg.window) };
++    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .valid = L.snapValidFn, .tail = @intCast(st.m.cfg.window) };
+     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
+ }
+ 
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 6060416..625f234 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -371,7 +371,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
+         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
+         if (want > 0) {
+-            h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
++            h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop, .valid = if (@hasField(@TypeOf(sn), "valid")) sn.valid else null };
+             h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{ .tail = if (@hasField(@TypeOf(sn), "tail")) sn.tail else 0 }, want);
+         }
+     };
