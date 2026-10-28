@@ -12,6 +12,7 @@ pruned). Read every number as this pair's. The tools keep the original machines'
 
 | | |
 | --- | --- |
+| [POOL-WINDOW.md](POOL-WINDOW.md) | 10-29: qualified/deployed 0054–0055; a position pool larger than the window (opt-in `POOL`, adapted from MiaAI-Lab 0008): two alternating ~600K sessions stay resident (switch back 257 s → 2.5 s, 598,016 cached), ~0.4 GiB per Spark; Engram read-ahead reset always on; fresh-text cold reads measured |
 | [PROGRESS-STATES.md](PROGRESS-STATES.md) | 10-29: qualified/deployed 0051–0053; an interrupted long prompt pass resumes from its last progress state (0 → 65,536 after a 45 s disconnect, identical output), −0.09/+0.21% cold prefill; Anthropic/Responses stream keep-alives; overflow wording Pi compacts on |
 | [CACHE-PLACEMENT-SSE.md](CACHE-PLACEMENT-SSE.md) | 10-28: qualified/deployed 0048–0050; blocked placement preserves 679,936 tokens, 850K cold SDK stream survives >300s prefill, 34 complete output comparisons; limitations and rollback provenance |
 | [CACHE-LIFECYCLE.md](CACHE-LIFECYCLE.md) | 10-28: earlier qualified/deployed 0046/0047; snapshot validity, refresh, nesting and save rollback |

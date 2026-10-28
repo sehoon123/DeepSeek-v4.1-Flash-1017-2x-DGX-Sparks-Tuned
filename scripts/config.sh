@@ -112,6 +112,12 @@ PORT="${PORT:-8888}"
 # A request's positions at most (prompt and reply). The model's window is 1,048,576 tokens. The streams share a pool of
 # CONTEXT positions (rank 1's --pool is rank 0's --context), so PARALLEL streams at the full window take turns.
 CONTEXT="${CONTEXT:-1048576}"
+# zig/patches/0054 (MiaAI-Lab's 0008): positions the streams' extents and kept prompts share, when more than CONTEXT (empty:
+# CONTEXT). More long conversations stay resident at once: switching between two long sessions then resumes each from its
+# kept state instead of recomputing it. A request still stops at CONTEXT. The KV caches grow with the pool (MiaAI-Lab
+# measured about 0.9 GiB a rank per 1,048,576 positions); RoPE tables stay at the window. Whole 2,048-position chunks.
+# Both ranks get it (TF_DS_POOL, TF_DS_WINDOW and rank 1's --pool); measure MemAvailable on both Sparks before raising it.
+POOL="${POOL:-}"
 PARALLEL="${PARALLEL:-4}"              # requests at once (the engine's streams, TF_DS_STREAMS; the family measured 4)
 ROUND_ROWS="${ROUND_ROWS:-32}"         # a decode round's rows at most, 16 to 48 (this recipe: 32, for wide copy windows; 48 copies faster
                                        # for ~0.3 GiB more of each Spark's memory, README "Memory and safety"; 16: the engine's)

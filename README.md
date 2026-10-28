@@ -35,6 +35,14 @@ See [PROGRESS-STATES.md](research/PROGRESS-STATES.md), [CACHE-PLACEMENT-SSE.md](
 Cold prefill can still take minutes; keep-alives do not override absolute client deadlines. This is not a claim that
 every client-side stall is resolved. The decode measurements below retain their original dates and baselines.
 
+**0054–0055 (same day): two long sessions that alternate stay resident.** With the opt-in `POOL` (0054, adapted from
+MiaAI-Lab's 0008), the streams' extents and kept prompts share more positions than the 1,048,576-token request window.
+On the pair with two synthetic ~600K-token sessions, switching back to the first resumed from 598,016 cached tokens in
+2.5 s; with the 1M pool, the switch recomputed it in 257 s. `POOL=1572864` costs ~0.4 GiB `MemAvailable` per Spark.
+It is off by default; measure both Sparks before enabling it. 0055 makes the Engram read-ahead reset unconditional.
+Every complete output token array matched the predecessor's. See [POOL-WINDOW.md](research/POOL-WINDOW.md) and the
+[source/evidence release](https://github.com/sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned/releases/tag/pool-window-20261029).
+
 ## What this recipe adds
 
 This is [Mia's AI Lab's recipe](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks) at [`31eea46`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/commit/31eea4608f8bb292a92e2f7a1db400e928620c78) with the changes below (follow Mia's AI Lab on
@@ -426,6 +434,7 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 | `ABLIT_PRUNE_STOCK` | 0 | this recipe: `1` (with `ABLIT=1`) removes the 24 stock shards the overlay replaced once its checkpoint is verified (127 GB); `ABLIT=0` then downloads them again (see Abliterated mode) |
 | `HF_TOKEN` | unset | Hugging Face read token for downloads; alternatively authenticate with `hf auth login` on the head |
 | `CONTEXT` | 1048576 | a request's positions at most; rank 1's `--pool` follows it |
+| `POOL` | empty (`CONTEXT`) | this recipe (`zig/patches/0054`): the positions the streams' extents and kept prompts share, a multiple of 2,048 from `CONTEXT` to 4,194,304. `1572864` keeps two alternating sessions of up to ~737K tokens each resident (~0.4 GiB `MemAvailable` per Spark here; [research/POOL-WINDOW.md](research/POOL-WINDOW.md)) |
 | `PARALLEL` | 4 | requests at once (the engine's streams, 1 to 16; the family was measured at 4) |
 | `THINKING`, `REASONING_EFFORT` | 1, empty | think first unless a request turns it off; `low` / `medium` / `high` / `xhigh` as the default effort |
 | `THINKING_BUDGET` | empty | reasoning tokens a reply may spend before the engine closes the think block itself and lets the answer continue (`--thinking-budget`; a request's `thinking_budget` wins); empty: no cap. A hard task can otherwise spend its whole `MAX_TOKENS` thinking and end with no text and no tool call. A model that keeps rambling after the cut is not stopped by it. For long agentic or tool-calling jobs, leave it empty or set it large: a small budget cuts the reasoning mid-plan, which can make the model repeat a tool call it already made |
@@ -512,7 +521,7 @@ answering and has to be power-cycled (this happened once, with the engine's rese
   run `sudo mount -o remount,size=4G /dev/shm` for now. The engine's container shares the host's (`--ipc=host`) and uses
   some 33 MiB of it. Do not profile with Nsight Compute, or run compute-sanitizer on the engine, beside a loaded rank;
 - the KV cache is small (compressed FP4 with block scales; about 0.5 GiB at 262,144 tokens and ~1.8 GiB at the full window,
-  by two memory readings); it is sized from `CONTEXT` when the model loads and shared by the streams. Most of the
+  by two memory readings); it is sized from `CONTEXT` (or `POOL`, when set: ~0.9 GiB a rank per 1M more positions) when the model loads and shared by the streams. Most of the
   memory is the weights (~99 GiB, of which ~3.5 GiB are the drafter's), so the head's other software decides what is left.
 
 ## Repository layout

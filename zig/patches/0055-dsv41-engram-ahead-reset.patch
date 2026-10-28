@@ -1,0 +1,35 @@
+# dsv41: every prompt pass drops an Engram read-ahead an earlier pass left (a pass that ended between two chunks), paired
+# or not, so no chunk takes rows hashed from another prompt's ids. The read-ahead part of MiaAI-Lab's
+# zig/patches/0012-dsv41-base-fixes.patch (by Robert Wojciechowski, @wojo; Apache-2.0). This tree already cleared it with
+# TF_DS_PAIR=1 (the recipe's setting); now always, and a stale read-ahead error with it. No switch.
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 7765dd2..2d6a597 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -658,15 +658,17 @@ pub const Model = struct {
+ 
+     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
+         if (slot >= m.streams) return error.BadSlot;
+-        if (m.pair_on) {
+-            // TF_DS_PAIR: no Engram rows read ahead for another prompt stay ready (the back hosts read two chunks, a
+-            // single chunk next leaves the second's)
+-            m.joinAhead();
+-            m.back_spawned = false;
+-            inline for (.{ &m.eh, &m.eh2, &m.eh3, &m.eh4 }) |hp| if (hp.*) |*x| {
+-                x.ahead_ready = .{ false, false };
+-            };
+-        }
++        // No Engram rows read ahead for another prompt stay ready, paired or not (MiaAI-Lab's 0012, by wojo): a pass that
++        // ended between two chunks (a cancel, an error) leaves a read-ahead keyed by position alone, and a later pass that
++        // starts a chunk there would take rows hashed from the other prompt's ids. TF_DS_PAIR=1 always cleared them here
++        // (its back hosts read two chunks, a single chunk next leaves the second's); now every pass does. A pass reads
++        // the rows an unbroken pass reads.
++        m.joinAhead();
++        m.back_spawned = false;
++        inline for (.{ &m.eh, &m.eh2, &m.eh3, &m.eh4 }) |hp| if (hp.*) |*x| {
++            x.ahead_ready = .{ false, false };
++            x.ahead_err = null;
++        };
+         m.spans.clearRetainingCapacity();
+         m.ch.spans = &.{};
+         m.view = try m.caches.view(&m.eng, slot, base);

@@ -49,6 +49,7 @@ ablit_notice
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 for v in CONTEXT PARALLEL MAX_TOKENS TOP_K; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "$v is a positive count, not ${!v}"; done
 (( CONTEXT <= 1048576 )) || die "CONTEXT is at most 1048576 (the model's window), not $CONTEXT"
+[[ -z "$POOL" ]] || { [[ "$POOL" =~ ^[1-9][0-9]*$ ]] && (( POOL >= CONTEXT && POOL % 2048 == 0 && POOL <= 4194304 )); } || die "POOL is empty (CONTEXT) or a multiple of 2048 from CONTEXT ($CONTEXT) to 4194304, not $POOL"
 (( PARALLEL <= 16 )) || die "PARALLEL is 1 to 16 (the engine's streams), not $PARALLEL"
 [[ -z "$ROUND_ROWS" ]] || { [[ "$ROUND_ROWS" =~ ^[0-9]+$ ]] && (( ROUND_ROWS >= 16 && ROUND_ROWS <= 48 )); } || die "ROUND_ROWS is empty or 16 to 48, not $ROUND_ROWS"
 [[ -z "$PROMPT_CACHE_GIB" || "$PROMPT_CACHE_GIB" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "PROMPT_CACHE_GIB is a size in GiB (or empty for the server's), not $PROMPT_CACHE_GIB"
@@ -254,7 +255,8 @@ ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDM
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
 (( PREFILL_NEST_TOKENS == 0 || PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_NEST_TOKENS=$PREFILL_NEST_TOKENS")
 (( PROMPT_PROGRESS_TOKENS == 0 )) || ENGINE_ENV+=("TF_DS_PROMPT_PROGRESS_TOKENS=$PROMPT_PROGRESS_TOKENS")
-while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_EXL3)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|PROMPT_PROGRESS_TOKENS)=' || true)
+[[ -z "$POOL" ]] || ENGINE_ENV+=("TF_DS_POOL=$POOL" "TF_DS_WINDOW=$CONTEXT")
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_EXL3)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|ROUND_ROWS|GRAPHS|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP|PROMPT_PROGRESS_TOKENS|POOL|WINDOW)=' || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
 RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
 DATA=/hf/$DATA_SUB
@@ -262,7 +264,7 @@ KIT=/hf/$KIT_SUB/kit
 # rank 1 takes the round's settings as flags only (tf-dsv41-lanes reads no TF_DS_GRAPHS & co.): without them it runs
 # every round ungraphed, with no side stream, prefetch or AIO, and rank 0 waits on it each round. Its pool is rank 0's
 # context, and its streams rank 0's (TF_DS_STREAMS): with other values the two ranks wait on each other.
-FOLLOW="--pool $CONTEXT --streams $PARALLEL --drafts $DRAFTS --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
+FOLLOW="--pool ${POOL:-$CONTEXT} --streams $PARALLEL --drafts $DRAFTS --graphs $GRAPHS --side $SIDE --prefetch $PREFETCH --aio $ENGRAM_AIO"
 [[ -z "$ROUND_ROWS" ]] || FOLLOW+=" --round-rows $ROUND_ROWS"
 # Rank 0 reads TF_DS_FIX_K; the follower takes the matching CLI flag. A mismatch would benchmark a different policy.
 [[ -z "${TF_DS_FIX_K:-}" ]] || FOLLOW+=" --fix-k $TF_DS_FIX_K"
