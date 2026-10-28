@@ -1,0 +1,67 @@
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 89ada6b..6225abb 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -592,6 +592,10 @@ pub const LaneHost = struct {
+     fn forgetFaulted(h: *LaneHost, job: *Job) void {
+         if (!cacheable(job.request)) return;
+         const store = h.cache orelse return;
++        // Invalidation below may free this very entry. No later finish/report may dereference it, even
++        // when the resumed prompt faults before a keep or interleave retired the consumed reference.
++        job.entry = null;
++        if (job.started) job.stream.reuse.saved = null;
+         const n = store.forgetPrefixes(keyOf(job.request));
+         std.log.warn("{s}: its scores turned NaN: {d} kept states of its prompt dropped", .{ job.stream.id, n });
+     }
+@@ -1188,6 +1192,51 @@ test "nested admission rechecks a short estimate after its saved rows become inv
+     try std.testing.expectEqual(@as(u64, 2), store.counts.failed); // explicit forget plus the failed restore
+ }
+ 
++test "fault invalidation retires a resumed job reference before freeing its cache entry" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    const Snaps = struct {
++        fn bytes(_: *anyopaque, _: u32) u64 {
++            return 1;
++        }
++        fn save(ptr: *anyopaque, _: ?*anyopaque, _: u32) anyerror!pc.Saved {
++            return ptr;
++        }
++        fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {}
++        fn drop(_: *anyopaque, _: pc.Saved) void {}
++        fn event(_: *anyopaque, _: Id, _: *const Event) void {}
++    };
++    var state: u8 = 0;
++    var store = pc.Store.init(gpa, .{ .ptr = &state, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_prompt = 0 }, 10);
++    defer store.deinit();
++    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
++    try std.testing.expect(store.keep(&prompt, 4, null, &.{}));
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    host.cache = &store;
++    const request: Request = .{ .prompt = &prompt, .max_tokens = 1 };
++    var job: LaneHost.Job = .{ .host = &host, .id = 1, .request = &request, .sink = .{ .ctx = &host, .event = Snaps.event } };
++    job.stream = try lanes.Stream.init(gpa, .{ .id = "synthetic-fault", .prompt = &prompt, .max_new = 1 });
++    defer job.stream.deinit(gpa);
++    job.started = true;
++    job.entry = store.find(&prompt, &.{}).?;
++    job.stream.reuse.saved = job.entry.?.saved;
++    job.stream.reuse.at = 4;
++    job.stream.cached = 4;
++    host.forgetFaulted(&job); // then the error path calls finish -> reported
++    try std.testing.expect(job.entry == null);
++    try std.testing.expect(job.stream.reuse.saved == null);
++    try std.testing.expectEqual(@as(usize, 0), store.entries.items.len);
++    job.reported(); // must not dereference the freed Entry or report a cache hit
++    try std.testing.expectEqual(@as(u64, 0), store.counts.hits);
++    try std.testing.expectEqual(@as(u64, 1), store.counts.failed);
++}
++
+ test "a stream its backend faults (its scores turned NaN) ends alone with those words; the other stream's reply is whole" {
+     const gpa = std.testing.allocator;
+     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
