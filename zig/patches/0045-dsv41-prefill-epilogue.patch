@@ -1,0 +1,211 @@
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index a8cfc95..fafbb75 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -28,6 +28,7 @@ const link = @import("link.zig");
+ const ring2d = @import("ring2d.zig");
+ const rdma = @import("rdma.zig");
+ const tri = @import("tri.zig");
++const tri_markov = @import("tri_markov.zig");
+ 
+ /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
+ pub const chunk_rows = 2048;
+@@ -229,6 +230,10 @@ pub const Model = struct {
+         m.two = null;
+         m.rdma_rings = null;
+         const d = ctx.d;
++        const prefill_ep32 = try tri_markov.parsePrefillEp32(if (std.c.getenv("TF_DS_PF_EP32")) |v| std.mem.span(v) else null);
++        const prefill_aot: ?[]const u8 = if (std.c.getenv("TF_DS_PREFILL_AOT")) |v| std.mem.span(v) else null;
++        if (prefill_aot) |dir| if (dir.len == 0) return error.EmptyPrefillAot;
++        if (prefill_ep32 and prefill_aot == null) return error.PrefillEp32NeedsAot;
+         m.cfg = try Config.read(a, io, o.model_dir);
+         const c = &m.cfg;
+         m.stream = try cuda.Stream.init(d, true);
+@@ -266,8 +271,9 @@ pub const Model = struct {
+         errdefer if (m.rdma_mod) |*x| x.unload();
+ 
+         // kernels: the recorded Triton set, the served extension cubins, the torch-op images
+-        m.set = try cuda.aot.Set.load(gpa, io, d, ctx.device, o.aot_dir orelse try std.fs.path.join(a, &.{ o.kit_dir, "aot" }));
++        m.set = try cuda.aot.Set.load(gpa, io, d, ctx.device, prefill_aot orelse o.aot_dir orelse try std.fs.path.join(a, &.{ o.kit_dir, "aot" }));
+         errdefer m.set.deinit();
++        if (prefill_ep32) try tri_markov.requirePrefillEp32(&m.set);
+         m.pf = try exl3_prefill.Kernels.load(d, try readKit(a, io, o.kit_dir, "linear.cubin"));
+         errdefer m.pf.unload();
+         m.lg = try exl3_linear.Kernels.load(d, try readKit(a, io, o.kit_dir, "linear_grouped.cubin"));
+@@ -318,7 +324,7 @@ pub const Model = struct {
+                 m.two.?.rings = &m.rdma_rings.?;
+             }
+         }
+-        m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
++        m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream, .prefill_ep32 = prefill_ep32 }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
+         m.eng.round_rows = o.round_rows;
+         m.pair_on = sp.pair == null and (if (std.c.getenv("TF_DS_PAIR")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false); // every rank alike
+         m.pair_reuse = if (std.c.getenv("TF_DS_PAIR_REUSE")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+diff --git a/zig/src/families/dsv41/tri.zig b/zig/src/families/dsv41/tri.zig
+index 10a3264..116541d 100644
+--- a/zig/src/families/dsv41/tri.zig
++++ b/zig/src/families/dsv41/tri.zig
+@@ -15,6 +15,8 @@ pub const Tri = struct {
+     log: ?*Log = null,
+     /// The "pdl" switch (TF_DS_TRITON_PDL, on in the served build): decode kernels as programmatic dependent launches.
+     pdl: bool = true,
++    /// Opt-in row-partitioned prompt GEMM epilogues, fixed before graph capture.
++    prefill_ep32: bool = false,
+ 
+     pub fn run(t: Tri, name: []const u8, grid: [3]u32, args: []const aot.Arg, consts: []const aot.Const) !void {
+         if (t.log) |l| return l.add(name, grid, args, consts);
+diff --git a/zig/src/families/dsv41/tri_markov.zig b/zig/src/families/dsv41/tri_markov.zig
+index 3157a81..c128613 100644
+--- a/zig/src/families/dsv41/tri_markov.zig
++++ b/zig/src/families/dsv41/tri_markov.zig
+@@ -148,20 +148,138 @@ pub const gemm_bn = 128;
+ /// The prompt GEMM's output dtype: the caller's out tensor's.
+ pub const OutType = enum { bf16, fp32 };
+ 
+-/// prefill.matmul's _gemm after the extension's rot_in (xh fp16 [M, K]) and unpack (wq fp16 [K, N]): out [M, N] (row stride os) = (xh wq) H SCALE svh + bias.
++pub const Ep32Shape = struct { k: usize, n: usize, out_type: OutType, min_rows: usize = 129 };
++/// Captured projections only; the 512x128 projection did not benefit. The
++/// smaller column grids use only full chunks: their short-row tests were slower.
++pub const ep32_shapes = [_]Ep32Shape{
++    .{ .k = 5120, .n = 1280, .out_type = .bf16, .min_rows = 2048 },
++    .{ .k = 5120, .n = 512, .out_type = .bf16, .min_rows = 2048 },
++    .{ .k = 4096, .n = 1024, .out_type = .bf16, .min_rows = 2048 },
++    .{ .k = 1280, .n = 16384, .out_type = .bf16 },
++    .{ .k = 3072, .n = 25600, .out_type = .fp32, .min_rows = 512 },
++    .{ .k = 5120, .n = 512, .out_type = .fp32, .min_rows = 2048 },
++    .{ .k = 1280, .n = 4096, .out_type = .bf16 },
++    .{ .k = 4096, .n = 5120, .out_type = .fp32 },
++};
++
++pub fn parsePrefillEp32(value: ?[]const u8) !bool {
++    const s = value orelse return false;
++    if (s.len == 0 or std.mem.eql(u8, s, "0")) return false;
++    if (std.mem.eql(u8, s, "1")) return true;
++    return error.BadPrefillEp32;
++}
++
++pub fn usePrefillEp32(enabled: bool, m: usize, k: usize, n: usize, out_type: OutType, has_bias: bool) bool {
++    if (!enabled or has_bias or m <= 128 or m > 2048) return false;
++    for (ep32_shapes) |s| if (s.k == k and s.n == n and s.out_type == out_type) return m >= s.min_rows;
++    return false;
++}
++
++const GemmLaunch = struct {
++    name: []const u8,
++    grid: [3]u32,
++    args: [8]aot.Arg,
++    consts: [8]aot.Const,
++    nconsts: usize,
++};
++
++inline fn gemmLaunch(enabled: bool, xh: u64, wq: u64, h: u64, svh: u64, bias: ?u64, out: u64, out_type: OutType, os: usize, m: usize, k: usize, n: usize) GemmLaunch {
++    // The input GEMM and grid remain BM128/BK32/GROUP8. Only independent rows
++    // of its original two-term BF16 Hadamard epilogue are partitioned by EP32.
++    const ep32 = usePrefillEp32(enabled, m, k, n, out_type, bias != null);
++    const ty: []const u8 = if (out_type == .bf16) "*bf16" else "*fp32";
++    return .{
++        .name = if (ep32) "_gemm_ep32r128" else "_gemm",
++        .grid = .{ tri.cdiv(m, 128) * u(n / gemm_bn), 1, 1 },
++        .args = .{
++            p("X", "*fp16", xh),                 p("W", "*fp16", wq), p("H", "*bf16", h), p("SVH", "*fp16", svh),
++            p("BIAS", "*fp16", bias orelse svh), p("OUT", ty, out),   int("M", m),        int("o_stride", os),
++        },
++        .consts = .{ ci("K", k), ci("N", n), ci("BM", 128), ci("BK", 32), ci("GROUP", 8), ci("HAS_BIAS", @intFromBool(bias != null)), aot.cf("SCALE", had_scale), ci("EP", 32) },
++        .nconsts = if (ep32) 8 else 7,
++    };
++}
++
++/// Fail at initialization, not the first long request, if an opted-in pack is
++/// incomplete. Uses exactly the runtime launch descriptor, with no GPU launch,
++/// extra allocation, or default-path dependency on the optional variants.
++pub fn requirePrefillEp32(set: anytype) !void {
++    for (ep32_shapes) |s| {
++        const g = gemmLaunch(true, 0x1000, 0x2000, 0x3000, 0x4000, null, 0x5000, s.out_type, s.n, 2048, s.k, s.n);
++        _ = try set.find(g.name, &g.args, g.consts[0..g.nconsts]);
++    }
++}
++
++/// prefill.matmul's _gemm after the extension's rot_in and unpack: the original
++/// arithmetic, weights and output layout; opt-in epilogues share its K step/grid.
+ pub fn matmul(t: Tri, xh: u64, wq: u64, h: u64, svh: u64, bias: ?u64, out: u64, out_type: OutType, os: usize, m: usize, k: usize, n: usize) !void {
+-    // TF_EXL3_PREFILL_TILES unset in the served lane: tiles() is 128 rows, a 32-wide K step, 8 warps, 4 stages and groups of 8 for every shape
+-    const bm = 128;
+-    const bk = 32;
+-    const group = 8;
+-    const ty: []const u8 = switch (out_type) {
+-        .bf16 => "*bf16",
+-        .fp32 => "*fp32",
++    const g = gemmLaunch(t.prefill_ep32, xh, wq, h, svh, bias, out, out_type, os, m, k, n);
++    try t.run(g.name, g.grid, &g.args, g.consts[0..g.nconsts]);
++}
++
++test "prefill epilogue profile defaults and bounded shape selection" {
++    try std.testing.expect(!try parsePrefillEp32(null));
++    try std.testing.expect(!try parsePrefillEp32(""));
++    try std.testing.expect(!try parsePrefillEp32("0"));
++    try std.testing.expect(try parsePrefillEp32("1"));
++    try std.testing.expectError(error.BadPrefillEp32, parsePrefillEp32("2"));
++    try std.testing.expectError(error.BadPrefillEp32, parsePrefillEp32("true"));
++    for (ep32_shapes) |s| {
++        for ([_]usize{ 129, 511, 512, 1537, 2047, 2048 }) |m| {
++            try std.testing.expectEqual(m >= s.min_rows, usePrefillEp32(true, m, s.k, s.n, s.out_type, false));
++            try std.testing.expect(!usePrefillEp32(false, m, s.k, s.n, s.out_type, false));
++            try std.testing.expect(!usePrefillEp32(true, m, s.k, s.n, s.out_type, true));
++        }
++        for ([_]usize{ 0, 1, 48, 128, 2049, 4096 }) |m| try std.testing.expect(!usePrefillEp32(true, m, s.k, s.n, s.out_type, false));
++    }
++    try std.testing.expect(!usePrefillEp32(true, 2048, 512, 128, .bf16, false));
++    try std.testing.expect(!usePrefillEp32(true, 2048, 1280, 16384, .fp32, false));
++    try std.testing.expect(!usePrefillEp32(true, 2048, 5120, 1024, .bf16, false));
++}
++
++test "prefill epilogue leaves grid, runtime arguments and original constants unchanged" {
++    var old: tri.Log = .{ .gpa = std.testing.allocator };
++    defer old.deinit();
++    var next: tri.Log = .{ .gpa = std.testing.allocator };
++    defer next.deinit();
++    try matmul(.{ .log = &old }, 0x1000, 0x2000, 0x3000, 0x4000, null, 0x5000, .fp32, 528, 2048, 5120, 512);
++    try matmul(.{ .log = &next, .prefill_ep32 = true }, 0x1000, 0x2000, 0x3000, 0x4000, null, 0x5000, .fp32, 528, 2048, 5120, 512);
++    const a = old.items.items[0];
++    const b = next.items.items[0];
++    try std.testing.expectEqualStrings("_gemm", a.name);
++    try std.testing.expectEqualStrings("_gemm_ep32r128", b.name);
++    try std.testing.expectEqual([3]u32{ 64, 1, 1 }, a.grid);
++    try std.testing.expectEqual(a.grid, b.grid);
++    try std.testing.expectEqualDeep(a.args, b.args);
++    try std.testing.expectEqualDeep(a.consts, b.consts[0..7]);
++    try std.testing.expectEqualDeep(ci("EP", 32), b.consts[7]);
++}
++
++test "prefill epilogue checks every required AOT signature without launching" {
++    const FakeSet = struct {
++        seen: usize = 0,
++        missing: ?usize = null,
++        fn find(self: *@This(), name: []const u8, args: []const aot.Arg, consts: []const aot.Const) !void {
++            if (self.missing) |i| if (i == self.seen) return error.MissingTritonVariant;
++            try std.testing.expectEqualStrings("_gemm_ep32r128", name);
++            try std.testing.expectEqual(@as(usize, 8), args.len);
++            try std.testing.expectEqual(@as(usize, 8), consts.len);
++            const s = ep32_shapes[self.seen];
++            try std.testing.expectEqualDeep(ci("K", s.k), consts[0]);
++            try std.testing.expectEqualDeep(ci("N", s.n), consts[1]);
++            try std.testing.expectEqualDeep(ci("EP", 32), consts[7]);
++            try std.testing.expectEqualStrings(if (s.out_type == .bf16) "*bf16" else "*fp32", args[5].value.ptr.ty);
++            self.seen += 1;
++        }
+     };
+-    try t.run("_gemm", .{ tri.cdiv(m, bm) * u(n / gemm_bn), 1, 1 }, &.{
+-        p("X", "*fp16", xh),                 p("W", "*fp16", wq), p("H", "*bf16", h), p("SVH", "*fp16", svh),
+-        p("BIAS", "*fp16", bias orelse svh), p("OUT", ty, out),   int("M", m),        int("o_stride", os),
+-    }, &.{ ci("K", k), ci("N", n), ci("BM", bm), ci("BK", bk), ci("GROUP", group), ci("HAS_BIAS", @intFromBool(bias != null)), aot.cf("SCALE", had_scale) });
++    var complete: FakeSet = .{};
++    try requirePrefillEp32(&complete);
++    try std.testing.expectEqual(ep32_shapes.len, complete.seen);
++    for (0..ep32_shapes.len) |i| {
++        var partial: FakeSet = .{ .missing = i };
++        try std.testing.expectError(error.MissingTritonVariant, requirePrefillEp32(&partial));
++        try std.testing.expectEqual(i, partial.seen);
++    }
+ }
+ 
+ // -- conformance with the recorded launches ----------------------------------------------------------------------

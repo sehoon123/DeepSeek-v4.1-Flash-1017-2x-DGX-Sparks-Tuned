@@ -1,0 +1,182 @@
+diff --git a/zig/src/core/tokenizer/tokenizer.zig b/zig/src/core/tokenizer/tokenizer.zig
+index cca8a59..20d61d5 100644
+--- a/zig/src/core/tokenizer/tokenizer.zig
++++ b/zig/src/core/tokenizer/tokenizer.zig
+@@ -173,8 +173,9 @@ pub const Tokenizer = struct {
+         return a.dupe(u32, ids.items);
+     }
+ 
+-    /// A text's encoding kept for the next one (encodeReusing): its bytes, its ids and its top-level segments (the
+-    /// split at added tokens) with the ids each made; owned by the allocator encodeReusing was given for it.
++    /// A text's encoding kept for the next one (encodeReusing): its bytes, ids and independently encoded segments.
++    /// With an identity normalizer these include normalized added-token boundaries too (e.g. DSv4 chat markers).
++    /// Owned by the allocator encodeReusing was given for it.
+     pub const Memo = struct {
+         text: []u8 = &.{},
+         ids: []u32 = &.{},
+@@ -189,7 +190,7 @@ pub const Tokenizer = struct {
+     };
+     pub const MemoSegment = struct { start: usize, end: usize, id: ?u32, n: usize };
+ 
+-    /// encode's ids, with `prev`'s taken for the leading top-level segments both texts have alike (the same bounds and
++    /// encode's ids, with `prev`'s taken for the leading independent segments both texts have alike (the same bounds and
+     /// id, inside their common prefix): a segment's ids depend only on its bytes and on whether it starts the text, so
+     /// the ids are encode's. With `next`, this text's memo goes there, allocated with `keep`.
+     pub fn encodeReusing(t: *const Tokenizer, a: Allocator, keep: Allocator, text: []const u8, prev: ?*const Memo, next: ?*Memo) Error![]u32 {
+@@ -197,7 +198,7 @@ pub const Tokenizer = struct {
+         var arena = std.heap.ArenaAllocator.init(a);
+         defer arena.deinit();
+         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
+-        const segs = try t.splitAdded(&ctx, &t.raw, text, null);
++        const segs = try t.memoSegments(&ctx, text);
+         var same: usize = 0;
+         var same_ids: usize = 0;
+         if (prev) |p| {
+@@ -236,6 +237,29 @@ pub const Tokenizer = struct {
+         return out;
+     }
+ 
++    /// Flatten the second added-token split only when normalization cannot change bytes or first-character
++    /// alignment. Each plain span still uses encodeText's unchanged pre-tokenizer and BPE. Non-identity
++    /// normalizers retain the original raw boundaries: splitting before NFC/strip/replace would be unsound.
++    fn memoSegments(t: *const Tokenizer, ctx: *steps.Context, text: []const u8) Error![]const Segment {
++        const raw = try t.splitAdded(ctx, &t.raw, text, null);
++        if (t.normalizer) |n| switch (n) {
++            .sequence => |seq| if (seq.len != 0) return raw,
++            else => return raw,
++        };
++        if (t.normalized.ends.items.len == 0) return raw;
++        var out: std.ArrayList(Segment) = .empty;
++        for (raw) |seg| {
++            if (seg.id != null) {
++                try out.append(ctx.a, seg);
++                continue;
++            }
++            for (try t.splitAdded(ctx, &t.normalized, text[seg.start..seg.end], null)) |part| {
++                try out.append(ctx.a, .{ .start = seg.start + part.start, .end = seg.start + part.end, .id = part.id });
++            }
++        }
++        return out.items;
++    }
++
+     fn encodeText(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32), skip: ?Skip) Error!void {
+         var zero: usize = if (first) unicode.decodeAt(text, 0).len else 0;
+         const normalized = if (t.normalizer) |*n| try n.apply(ctx, text, &zero) else text;
+@@ -520,6 +544,34 @@ test "encodeReusing gives encode's ids: texts that share a prefix, the added tok
+     defer t2.deinit();
+     try memoCheck(&t2, 3);
+     try memoCheck(&t2, 4);
++    // DSv4's chat markers are normalized added tokens, with an empty normalizer. They must delimit memo spans.
++    const norm = try std.mem.replaceOwned(u8, a, plain, "\"normalized\":false", "\"normalized\":true");
++    defer a.free(norm);
++    for ([_][]const u8{ "null", "{\"type\":\"Sequence\",\"normalizers\":[]}", "{\"type\":\"NFC\"}" }, 0..) |normalizer, i| {
++        const doc = try std.mem.replaceOwned(u8, a, norm, "{\"type\":\"NFC\"}", normalizer);
++        defer a.free(doc);
++        var nt = try parse(a, doc);
++        defer nt.deinit();
++        try memoCheck(&nt, 10 + i);
++        var memo: Tokenizer.Memo = .{};
++        defer memo.deinit(a);
++        const ids = try nt.encodeReusing(a, a, "ab<|end|>c", null, &memo);
++        defer a.free(ids);
++        try std.testing.expectEqual(@as(usize, if (i == 2) 1 else 3), memo.segs.len);
++        try std.testing.checkAllAllocationFailures(a, memoFailCheck, .{&nt});
++        const strip_doc = try std.mem.replaceOwned(u8, a, doc, "\"lstrip\":false,\"rstrip\":false", "\"lstrip\":true,\"rstrip\":true");
++        defer a.free(strip_doc);
++        var st = try parse(a, strip_doc);
++        defer st.deinit();
++        try memoCheck(&st, 20 + i);
++    }
++}
++
++fn memoFailCheck(a: Allocator, t: *const Tokenizer) !void {
++    var memo: Tokenizer.Memo = .{};
++    defer memo.deinit(a);
++    const ids = try t.encodeReusing(a, a, "ab<|end|>c ab", null, &memo);
++    defer a.free(ids);
+ }
+ 
+ test "encodeProtected: an added token's text inside a span is plain text; with none inside, encode's ids" {
+@@ -558,11 +610,11 @@ test "encodeProtected: an added token's text inside a span is plain text; with n
+     defer a.free(same);
+     try std.testing.expectEqualSlices(u32, plain, same);
+     // a span touching a token but not over it leaves it the token
+-    const touch = try t.encodeProtected(a, text, &.{ .{ 4, 6 } }, &.{});
++    const touch = try t.encodeProtected(a, text, &.{.{ 4, 6 }}, &.{});
+     defer a.free(touch);
+     try std.testing.expectEqualSlices(u32, plain, touch);
+     // a kept token (a server's picture placeholder) stays the token inside a span; the other one there does not
+-    const kept = try t.encodeProtected(a, text, &.{ .{ 0, 16 } }, &.{8});
++    const kept = try t.encodeProtected(a, text, &.{.{ 0, 16 }}, &.{8});
+     defer a.free(kept);
+     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u32, kept, &.{8}));
+     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u32, kept, &.{9}));
+diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
+index 216e1e0..f511c9b 100644
+--- a/zig/src/server/hf_text.zig
++++ b/zig/src/server/hf_text.zig
+@@ -222,7 +222,13 @@ pub const HfText = struct {
+     }
+ 
+     fn encodeProtectedFn(ctx: *anyopaque, a: Allocator, s: []const u8, spans: []const [2]usize, keep: []const u32) model_text.Error![]u32 {
+-        return self(ctx).tok.encodeProtected(a, s, spans, keep) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
++        const t = self(ctx);
++        // The caller is usually a connection arena: freeing nested scratch into it does not release its pages.
++        // Only the finished ids belong to that connection, not the tokenizer's transient pieces and BPE state.
++        var scratch = std.heap.ArenaAllocator.init(t.gpa);
++        defer scratch.deinit();
++        const ids = t.tok.encodeProtected(scratch.allocator(), s, spans, keep) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
++        return a.dupe(u32, ids);
+     }
+ 
+     fn specialFn(ctx: *anyopaque, id: u32) bool {
+@@ -237,8 +243,11 @@ pub const HfText = struct {
+ 
+     fn encodeFn(ctx: *anyopaque, a: Allocator, s: []const u8, add_special: bool) model_text.Error![]u32 {
+         const t = self(ctx);
+-        const ids = (if (s.len >= memo_min_bytes) t.encodeMemo(a, s) else t.tok.encode(a, s)) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
+-        if (!add_special or (t.prefix.len == 0 and t.suffix.len == 0)) return ids;
++        var scratch = std.heap.ArenaAllocator.init(t.gpa);
++        defer scratch.deinit();
++        const work = scratch.allocator();
++        const ids = (if (s.len >= memo_min_bytes) t.encodeMemo(work, s) else t.tok.encode(work, s)) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.Template;
++        if (!add_special or (t.prefix.len == 0 and t.suffix.len == 0)) return a.dupe(u32, ids);
+         return std.mem.concat(a, u32, &.{ t.prefix, ids, t.suffix });
+     }
+ 
+@@ -409,4 +418,35 @@ test "the memos give encode's ids: one conversation's requests, another's betwee
+     var held: usize = 0;
+     for (t.memos) |m| held += @intFromBool(m.text.len > 0);
+     try std.testing.expectEqual(@as(usize, 2), held);
++    // The connection only needs room for result ids, not tokenizer scratch. Check the normal, memo-hit,
++    // busy fallback and protected paths; the fixed output allocator deliberately cannot hold BPE scratch.
++    var output: [128 * 1024]u8 = undefined;
++    var dest = std.heap.FixedBufferAllocator.init(&output);
++    const want = try t.tok.encode(a, conv.items);
++    defer a.free(want);
++    for (0..3) |i| {
++        dest.reset();
++        t.memo_busy.store(i == 2, .release);
++        const got = try HfText.encodeFn(&t, dest.allocator(), conv.items, false);
++        try std.testing.expectEqualSlices(u32, want, got);
++        try std.testing.expectEqual(want.len * @sizeOf(u32), dest.end_index);
++    }
++    t.memo_busy.store(false, .release);
++    dest.reset();
++    const spans = [_][2]usize{.{ 0, conv.items.len }};
++    const protected = try t.tok.encodeProtected(a, conv.items, &spans, &.{7});
++    defer a.free(protected);
++    const got_protected = try HfText.encodeProtectedFn(&t, dest.allocator(), conv.items, &spans, &.{7});
++    try std.testing.expectEqualSlices(u32, protected, got_protected);
++    try std.testing.expectEqual(protected.len * @sizeOf(u32), dest.end_index);
++    t.prefix = &.{71};
++    t.suffix = &.{72};
++    dest.reset();
++    const special = try HfText.encodeFn(&t, dest.allocator(), "ab", true);
++    try std.testing.expectEqualSlices(u32, &.{ 71, 3, 72 }, special);
++    try std.testing.expectEqual(3 * @sizeOf(u32), dest.end_index);
++    var empty: [0]u8 = .{};
++    var refuse = std.heap.FixedBufferAllocator.init(&empty);
++    try std.testing.expectError(error.OutOfMemory, HfText.encodeFn(&t, refuse.allocator(), "ab", false));
++    try std.testing.expectError(error.OutOfMemory, HfText.encodeProtectedFn(&t, refuse.allocator(), "ab", &.{}, &.{}));
+ }

@@ -89,6 +89,10 @@ for v in THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_K
 [[ -z "${TF_DS_PHASE_ARENA:-}" || "${TF_DS_PHASE_ARENA}" =~ ^[01]$ ]] || die "TF_DS_PHASE_ARENA is empty, 0 or 1, not '${TF_DS_PHASE_ARENA:-}'"
 [[ -z "${TF_DS_PHASE_POISON:-}" || "${TF_DS_PHASE_POISON}" =~ ^[01]$ ]] || die "TF_DS_PHASE_POISON is empty, 0 or 1, not '${TF_DS_PHASE_POISON:-}'"
 [[ "${TF_DS_PHASE_POISON:-0}" != 1 || "${TF_DS_PHASE_ARENA:-0}" == 1 ]] || die 'TF_DS_PHASE_POISON=1 requires TF_DS_PHASE_ARENA=1 (diagnostic only)'
+[[ -z "${TF_DS_PF_EP32:-}" || "${TF_DS_PF_EP32}" =~ ^[01]$ ]] || die "TF_DS_PF_EP32 is empty, 0 or 1, not '${TF_DS_PF_EP32:-}'"
+if [[ "${TF_DS_PF_EP32:-0}" == 1 ]]; then
+  export TF_DS_PF_EP32 TF_DS_PREFILL_AOT="${TF_DS_PREFILL_AOT:-/opt/tensorfold/prefill-aot}"
+fi
 [[ -z "${TF_DS_HC_PF_RB:-}" || "${TF_DS_HC_PF_RB}" =~ ^(2|4|8)$ ]] || die "TF_DS_HC_PF_RB is empty, 2, 4 or 8, not '${TF_DS_HC_PF_RB:-}'"
 [[ "$TF_DS_ENGRAM_DEDUP" =~ ^[01]$ ]] || die "TF_DS_ENGRAM_DEDUP is 0 or 1, not '$TF_DS_ENGRAM_DEDUP'"
 [[ "$TF_DS_ENGRAM_CACHE_MB" =~ ^[0-9]+$ ]] || die "TF_DS_ENGRAM_CACHE_MB is a number of MiB (0: no cache), not '$TF_DS_ENGRAM_CACHE_MB'"

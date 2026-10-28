@@ -88,7 +88,7 @@ image_hash() {
     cat zig/patches/*.patch 2>/dev/null
     cat zig/kit-patches/*.patch zig/kit-patches/*.py 2>/dev/null   # (not its README)
     cat zig/Dockerfile
-    echo "$TF_REPO $TF_REF $INPUTS_REF $TF_PY_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE"
+    echo "$TF_REPO $TF_REF $INPUTS_REF $TF_PY_REF $KIT_REPO $KIT_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE"
   ) | sha256sum | cut -c1-12
 }
 TAG_BASE="exl3-tp2"             # the image tag's prefix: <TAG_BASE>-<image hash>

@@ -62,14 +62,21 @@ sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned
   above, "this project" and "this repository", and their issue and pull-request numbers, mean Mia's AI Lab's repository.
 
   What was changed (Apache-2.0, section 4(b)):
-  - zig/patches/0010-0019, 0021-0031 and 0034-0043 (added): changes to BertholomusAI's engine, this repository's work under Apache-2.0; the code they
+  - zig/patches/0010-0019, 0021-0031 and 0034-0045 (added): changes to BertholomusAI's engine, this repository's work under Apache-2.0; the code they
     modify, and quote as diff context, stays under its authors' license (see "The DeepSeek-V4.1-Flash family" above).
   - zig/kit-patches/0001-experts-mma-three-programs.patch and zig/kit-patches/build_experts.py (added): a change to
     src/tensorfold/cuda/exl3/experts_grouped.cuh of BertholomusAI's TensorFold (branch deepseek-v41-tp2, Apache-2.0; its EXL3
     kernels after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp), the grouped_mma_kernel's row staging and launch bounds,
     and the build of that file's experts_cb2.cu into the image's /opt/tensorfold/kit-overlay/experts_cb.cubin; this
     repository's work under Apache-2.0, the code it modifies under its authors' licenses.
-  - zig/Dockerfile (modified): the kit-patches build step.
+  - zig/kit-patches/gemm_epilogue.py and build_prefill.py (added): optional dense-prefill kernels derived from
+    src/tensorfold/cuda/exl3/prefill.py of the same TensorFold Python branch. Independent output-row partitioning of
+    the original BF16 Hadamard epilogue, unchanged K accumulation, and a CPU-only compiler/complete AOT pack builder
+    that checks the qualified cubin bytes. This repository's changes are Apache-2.0; the original code retains its
+    authors' licenses. No model weights or quantization are changed.
+  - zig/Dockerfile (modified): the kit-patches build steps, including the original kit AOT set plus eight optional
+    sm_121 prefill variants. start.sh selects that set only for TF_DS_PF_EP32=1; config.sh hashes the kit source pins
+    into image identity and prepare.sh passes those build arguments.
   - zig/patches/0020-upstream-dsml-calls.patch (added): commit 4803479e of bertholomus/TensorFold (pull request #25) by
     Manrique (@hashd1ve), Apache-2.0, carried unchanged with its original header.
   - zig/patches/0033-upstream-prompt-tail.patch (added): commit cf6aae2b of bertholomus/TensorFold (pull request #35) by

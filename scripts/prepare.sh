@@ -87,6 +87,7 @@ if [[ $REBUILD -eq 1 || "$built" != "$hash" ]]; then
   nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
   docker build "${nocache[@]}" -t "$IMAGE" -f "$ctx/Dockerfile" --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg TF_REPO="$TF_REPO" --build-arg TF_REF="$TF_REF" --build-arg INPUTS_REF="$INPUTS_REF" --build-arg TF_PY_REF="$TF_PY_REF" \
+    --build-arg KIT_REPO="$KIT_REPO" --build-arg KIT_REF="$KIT_REF" \
     --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" --build-arg PATCHES_HASH="$hash" "$ctx"
   rm -rf -- "$ctx"; trap - EXIT
 else

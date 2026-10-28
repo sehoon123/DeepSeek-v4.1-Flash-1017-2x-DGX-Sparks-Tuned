@@ -70,6 +70,20 @@ RUN git init -q /tf-py && cd /tf-py && git remote add origin "${TF_REPO}" && \
     cp LICENSE /opt/tensorfold/share/doc/tensorfold/LICENSE-kit-source-branch && \
     rm -rf /tf-py /tf-kit-build /root/.cache/torch_extensions
 
+# Optional dense-prefill epilogues: preserve the kit's complete original AOT set
+# and append eight CPU-compiled, byte-checked sm_121 variants. Default dispatch is
+# unchanged; start.sh selects this set only with TF_DS_PF_EP32=1.
+ARG KIT_REPO
+ARG KIT_REF
+RUN git init -q /tf-prefill-kit && cd /tf-prefill-kit && git remote add origin "${KIT_REPO}" && \
+    git fetch -q --depth 1 origin "${KIT_REF}" && git checkout -q --detach FETCH_HEAD && \
+    test "$(git rev-parse HEAD)" = "${KIT_REF}"
+RUN --network=none mkdir -p /out && cp /opt/tf-kit-patches/gemm_epilogue.py /out/gemm_epilogue.py && \
+    NVIDIA_VISIBLE_DEVICES=void CUDA_VISIBLE_DEVICES=-1 python3 /opt/tf-kit-patches/build_prefill.py \
+      /tf-prefill-kit/kit/aot /opt/tensorfold/prefill-aot && \
+    if [ -f /tf-prefill-kit/LICENSE ]; then cp /tf-prefill-kit/LICENSE /opt/tensorfold/share/doc/tensorfold/LICENSE-prefill-kit; fi && \
+    rm -rf /tf-prefill-kit /out/gemm_epilogue.py /out/__pycache__ /root/.triton
+
 ARG PATCHES_HASH
 LABEL tf.patches=${PATCHES_HASH} tf.engine=zig tf.ref=${TF_REF} tf.inputs=${INPUTS_REF} tf.kit_source=${TF_PY_REF}
 ENV PATH=/opt/tensorfold/native/bin:/opt/tensorfold/bin:${PATH}
