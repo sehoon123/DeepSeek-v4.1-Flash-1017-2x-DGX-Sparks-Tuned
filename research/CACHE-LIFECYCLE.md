@@ -1,5 +1,9 @@
 # Prompt-cache lifecycle hardening — 2026-10-28
 
+This records the earlier 0046/0047 deployment. The subsequently qualified and deployed
+[0048–0050 follow-up](CACHE-PLACEMENT-SSE.md) adds fault-reference retirement, placement preservation
+and native OpenAI SSE keep-alives; its evidence and limitations are recorded separately.
+
 ## Released and deployed: 0046 + 0047
 
 These are host-side correctness fixes, not new CUDA kernels or a change to model
@@ -135,8 +139,10 @@ intentional contention during candidate qualification.
 - Further review found a separate NaN error-path reference issue: prefix
   invalidation can free a job's selected cache entry before final reporting.
   A focused CPU negative control reproduces the outstanding-reference defect;
-  a separate follow-up passes 50 engine-seam tests. **That follow-up is not part of
-  0046/0047 and is not deployed or native/full-model qualified yet.**
+  a separate follow-up passes 50 engine-seam tests. It was not part of 0046/0047.
+  **It has since been incorporated as 0048 in the qualified/deployed
+  [0048–0050 follow-up](CACHE-PLACEMENT-SSE.md).** Deliberate actual-GPU NaN injection
+  remains untested; CPU fault regression and normal-path native qualification are distinct evidence.
 - The previously isolated private-use placeholder/tokenization correction is
   also separate. It intentionally changes tokens for the triggering inputs and
   requires its own native/actual-model qualification.

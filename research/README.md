@@ -12,6 +12,8 @@ pruned). Read every number as this pair's. The tools keep the original machines'
 
 | | |
 | --- | --- |
+| [CACHE-PLACEMENT-SSE.md](CACHE-PLACEMENT-SSE.md) | 10-28: qualified/deployed 0048–0050; blocked placement preserves 679,936 tokens, 850K cold SDK stream survives >300s prefill, 34 complete output comparisons; limitations and rollback provenance |
+| [CACHE-LIFECYCLE.md](CACHE-LIFECYCLE.md) | 10-28: earlier qualified/deployed 0046/0047; snapshot validity, refresh, nesting and save rollback |
 | [FINDINGS.md](FINDINGS.md) | the notebook of 10-20: profiling, the confidence-head diagnosis, copy windows, depth-policy ceilings, the round's kernels, bandwidth and RDMA; corrections are marked where they were made |
 | [OVERNIGHT-OPTIMIZATION.md](OVERNIGHT-OPTIMIZATION.md) | the overnight search over draft-depth policies, run while the confidence head was still misread (its patches 0005-0011 are 0010-0016 here) |
 | [KERNEL-ROUNDS.md](KERNEL-ROUNDS.md) | 10-20 / 10-21: the read ceiling (263 GB/s), the L2 prefetcher, the tensor-parallel gather, each prefetch site, the drafter's prefetch (`zig/patches/0019`), the serving environment (GPU polling, CPU load), copy windows of 48 rows (`zig/patches/0021`), and drafts coupled to the sampler's randomness (negative) |

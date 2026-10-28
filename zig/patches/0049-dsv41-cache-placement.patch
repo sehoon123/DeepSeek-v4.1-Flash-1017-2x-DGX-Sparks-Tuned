@@ -1,0 +1,184 @@
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 32902a2..0a28913 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -703,30 +703,27 @@ pub const Lanes = struct {
+         // a kept state of this prompt's prefix: the pass resumes at its chunk end, in its extent, or in one of its own
+         // with the kept rows copied there when a live stream holds that extent (a burst's second request on a prompt)
+         s.cached = 0;
+-        var kept: ?*Snap = null;
+-        var moved = false;
++        var source: ?*Snap = null;
+         if (s.reuse.saved) |p| {
+             const sn: *Snap = @ptrCast(@alignCast(p));
+             // (a prompt with images resumes a kept state too: the cache keys the image positions by the picture's content, so the
+             // state's rows are this prompt's own; the pictures before the cut need no rows again, below)
+             if (self.usable(sn, len)) {
+-                kept = sn;
+-                // in place unless the extent runs past the pool, a live stream holds it, or another kept state has
+-                // rows past the kept ones (resuming there would stale it: the rows go to a free extent instead, as
+-                // the Python lane's _place resumes "here" only in a free extent)
+-                moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size) or self.keptOver(sn.base + sn.at, sn.base + size, sn);
++                source = sn;
+             } else s.reuse_failed = true;
+         }
+-        const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
+-        if (kept) |sn| {
+-            sn.wanted = 0;
+-            if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
+-        }
+-        if (kept) |sn| if (moved and sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
++        const placement = try self.placeResume(taken[0..nt], size, source);
++        const base = placement.base;
++        const kept = placement.kept;
++        const moved = placement.moved;
++        if (source) |sn| if (kept == null) {
+             if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} found no room to move to ({d} positions); the prompt runs from 0", .{ sn.at, sn.base, size });
+-            kept = null;
+             s.reuse_failed = true;
+         };
++        if (kept) |sn| {
++            sn.wanted = 0;
++            if (!moved) sn.end = @max(sn.end, base + size);
++        }
+         // the rows this stream writes are no other kept state's
+         self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
+         try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size });
+@@ -1160,7 +1157,27 @@ pub const Lanes = struct {
+     /// pool makes the next prompt evict a kept state (the 5 x 500K check with the duplicate admitted fourth). Kept
+     /// states hold their stream's whole extent back while a placement still fits so (placeSoft): its tail stays free
+     /// for the resume in place, which then stales nothing.
++    const Placement = struct { base: usize, kept: ?*Snap, moved: bool };
++
++    /// The source's eligibility is checked by prefillFn. Placement may stale it, or may make its original
++    /// extent usable after other states gave their room. Classify the resulting location, not the first attempt.
++    fn placeResume(self: *Lanes, live: []const [2]usize, size: usize, source: ?*Snap) !Placement {
++        const elsewhere = if (source) |sn|
++            sn.base + size > self.m.pool_cap or clashes(live, sn.base, sn.base + size) or self.keptOver(sn.base + sn.at, sn.base + size, sn)
++        else
++            true;
++        const base = if (elsewhere) try self.placeKept(live, size, source) else source.?.base;
++        const kept = if (source) |sn| (if (sn.stale) null else sn) else null;
++        return .{ .base = base, .kept = kept, .moved = if (kept) |sn| base != sn.base else false };
++    }
++
+     fn placeKept(self: *Lanes, live: []const [2]usize, size: usize, source: ?*Snap) !usize {
++        // No eviction can change the live extents. A failed admission must not destroy snapshots that
++        // become usable when a live stream finishes (including a collision only with the source's growth).
++        if (place(live, size, self.m.pool_cap) == null) {
++            std.log.debug("dsv41: placement waits: extent {d}, source {d} at {d}, live {any}", .{ size, if (source) |sn| sn.at else 0, if (source) |sn| sn.base else 0, live });
++            return error.ContextFull;
++        }
+         const gpa = self.gpa;
+         var kept: std.ArrayList([3]usize) = .empty;
+         defer kept.deinit(gpa);
+@@ -1184,6 +1201,14 @@ pub const Lanes = struct {
+             const victim = for (self.snaps.items) |sn| {
+                 if (!sn.stale and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
+             } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
++            // Preserve the existing oldest-other/source-last order. Before destroying the source itself,
++            // recheck its original extent: earlier evictions may have removed the sole tail blocker.
++            if (source) |sn| if (victim == sn and sn.base + size <= self.m.pool_cap and
++                !clashes(live, sn.base, sn.base + size) and !self.keptOver(sn.base + sn.at, sn.base + size, sn))
++            {
++                std.log.info("dsv41: placement resumes in place: source {d} at {d}, extent {d}", .{ sn.at, sn.base, size });
++                return sn.base;
++            };
+             noteStale(victim, "a placement needed its room (oldest first)");
+             victim.stale = true;
+         }
+@@ -1642,6 +1667,94 @@ test "placement invalidation reaches the cache validity probe without touching G
+     try std.testing.expect(Lanes.snapValidFn(&ln, &snapshots[2]));
+ }
+ 
++test "placement refusal preserves snapshots when only live extents prevent admission" {
++    const gpa = std.testing.allocator;
++    var m: Model = undefined;
++    m.pool_cap = 1048576;
++    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
++    defer ln.snaps.deinit(gpa);
++    var older: Snap = .{ .id = 1, .base = 0, .at = 673792, .end = 714752, .buf = undefined };
++    var source: Snap = .{ .id = 2, .base = 0, .at = 679936, .end = 714752, .buf = undefined };
++    var other: Snap = .{ .id = 3, .base = 714752, .at = 40960, .end = 790528, .buf = undefined };
++    try ln.snaps.appendSlice(gpa, &.{ &older, &source, &other });
++    const live = [_][2]usize{.{ 714752, 790528 }};
++    const size = 716800; // a 683574-token prompt plus output/round reservations, aligned
++    try std.testing.expect(place(&live, size, m.pool_cap) == null);
++    try std.testing.expectError(error.ContextFull, ln.placeResume(&live, size, &source));
++    try std.testing.expect(!older.stale);
++    try std.testing.expect(!source.stale);
++    try std.testing.expect(!other.stale);
++    try std.testing.expectEqual(@as(u64, 0), source.wanted);
++    try std.testing.expectEqual(@as(usize, 714752), source.end);
++    // With the live extent gone, the same exact-prefix source is still eligible.
++    try std.testing.expect(ln.validSnap(&source));
++    const p = try ln.placeResume(&.{}, size, &source);
++    try std.testing.expectEqual(@as(usize, 0), p.base);
++    try std.testing.expect(p.kept == &source);
++    try std.testing.expect(!p.moved);
++}
++
++test "placement reuses its source in place after the oldest other tail blockers are evicted" {
++    const gpa = std.testing.allocator;
++    var m: Model = undefined;
++    m.pool_cap = 1048576;
++    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
++    defer ln.snaps.deinit(gpa);
++    var older: Snap = .{ .id = 1, .base = 0, .at = 673792, .end = 714752, .buf = undefined };
++    var source: Snap = .{ .id = 2, .base = 0, .at = 679936, .end = 714752, .buf = undefined };
++    var other: Snap = .{ .id = 3, .base = 714752, .at = 40960, .end = 790528, .buf = undefined };
++    try ln.snaps.appendSlice(gpa, &.{ &older, &source, &other });
++    try std.testing.expect(ln.keptOver(source.at, 716800, &source));
++    const p = try ln.placeResume(&.{}, 716800, &source);
++    try std.testing.expect(!source.stale);
++    try std.testing.expect(p.kept == &source);
++    try std.testing.expectEqual(@as(usize, 0), p.base);
++    try std.testing.expect(!p.moved); // no self-copy and no cold prefill after the blocker gave its room
++    try std.testing.expect(older.stale and other.stale);
++    try std.testing.expectEqual(@as(usize, 3), ln.snaps.items.len);
++}
++
++test "ordinary placement keeps its source in place or copies it when spare room exists" {
++    const gpa = std.testing.allocator;
++    const c = model.chunk_rows;
++    var m: Model = undefined;
++    m.pool_cap = 128 * c;
++    m.io = std.testing.io;
++    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
++    defer ln.snaps.deinit(gpa);
++    var source: Snap = .{ .id = 1, .base = 0, .at = 8 * c, .end = 10 * c, .buf = undefined };
++    try ln.snaps.append(gpa, &source);
++    const same = try ln.placeResume(&.{}, 10 * c, &source);
++    try std.testing.expectEqual(@as(usize, 0), same.base);
++    try std.testing.expect(same.kept == &source and !same.moved and !source.stale);
++    var other: Snap = .{ .id = 2, .base = 8 * c, .at = 4 * c, .end = 14 * c, .buf = undefined };
++    try ln.snaps.append(gpa, &other);
++    const copied = try ln.placeResume(&.{}, 12 * c, &source);
++    try std.testing.expectEqual(@as(usize, 14 * c + growth_rows), copied.base);
++    try std.testing.expect(copied.kept == &source and copied.moved);
++    try std.testing.expect(!source.stale and !other.stale);
++    // A source that a live stream holds is still copied only through the existing patient/roomAfter path.
++    const held = try ln.placeResume(&.{.{ 0, 14 * c }}, 12 * c, &source);
++    try std.testing.expect(held.kept == &source and held.moved);
++    try std.testing.expect(!source.stale and !other.stale);
++}
++
++test "placement cannot reuse a source extent past the pool end" {
++    const gpa = std.testing.allocator;
++    const c = model.chunk_rows;
++    var m: Model = undefined;
++    m.pool_cap = 32 * c;
++    var ln: Lanes = .{ .gpa = gpa, .m = &m, .peer = null };
++    defer ln.snaps.deinit(gpa);
++    var source: Snap = .{ .id = 1, .base = 20 * c, .at = 8 * c, .end = 30 * c, .buf = undefined };
++    try ln.snaps.append(gpa, &source);
++    const p = try ln.placeResume(&.{}, 16 * c, &source);
++    try std.testing.expectEqual(@as(usize, 0), p.base);
++    try std.testing.expect(p.kept == &source and p.moved and !source.stale);
++    try std.testing.expectError(error.ContextFull, ln.placeResume(&.{}, 33 * c, &source));
++    try std.testing.expect(!source.stale);
++}
++
+ test "failed snapshot save unregisters before freeing and a later save still works" {
+     // Exercise the real Lanes/Model save path, with driver function pointers replaced by CPU fakes.
+     // No CUDA library, context or device is opened. NOT_READY is a recoverable, silent injected error.

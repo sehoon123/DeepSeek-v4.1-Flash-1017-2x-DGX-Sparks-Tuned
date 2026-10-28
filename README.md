@@ -21,6 +21,18 @@ or off, and **DSpark** speculative decoding from the checkpoint's own draft bloc
 - Optional `ABLIT=1`: keeps Mia EAQ 2.9 bpw and applies the matching [Keys overlay by drowzeys](https://huggingface.co/drowzeys/keys-DeepSeek-V4.1-Flash-1017-Abliterated).
   Requires your Hugging Face token and access to that gated repository; see [Abliterated mode](#abliterated-mode).
 
+## Latest stability release — 2026-10-28
+
+Patches **0046–0050** harden saved-cache ownership, preserve valid prefixes when placement is temporarily blocked by
+live streams, and send 15-second native OpenAI SSE keep-alives during long waits. The 0048–0050 follow-up passed
+**34 complete output-token-array comparisons** against 0047, including a real 850K-token SDK/proxy request with
+381.91 seconds of cold prefill and no retry. Model, quantization, arithmetic, limits and cache budget are unchanged.
+See [the qualification report and its limits](research/CACHE-PLACEMENT-SSE.md),
+[0046/0047 lifecycle details](research/CACHE-LIFECYCLE.md), and the
+[source/evidence release](https://github.com/sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned/releases/tag/cache-placement-sse-20261028).
+Cold prefill can still take minutes; SSE comments do not override absolute client deadlines. This is not a claim
+that every client-side stall is resolved. The decode measurements below retain their original dates and baselines.
+
 ## What this recipe adds
 
 This is [Mia's AI Lab's recipe](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks) at [`31eea46`](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/commit/31eea4608f8bb292a92e2f7a1db400e928620c78) with the changes below (follow Mia's AI Lab on
@@ -102,14 +114,15 @@ their repository's.
 - **[research/](research/README.md)**: the measurements behind these changes: where a 38.9 ms decode round goes on this
   pair, the exactness checks, what did not help, and the tools.
 
-Replies do not change. Every check compared them with serial decoding (one token a round, no drafts) or with its token
+The historical decode checks below compared replies with serial decoding (one token a round, no drafts) or with its token
 hashes: 62 of 62 copy-window runs (copies 0-90 % wrong, three streams at once, temperature 1, EOS and length endings) and
 611 decodes of the later offline runs, up to 125K-token prompts, and every run of the kernel rounds (patch 0019), none
 different ([research/](research/README.md)).
 
-The image is Mia's AI Lab's with these nineteen patches added and the kit's experts cubin rebuilt with `zig/kit-patches`
-(`tensorfold-dsv41:exl3-tp2-c5efaf7a1b56`). None is published, so the first `./start.sh` builds it on the head (two Zig
-builds and the cubin, ~8 minutes) and copies it to the worker.
+The runtime uses the full ordered [patch chain](zig/patches/README.md) and kit overlays in `zig/Dockerfile`.
+The currently qualified local image is `tensorfold-dsv41:exl3-tp2-67309ead97da`; its exact build/deployment scope is
+recorded in the stability report above. No container-registry image is published: `./start.sh` builds a missing
+local image on the head and copies it to the worker. Source/evidence releases do not include model weights.
 
 <!-- MEASURED -->
 Measured on our pair with this commit, run as our production (`ABLIT=1`, `CONTEXT=1048576`, the defaults above; sparkDash's

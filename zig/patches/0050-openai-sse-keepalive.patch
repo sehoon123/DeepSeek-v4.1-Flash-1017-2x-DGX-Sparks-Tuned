@@ -1,0 +1,154 @@
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 6d3ba30..2a65217 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -40,8 +40,56 @@ pub const Input = struct {
+ pub const Sink = struct {
+     ctx: *anyopaque,
+     call: *const fn (ctx: *anyopaque, delta: Value) error{Closed}!void,
++    /// Transport-only SSE comment; never a model token, delta, usage item, or first-token event.
++    pulse: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
+ };
+ 
++const Keepalive = struct {
++    const interval_ns = 15 * std.time.ns_per_s;
++    last_ns: i96,
++
++    fn tick(k: *Keepalive, sink: Sink, now: i96) error{Closed}!void {
++        const pulse = sink.pulse orelse return;
++        if (now - k.last_ns < interval_ns) return;
++        try pulse(sink.ctx);
++        k.last_ns = now;
++    }
++};
++
++test "stream keepalive is periodic transport-only and propagates a closed writer" {
++    const Fake = struct {
++        pulses: usize = 0,
++        deltas: usize = 0,
++        closed: bool = false,
++        fn call(p: *anyopaque, _: Value) error{Closed}!void {
++            const s: *@This() = @ptrCast(@alignCast(p));
++            s.deltas += 1;
++        }
++        fn pulse(p: *anyopaque) error{Closed}!void {
++            const s: *@This() = @ptrCast(@alignCast(p));
++            if (s.closed) return error.Closed;
++            s.pulses += 1;
++        }
++    };
++    var f: Fake = .{};
++    const sink: Sink = .{ .ctx = &f, .call = Fake.call, .pulse = Fake.pulse };
++    var k: Keepalive = .{ .last_ns = 100 };
++    try k.tick(sink, 100 + Keepalive.interval_ns - 1);
++    try std.testing.expectEqual(@as(usize, 0), f.pulses);
++    try k.tick(sink, 100 + Keepalive.interval_ns);
++    try k.tick(sink, 100 + Keepalive.interval_ns + 1);
++    try std.testing.expectEqual(@as(usize, 1), f.pulses);
++    try k.tick(sink, 100 + 2 * Keepalive.interval_ns);
++    try std.testing.expectEqual(@as(usize, 2), f.pulses);
++    try std.testing.expectEqual(@as(usize, 0), f.deltas);
++    f.closed = true;
++    try std.testing.expectError(error.Closed, k.tick(sink, 100 + 3 * Keepalive.interval_ns));
++    try std.testing.expectEqual(@as(i96, 100 + 2 * Keepalive.interval_ns), k.last_ns);
++    // Non-streamed/translated outputs without a pulse remain unaffected.
++    try k.tick(.{ .ctx = &f, .call = Fake.call }, 100 + 4 * Keepalive.interval_ns);
++    try std.testing.expectEqual(@as(usize, 2), f.pulses);
++}
++
+ pub const Reply = struct {
+     content: []const u8,
+     stop_sequence: ?[]const u8,
+@@ -432,6 +480,7 @@ const Generation = struct {
+     /// Takes rounds until the reply ends; a client that leaves cancels it.
+     fn loop(g: *Generation, gone: anytype) Failure!void {
+         const m = g.box;
++        var keepalive: Keepalive = .{ .last_ns = nowNs(m.io) };
+         while (true) {
+             m.mutex.lockUncancelable(m.io);
+             var chunk: ?[]u32 = null;
+@@ -455,6 +504,12 @@ const Generation = struct {
+                 g.cancel();
+                 return error.Cancelled;
+             }
++            if (g.sink) |sink| if (sink.pulse != null) {
++                keepalive.tick(sink, nowNs(m.io)) catch {
++                    g.cancel();
++                    return error.Cancelled;
++                };
++            };
+             const tokens = chunk orelse continue;
+             if (g.reason == null) try g.commit(tokens);
+         }
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index ba3db9c..958a5e4 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -35,6 +35,8 @@ pub const Out = struct {
+         event: *const fn (ctx: *anyopaque, payload: ?Value) error{Closed}!void,
+         /// A whole JSON reply.
+         reply: *const fn (ctx: *anyopaque, status: u16, payload: Value) void,
++        /// Optional transport-only keepalive for long OpenAI SSE prefill/decode gaps.
++        pulse: ?*const fn (ctx: *anyopaque) error{Closed}!void = null,
+     };
+ };
+ 
+@@ -55,7 +57,7 @@ const ClientOut = struct {
+     a: Allocator,
+ 
+     fn out(c: *ClientOut) Out {
+-        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply } };
++        return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply, .pulse = pulse } };
+     }
+ 
+     fn open(ctx: *anyopaque) error{Closed}!void {
+@@ -68,6 +70,11 @@ const ClientOut = struct {
+         return if (payload) |p| sse.data(c.conn, c.a, p) else sse.done(c.conn);
+     }
+ 
++    fn pulse(ctx: *anyopaque) error{Closed}!void {
++        const c: *ClientOut = @ptrCast(@alignCast(ctx));
++        return sse.keepalive(c.conn);
++    }
++
+     fn reply(ctx: *anyopaque, status: u16, payload: Value) void {
+         const c: *ClientOut = @ptrCast(@alignCast(ctx));
+         routes.sendValue(c.conn, c.a, status, payload);
+@@ -394,6 +401,11 @@ const Run = struct {
+         run: *Run,
+         tools: bool,
+ 
++        fn pulse(ctx: *anyopaque) error{Closed}!void {
++            const s: *StreamSink = @ptrCast(@alignCast(ctx));
++            if (s.run.out.vt.pulse) |p| try p(s.run.out.ctx);
++        }
++
+         fn call(ctx: *anyopaque, delta: Value) error{Closed}!void {
+             const s: *StreamSink = @ptrCast(@alignCast(ctx));
+             const r = s.run;
+@@ -464,7 +476,7 @@ const Run = struct {
+         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
+         var sink_state: StreamSink = .{ .run = r, .tools = tools };
+         handed = true;
+-        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call }, gone) catch |e| {
++        var reply = chat.generate(r.srv, &cx, prepared, .{ .ctx = &sink_state, .call = StreamSink.call, .pulse = if (r.out.vt.pulse != null) StreamSink.pulse else null }, gone) catch |e| {
+             switch (e) {
+                 error.Cancelled => return,
+                 error.Refused => if (cx.kind != .other and cx.kind != .server) {
+diff --git a/zig/src/server/sse.zig b/zig/src/server/sse.zig
+index de30ac1..05182c2 100644
+--- a/zig/src/server/sse.zig
++++ b/zig/src/server/sse.zig
+@@ -23,6 +23,12 @@ pub fn done(conn: *Conn) error{Closed}!void {
+     return conn.writeAll("data: [DONE]\n\n");
+ }
+ 
++/// Standard SSE comment: clients ignore it as an event, while body-idle timers see activity.
++/// No allocation and no model/request data. It must never be counted as a generated token or TTFT.
++pub fn keepalive(conn: *Conn) error{Closed}!void {
++    return conn.writeAll(": keep-alive\n\n");
++}
++
+ /// ``event: KIND`` then its data line (Responses and Messages events).
+ pub fn event(conn: *Conn, a: Allocator, kind: []const u8, payload: json.Value) error{Closed}!void {
+     const text = json.stringify(a, payload, .{}) catch return error.Closed;

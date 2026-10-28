@@ -1,0 +1,89 @@
+{
+  "complete": true,
+  "checked_at": "2026-10-28T19:29:22.138657+09:00",
+  "production_promoted": true,
+  "image": "tensorfold-dsv41:exl3-tp2-67309ead97da",
+  "image_id": "sha256:27b75f33f380af5ba6fffeaed24e26c938f75d140505210e1419fb93ad00094e",
+  "native_sha256": "97be35393f4f54fcd70f6719aed181a3445f1bfc4dba8dfc12e70e346b66bb01",
+  "baseline": {
+    "image": "tensorfold-dsv41:exl3-tp2-0078cefc720d",
+    "source_run": "qual1",
+    "reused_not_rerun": true
+  },
+  "cpu": {
+    "host": 267,
+    "server": 69,
+    "seam": 50,
+    "overlap": true,
+    "intended_negative_controls": 4,
+    "native_build_steps": 28,
+    "transport_fixture": true,
+    "exact_sdk_fixture": true
+  },
+  "actual_model": {
+    "full_array_comparisons": 34,
+    "complete_responses": 68,
+    "ordinary": 20,
+    "long": 9,
+    "features": 5,
+    "placement": {
+      "baseline": {
+        "input": 683602,
+        "cached": 0,
+        "output_tokens": 2,
+        "prefill_seconds": 296.689198562,
+        "client_ttft_seconds": 315.96778802998597,
+        "full_sha256": "1a10755ba0929233ab6797087c1ceeef7a47b081434a88ed1e4f514856ab02b8"
+      },
+      "candidate": {
+        "input": 683602,
+        "cached": 679936,
+        "output_tokens": 2,
+        "prefill_seconds": 2.427432129,
+        "client_ttft_seconds": 21.740098492009565,
+        "full_sha256": "1a10755ba0929233ab6797087c1ceeef7a47b081434a88ed1e4f514856ab02b8"
+      }
+    },
+    "cold_sdk": {
+      "input": 850123,
+      "prefill_seconds": 381.914988633,
+      "comments": 25,
+      "max_body_gap_seconds": 15.062420984000001,
+      "fetches": 1,
+      "body_idle_timeout_overridden": false
+    },
+    "prefill_disconnect_exact_retry": true,
+    "decode_disconnect_exact_recovery": true,
+    "cache_failed_counter_max": 0,
+    "video": "skipped: PyAV unavailable"
+  },
+  "memory_minima": {
+    "qual1": {
+      "head_MiB": 5058,
+      "worker_MiB": 6889
+    },
+    "qual2": {
+      "head_MiB": 5599,
+      "worker_MiB": 7399
+    }
+  },
+  "unchanged_environment_command_mount_limits": true,
+  "unchanged_operator_model_retention_files": true,
+  "current_health": {
+    "status": "ok",
+    "warming": false,
+    "max_batch_size": 4
+  },
+  "services": {
+    "restart": "on-failure",
+    "nrestarts": 0,
+    "public_unauthenticated_status": 401
+  },
+  "limitations": [
+    "Synthetic geometry is not a capture of the user's request; long geometry replies mostly ACK.",
+    "Actual user-PC timeout hop remains unproved; SSE comments do not override absolute deadlines.",
+    "No deliberate actual-GPU NaN/transport-fault injection; fault-reference path is CPU-regressed.",
+    "Private-use placeholder tokenization candidate and follower save-copy acknowledgement are not included.",
+    "Cold/legitimately changed large prompts still require full computation; shared 1M pool may queue streams."
+  ]
+}
