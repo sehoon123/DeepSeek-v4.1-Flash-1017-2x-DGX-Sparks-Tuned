@@ -14,7 +14,11 @@ the head (and the worker) back ~1.23 GiB, which this release spends on a larger 
 The newer firmware option for the same reservation (DGX Spark OTA2610, UEFI "Display Reserved Memory": Auto / 0.5 GB,
 NVIDIA's DGX Spark User Guide) shrinks it to 0.5 GB on a headless Spark. It was not available here: these MSI nodes run
 OTA2607 (UEFI 5.36_1.8.0), and neither the stable nor the testing LVFS remote had a newer MSI MS-C931 firmware. The two
-approaches add up: once the firmware option exists, the reservation can be shrunk to what the span needs.
+do not add up: the span lives inside the reservation. At the firmware's 0.5 GB (or 1 GB) the reservation gives ~1.5
+GiB back to Linux, a little more than the span's ~1.23 GiB, but can no longer hold the table (1,264 MiB), and start.sh
+then starts without the span at `DISPLAY_EMBED_FALLBACK_POOL`. At 2 GB the span fits and ~0.75 GiB of the reservation
+stays idle. Once the option exists, the choice is 0.5 GB with `DISPLAY_EMBED=0` (re-qualifying the pool at that
+memory) or 2 GB with the span.
 
 ## Prior art
 
