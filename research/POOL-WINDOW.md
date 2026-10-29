@@ -74,6 +74,12 @@ B1's placement retired A1's kept state, so A2 was recomputed from position 0. Th
 A2's complete output equals phase 1's A2 (recomputed cold). The features suite, the stock smoke and validate tools and
 an owned decode-disconnect recovery check also passed under `POOL`.
 
+**Correction (same day, 0056's window).** The pool's cost is ~0.75 GiB a Spark for 1,048,576 -> 1,572,864 positions, not
+the ~0.4 GiB below: rank 0's own device-memory count at load reads 106.12 -> 106.87 GiB, and stepping the pool back from
+1,572,864 to 1,048,576 freed 769 MiB of GPU memory on each rank (nvidia-smi) with `MemAvailable` rising about as much.
+The ~0.4 GiB compared `MemAvailable` snapshots taken at different page-cache states. The gate below (minima under load)
+stands as measured. See [DISPLAY-EMBED.md](DISPLAY-EMBED.md).
+
 **Memory.** `MemAvailable` right after the load: at most 6,394 / 8,466 MiB (head / worker) with the 1M pool, 6,006 /
 8,032 MiB with `POOL=1572864`: ~390-430 MiB less per Spark for 524,288 more positions, in line with MiaAI-Lab's
 ~0.9 GiB per 1M. Minima under phase 2's load: 4,892 / 6,917 MiB (gate: 4,096 on both). On this site the head reads

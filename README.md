@@ -38,10 +38,22 @@ every client-side stall is resolved. The decode measurements below retain their 
 **0054–0055 (same day): two long sessions that alternate stay resident.** With the opt-in `POOL` (0054, adapted from
 MiaAI-Lab's 0008), the streams' extents and kept prompts share more positions than the 1,048,576-token request window.
 On the pair with two synthetic ~600K-token sessions, switching back to the first resumed from 598,016 cached tokens in
-2.5 s; with the 1M pool, the switch recomputed it in 257 s. `POOL=1572864` costs ~0.4 GiB `MemAvailable` per Spark.
+2.5 s; with the 1M pool, the switch recomputed it in 257 s. `POOL=1572864` costs ~0.75 GiB per Spark (corrected from
+~0.4 GiB the same day: see [DISPLAY-EMBED.md](research/DISPLAY-EMBED.md)).
 It is off by default; measure both Sparks before enabling it. 0055 makes the Engram read-ahead reset unconditional.
 Every complete output token array matched the predecessor's. See [POOL-WINDOW.md](research/POOL-WINDOW.md) and the
 [source/evidence release](https://github.com/sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned/releases/tag/pool-window-20261029).
+
+**0056 (same day): the embedding table in the display reservation, and room for a third long session.** Each GB10 keeps
+~2 GiB for a screen that a headless Spark never uses (Linux and ordinary CUDA allocations never touch it). With the
+opt-in `DISPLAY_EMBED=1` (0056), each rank moves its 1,262.5 MiB BF16 embedding table there (a DRM dumb buffer imported
+into CUDA, the same bytes): rank 0's device memory at load 106.12 -> 104.89 GiB, every complete output token array of
+the predecessor's 34 unchanged, cold prefill x0.996-x0.999. This site spends the room on `POOL=2097152`: three ~600K
+sessions that alternate all stay resident (each switch back resumes ~598K cached tokens in ~2.5 s), with `MemAvailable`
+minima under the window's load of 5,713 / 7,857 MiB (head / worker) against 4,892 / 6,917 before. Needs nvidia-drm
+modeset on and no display connected; `start.sh` probes both Sparks and falls back to `DISPLAY_EMBED_FALLBACK_POOL`
+without the span. See [DISPLAY-EMBED.md](research/DISPLAY-EMBED.md) and the
+[source/evidence release](https://github.com/sehoon123/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks-Tuned/releases/tag/display-embed-20261029).
 
 ## What this recipe adds
 
@@ -434,7 +446,8 @@ Settings come from the environment, `scripts/local.sh` or `.env`; the defaults a
 | `ABLIT_PRUNE_STOCK` | 0 | this recipe: `1` (with `ABLIT=1`) removes the 24 stock shards the overlay replaced once its checkpoint is verified (127 GB); `ABLIT=0` then downloads them again (see Abliterated mode) |
 | `HF_TOKEN` | unset | Hugging Face read token for downloads; alternatively authenticate with `hf auth login` on the head |
 | `CONTEXT` | 1048576 | a request's positions at most; rank 1's `--pool` follows it |
-| `POOL` | empty (`CONTEXT`) | this recipe (`zig/patches/0054`): the positions the streams' extents and kept prompts share, a multiple of 2,048 from `CONTEXT` to 4,194,304. `1572864` keeps two alternating sessions of up to ~737K tokens each resident (~0.4 GiB `MemAvailable` per Spark here; [research/POOL-WINDOW.md](research/POOL-WINDOW.md)) |
+| `POOL` | empty (`CONTEXT`) | this recipe (`zig/patches/0054`): the positions the streams' extents and kept prompts share, a multiple of 2,048 from `CONTEXT` to 4,194,304. `1572864` keeps two alternating sessions of up to ~737K tokens each resident (~0.75 GiB per Spark here), `2097152` three of up to ~643K each (~1.0 GiB more; [research/POOL-WINDOW.md](research/POOL-WINDOW.md), [research/DISPLAY-EMBED.md](research/DISPLAY-EMBED.md)) |
+| `DISPLAY_EMBED`, `DISPLAY_EMBED_FALLBACK_POOL`, `DISPLAY_CARD` | 0, empty, `/dev/dri/card0` | this recipe (`zig/patches/0056`): `1` puts each rank's embedding table (1,262.5 MiB) in the GB10's display reservation, ~1.23 GiB of ordinary memory back on each Spark. Needs `options nvidia-drm modeset=1` (DGX OS ships `modeset=0`) and no display connected; `start.sh` probes both Sparks and, when either cannot, starts without it and with `POOL=DISPLAY_EMBED_FALLBACK_POOL` when set ([research/DISPLAY-EMBED.md](research/DISPLAY-EMBED.md)) |
 | `PARALLEL` | 4 | requests at once (the engine's streams, 1 to 16; the family was measured at 4) |
 | `THINKING`, `REASONING_EFFORT` | 1, empty | think first unless a request turns it off; `low` / `medium` / `high` / `xhigh` as the default effort |
 | `THINKING_BUDGET` | empty | reasoning tokens a reply may spend before the engine closes the think block itself and lets the answer continue (`--thinking-budget`; a request's `thinking_budget` wins); empty: no cap. A hard task can otherwise spend its whole `MAX_TOKENS` thinking and end with no text and no tool call. A model that keeps rambling after the cut is not stopped by it. For long agentic or tool-calling jobs, leave it empty or set it large: a small budget cuts the reasoning mid-plan, which can make the model repeat a tool call it already made |

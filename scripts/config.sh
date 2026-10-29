@@ -118,6 +118,16 @@ CONTEXT="${CONTEXT:-1048576}"
 # measured about 0.9 GiB a rank per 1,048,576 positions); RoPE tables stay at the window. Whole 2,048-position chunks.
 # Both ranks get it (TF_DS_POOL, TF_DS_WINDOW and rank 1's --pool); measure MemAvailable on both Sparks before raising it.
 POOL="${POOL:-}"
+# zig/patches/0056: 1 puts each rank's embedding table (1,262.5 MiB of BF16 rows, read one row a token) in the GB10's
+# display reservation, the ~2 GiB the firmware keeps for a screen that Linux and ordinary CUDA allocations never use, so
+# ~1.23 GiB of ordinary memory comes back on each Spark (the same bytes: every reply unchanged). Needs nvidia-drm with
+# modeset on (`options nvidia-drm modeset=1` in /etc/modprobe.d, a reboot) and no display connected, on both Sparks.
+# start.sh probes both first (scripts/display_probe.py in the engine's image) and, when either cannot, starts without
+# it, with POOL=DISPLAY_EMBED_FALLBACK_POOL when that is set (the layout that fits without the ~1.23 GiB).
+DISPLAY_EMBED="${DISPLAY_EMBED:-0}"
+DISPLAY_EMBED_FALLBACK_POOL="${DISPLAY_EMBED_FALLBACK_POOL:-}"
+DISPLAY_CARD="${DISPLAY_CARD:-/dev/dri/card0}"
+DISPLAY_EMBED_BYTES=1323827200   # embed.weight of DeepSeek-V4.1-Flash-1017: 129,280 x 5,120 BF16
 PARALLEL="${PARALLEL:-4}"              # requests at once (the engine's streams, TF_DS_STREAMS; the family measured 4)
 ROUND_ROWS="${ROUND_ROWS:-32}"         # a decode round's rows at most, 16 to 48 (this recipe: 32, for wide copy windows; 48 copies faster
                                        # for ~0.3 GiB more of each Spark's memory, README "Memory and safety"; 16: the engine's)

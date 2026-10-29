@@ -1,0 +1,425 @@
+# dsv41: the embedding table in the GB10's display reservation (TF_DS_DISPLAY_EMBED=1; off by default). The firmware
+# keeps ~2 GiB of each Spark's memory for a screen (the scanout carve-out Linux and ordinary CUDA allocations never use,
+# MemAvailable never counts it); with nvidia-drm's modeset on, a DRM dumb buffer comes from it, and exported as a
+# dma-buf and imported with cuImportExternalMemory it is device memory a kernel reads like any other. Each rank moves
+# its whole BF16 embedding table there (1,262.5 MiB, read one row a token by the prompt chunks', the rounds' and the
+# drafter's embedInit): copied, compared byte for byte, its ordinary buffer freed, its address changed before any kernel
+# or graph takes it, so every reply is the same and ~1.23 GiB of ordinary memory comes back on each Spark. A connected
+# display, modeset off, too little room or no card in the container stops the load (fails closed); the recipe's
+# start.sh probes both Sparks first. TF_DS_DISPLAY_CARD: the card (/dev/dri/card0). After coolbho3k (emihuang)'s
+# finding that the reservation is reachable from CUDA and christopherowen/spark-ds41f's measurements (Apache-2.0).
+diff --git a/zig/src/cuda/abi.zig b/zig/src/cuda/abi.zig
+index 97e048c..2894a9e 100644
+--- a/zig/src/cuda/abi.zig
++++ b/zig/src/cuda/abi.zig
+@@ -13,6 +13,7 @@ pub const Graph = ?*opaque {};
+ pub const GraphNode = ?*opaque {};
+ pub const GraphExec = ?*opaque {};
+ pub const Kernel = ?*opaque {};
++pub const ExternalMemory = ?*opaque {};
+ 
+ pub const success: Result = 0;
+ pub const error_not_found: Result = 500;
+@@ -23,6 +24,30 @@ pub const event_disable_timing: c_uint = 2;
+ pub const host_alloc_portable: c_uint = 1;
+ pub const host_alloc_devicemap: c_uint = 2;
+ 
++/// CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD (cuda.h, CUDA 11.7+): a Linux dma-buf, here a DRM dumb buffer's.
++pub const external_memory_handle_type_dmabuf_fd: c_int = 9;
++
++/// CUDA_EXTERNAL_MEMORY_HANDLE_DESC (v1): 104 bytes, `size` at 24.
++pub const ExternalMemoryHandleDesc = extern struct {
++    type: c_int,
++    handle: extern union {
++        fd: c_int,
++        win32: extern struct { handle: ?*anyopaque, name: ?*const anyopaque },
++        nv_sci_buf_object: ?*const anyopaque,
++    },
++    size: u64,
++    flags: c_uint = 0,
++    reserved: [16]c_uint = @splat(0),
++};
++
++/// CUDA_EXTERNAL_MEMORY_BUFFER_DESC (v1): 88 bytes.
++pub const ExternalMemoryBufferDesc = extern struct {
++    offset: u64 = 0,
++    size: u64,
++    flags: c_uint = 0,
++    reserved: [16]c_uint = @splat(0),
++};
++
+ pub const CaptureMode = enum(c_int) { global = 0, thread_local = 1, relaxed = 2 };
+ pub const CaptureStatus = enum(c_int) { none = 0, active = 1, invalidated = 2, _ };
+ 
+@@ -205,6 +230,9 @@ pub const Api = struct {
+     cuGraphExecDestroy: *const fn (GraphExec) callconv(.c) R,
+     cuGraphExecUpdate_v2: *const fn (GraphExec, Graph, *ExecUpdateResultInfo) callconv(.c) R,
+     cuGraphExecKernelNodeSetParams_v2: *const fn (GraphExec, GraphNode, *const KernelNodeParams) callconv(.c) R,
++    cuImportExternalMemory: *const fn (*ExternalMemory, *const ExternalMemoryHandleDesc) callconv(.c) R,
++    cuExternalMemoryGetMappedBuffer: *const fn (*DevicePtr, ExternalMemory, *const ExternalMemoryBufferDesc) callconv(.c) R,
++    cuDestroyExternalMemory: *const fn (ExternalMemory) callconv(.c) R,
+     cuGetErrorName: *const fn (R, *?[*:0]const u8) callconv(.c) R,
+     cuGetErrorString: *const fn (R, *?[*:0]const u8) callconv(.c) R,
+ };
+@@ -215,4 +243,6 @@ comptime {
+     std.debug.assert(@sizeOf(LaunchConfig) == 56 and @offsetOf(LaunchConfig, "stream") == 32);
+     std.debug.assert(@sizeOf(KernelNodeParams) == 72 and @offsetOf(KernelNodeParams, "params") == 40);
+     std.debug.assert(@sizeOf(ExecUpdateResultInfo) == 24);
++    std.debug.assert(@sizeOf(ExternalMemoryHandleDesc) == 104 and @offsetOf(ExternalMemoryHandleDesc, "handle") == 8 and @offsetOf(ExternalMemoryHandleDesc, "size") == 24 and @offsetOf(ExternalMemoryHandleDesc, "flags") == 32);
++    std.debug.assert(@sizeOf(ExternalMemoryBufferDesc) == 88 and @offsetOf(ExternalMemoryBufferDesc, "size") == 8 and @offsetOf(ExternalMemoryBufferDesc, "flags") == 16);
+ }
+diff --git a/zig/src/families/dsv41/display.zig b/zig/src/families/dsv41/display.zig
+new file mode 100644
+index 0000000..bbcb19c
+--- /dev/null
++++ b/zig/src/families/dsv41/display.zig
+@@ -0,0 +1,284 @@
++//! zig/patches/0056: the embedding table in the GB10's display reservation (TF_DS_DISPLAY_EMBED=1; off by default).
++//!
++//! The Spark's firmware keeps ~2 GiB of memory for a screen, the scanout carve-out that Linux and ordinary CUDA
++//! allocations never use and MemAvailable never counts. With nvidia-drm's modeset on, a DRM dumb buffer comes from it;
++//! exported as a dma-buf and imported into CUDA, it is device memory a kernel reads like any other. A headless Spark
++//! moves its embedding table there: 1,262.5 MiB of BF16 rows that each rank holds whole and reads one row a token
++//! (the prompt chunks', the decode rounds' and the drafter's embedInit). The span's bytes are compared with the table
++//! before its ordinary buffer is freed, and the table's address changes before any kernel or graph has taken it, so
++//! every reply is the same. Streaming reads from such a span run at cudaMalloc's speed; small random reads do not, so
++//! nothing that is gathered at random (the KV cache) goes there.
++//!
++//! Fails closed: with TF_DS_DISPLAY_EMBED=1, a card that cannot give the span (modeset off: CREATE_DUMB has no driver,
++//! a display connected, too little room, no device in the container) stops the model's load; the recipe's start.sh
++//! probes both Sparks first and starts its known-good layout instead. TF_DS_DISPLAY_CARD: the card (/dev/dri/card0).
++//!
++//! After coolbho3k (emihuang)'s finding that the reservation is reachable from CUDA, and
++//! christopherowen/spark-ds41f's measurements and placement of read-once tables there (Apache-2.0).
++
++const std = @import("std");
++const cuda = @import("cuda");
++const weights = @import("weights.zig");
++
++const abi = cuda.abi;
++const Io = std.Io;
++const linux = std.os.linux;
++
++/// The span's unit: whole 16 MiB pieces of the reservation.
++pub const granule: usize = 16 << 20;
++const dumb_width: u32 = 4096;
++const dumb_bpp: u32 = 32;
++const dumb_row: usize = dumb_width * dumb_bpp / 8;
++
++const CreateDumb = extern struct { height: u32, width: u32, bpp: u32, flags: u32 = 0, handle: u32 = 0, pitch: u32 = 0, size: u64 = 0 };
++const DestroyDumb = extern struct { handle: u32 };
++const PrimeHandle = extern struct { handle: u32, flags: u32, fd: i32 = -1 };
++
++const create_dumb: u32 = linux.IOCTL.IOWR('d', 0xB2, CreateDumb);
++const destroy_dumb: u32 = linux.IOCTL.IOWR('d', 0xB4, DestroyDumb);
++const prime_handle_to_fd: u32 = linux.IOCTL.IOWR('d', 0x2D, PrimeHandle);
++
++comptime {
++    // drm.h / drm_mode.h on arm64, as the probe and the prior art use them
++    std.debug.assert(@sizeOf(CreateDumb) == 32 and @sizeOf(DestroyDumb) == 4 and @sizeOf(PrimeHandle) == 12);
++    std.debug.assert(create_dumb == 0xC02064B2 and destroy_dumb == 0xC00464B4 and prime_handle_to_fd == 0xC00C642D);
++}
++
++/// TF_DS_DISPLAY_EMBED: unset, empty or 0 off; 1 on; anything else is refused.
++pub fn parseSwitch(v: ?[]const u8) error{BadDisplayEmbed}!bool {
++    const s = v orelse return false;
++    if (s.len == 0 or std.mem.eql(u8, s, "0")) return false;
++    if (std.mem.eql(u8, s, "1")) return true;
++    return error.BadDisplayEmbed;
++}
++
++pub fn wanted() error{BadDisplayEmbed}!bool {
++    return parseSwitch(if (std.c.getenv("TF_DS_DISPLAY_EMBED")) |v| std.mem.span(v) else null);
++}
++
++/// `len` bytes in whole granules.
++pub fn rounded(len: usize) usize {
++    return std.mem.alignForward(usize, len, granule);
++}
++
++/// The connectors of `card` (its entries "<card>-<connector>" in /sys/class/drm, here `drm`), and none of them
++/// "connected": a display that is plugged in keeps the reservation for its screen (its name in `connected`).
++pub fn headless(gpa: std.mem.Allocator, io: Io, drm: Io.Dir, card: []const u8, connected: *[64]u8) !usize {
++    var seen: usize = 0;
++    var it = drm.iterate();
++    while (try it.next(io)) |e| {
++        if (e.kind != .directory and e.kind != .sym_link) continue;
++        if (e.name.len <= card.len or !std.mem.startsWith(u8, e.name, card) or e.name[card.len] != '-') continue;
++        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
++        const path = try std.fmt.bufPrint(&path_buf, "{s}/status", .{e.name});
++        // a sysfs file says it is 4096 bytes whatever it holds
++        const status = drm.readFileAlloc(io, path, gpa, .limited(1 << 16)) catch |err| switch (err) {
++            error.FileNotFound => continue, // a connector without a status file is no output
++            else => return err,
++        };
++        defer gpa.free(status);
++        seen += 1;
++        if (std.mem.eql(u8, std.mem.trim(u8, status, " \n"), "connected")) {
++            const n = @min(e.name.len, connected.len - 1);
++            @memcpy(connected[0..n], e.name[0..n]);
++            connected[n] = 0;
++            return error.DisplayConnected;
++        }
++    }
++    return seen;
++}
++
++fn errno() c_int {
++    return std.c._errno().*;
++}
++
++/// A dma-buf of the reservation imported into CUDA: `ptr` is device memory of `len` bytes.
++pub const Span = struct {
++    d: *const cuda.Driver,
++    ext: abi.ExternalMemory,
++    ptr: abi.DevicePtr,
++    len: usize,
++
++    /// At least `want` bytes of the reservation from `card`, imported into the current context.
++    pub fn open(d: *const cuda.Driver, card: [*:0]const u8, want: usize) !Span {
++        const len = rounded(want);
++        const fd = std.c.open(card, .{ .ACCMODE = .RDWR, .CLOEXEC = true });
++        if (fd < 0) {
++            std.log.err("display reservation: open {s}: errno {d} (the container needs --device {s})", .{ card, errno(), card });
++            return error.NoDisplayCard;
++        }
++        // the GEM handle closes with the card; the dma-buf keeps the buffer
++        defer _ = std.c.close(fd);
++        var cd: CreateDumb = .{ .height = @intCast(len / dumb_row), .width = dumb_width, .bpp = dumb_bpp };
++        if (std.c.ioctl(fd, @bitCast(create_dumb), &cd) != 0) {
++            const e = errno();
++            std.log.err("display reservation: DRM_IOCTL_MODE_CREATE_DUMB of {d} MiB on {s}: errno {d}{s}", .{ len >> 20, card, e, if (e == @backingInt(linux.E.NOSYS) or e == @backingInt(linux.E.OPNOTSUPP)) " (nvidia-drm runs without modeset)" else if (e == @backingInt(linux.E.NOMEM)) " (the reservation has less room)" else "" });
++            return error.DisplayDumbBuffer;
++        }
++        if (cd.size < len) {
++            std.log.err("display reservation: a dumb buffer of {d} bytes, asked for {d}", .{ cd.size, len });
++            var dd: DestroyDumb = .{ .handle = cd.handle };
++            _ = std.c.ioctl(fd, @bitCast(destroy_dumb), &dd);
++            return error.DisplayTooSmall;
++        }
++        var ph: PrimeHandle = .{ .handle = cd.handle, .flags = @as(u32, @bitCast(linux.O{ .ACCMODE = .RDWR, .CLOEXEC = true })) };
++        if (std.c.ioctl(fd, @bitCast(prime_handle_to_fd), &ph) != 0 or ph.fd < 0) {
++            std.log.err("display reservation: DRM_IOCTL_PRIME_HANDLE_TO_FD on {s}: errno {d}", .{ card, errno() });
++            var dd: DestroyDumb = .{ .handle = cd.handle };
++            _ = std.c.ioctl(fd, @bitCast(destroy_dumb), &dd);
++            return error.DisplayExport;
++        }
++        // a dma-buf imported into CUDA stays the driver's to close (as an opaque fd would); closed here only if refused
++        var desc: abi.ExternalMemoryHandleDesc = .{ .type = abi.external_memory_handle_type_dmabuf_fd, .handle = .{ .fd = ph.fd }, .size = cd.size };
++        var ext: abi.ExternalMemory = null;
++        d.check(d.api.cuImportExternalMemory(&ext, &desc), "cuImportExternalMemory (the display reservation's dma-buf)") catch |err| {
++            _ = std.c.close(ph.fd);
++            return err;
++        };
++        errdefer _ = d.api.cuDestroyExternalMemory(ext);
++        const bd: abi.ExternalMemoryBufferDesc = .{ .size = cd.size };
++        var ptr: abi.DevicePtr = 0;
++        try d.check(d.api.cuExternalMemoryGetMappedBuffer(&ptr, ext, &bd), "cuExternalMemoryGetMappedBuffer");
++        return .{ .d = d, .ext = ext, .ptr = ptr, .len = @intCast(cd.size) };
++    }
++
++    pub fn close(s: *Span) void {
++        _ = s.d.api.cuMemFree_v2(s.ptr);
++        _ = s.d.api.cuDestroyExternalMemory(s.ext);
++        s.* = undefined;
++    }
++};
++
++/// The buffer at `ptr` out of the weights' list (not freed), or null.
++pub fn takeBuffer(w: *weights.Weights, ptr: u64) ?cuda.DeviceBuffer {
++    for (w.buffers.items, 0..) |b, i| if (b.ptr == ptr) return w.buffers.swapRemove(i);
++    return null;
++}
++
++/// The weights' names of the bytes at `from` now name `to`.
++pub fn retarget(w: *weights.Weights, from: u64, to: u64) usize {
++    var n: usize = 0;
++    for (w.named.items) |*x| if (x.ptr == from) {
++        x.ptr = to;
++        n += 1;
++    };
++    return n;
++}
++
++/// Device bytes [a, a + len) equal [b, b + len), read back in pieces.
++fn sameBytes(d: *const cuda.Driver, a: abi.DevicePtr, b: abi.DevicePtr, len: usize) !void {
++    const piece: usize = 64 << 20;
++    const pa = std.heap.page_allocator;
++    const x = try pa.alloc(u8, @min(piece, len));
++    defer pa.free(x);
++    const y = try pa.alloc(u8, @min(piece, len));
++    defer pa.free(y);
++    var at: usize = 0;
++    while (at < len) : (at += piece) {
++        const n = @min(piece, len - at);
++        try d.check(d.api.cuMemcpyDtoH_v2(x.ptr, a + at, n), "cuMemcpyDtoH (the display reservation's table)");
++        try d.check(d.api.cuMemcpyDtoH_v2(y.ptr, b + at, n), "cuMemcpyDtoH (the table)");
++        if (!std.mem.eql(u8, x[0..n], y[0..n])) {
++            std.log.err("display reservation: the table's copy differs within bytes {d}..{d}", .{ at, at + n });
++            return error.DisplayCopyMismatch;
++        }
++    }
++}
++
++/// TF_DS_DISPLAY_EMBED=1: the embedding table into the display reservation, its ordinary buffer freed. Returns the span
++/// (the model closes it after its weights).
++pub fn moveEmbed(gpa: std.mem.Allocator, io: Io, d: *const cuda.Driver, w: *weights.Weights) !Span {
++    const card: [*:0]const u8 = if (std.c.getenv("TF_DS_DISPLAY_CARD")) |v| v else "/dev/dri/card0";
++    const card_name = std.fs.path.basename(std.mem.span(card));
++    var drm = Io.Dir.cwd().openDir(io, "/sys/class/drm", .{ .iterate = true }) catch |err| {
++        std.log.err("display reservation: /sys/class/drm: {t}", .{err});
++        return error.NoDisplayCard;
++    };
++    defer drm.close(io);
++    var shown: [64]u8 = @splat(0);
++    const connectors = headless(gpa, io, drm, card_name, &shown) catch |err| {
++        if (err == error.DisplayConnected) std.log.err("display reservation: {s} has a display connected; the reservation is its screen's", .{std.mem.sliceTo(&shown, 0)});
++        return err;
++    };
++    var len: usize = 0;
++    for (w.buffers.items) |b| if (b.ptr == w.embed) {
++        len = b.len;
++    };
++    if (len == 0) return error.NoEmbedBuffer;
++    var span = try Span.open(d, card, len);
++    errdefer span.close();
++    try d.check(d.api.cuMemcpyDtoD_v2(span.ptr, w.embed, len), "cuMemcpyDtoD (the table into the display reservation)");
++    try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize");
++    try sameBytes(d, span.ptr, w.embed, len);
++    const from = w.embed;
++    var old = takeBuffer(w, from) orelse return error.NoEmbedBuffer;
++    _ = retarget(w, from, span.ptr);
++    w.embed = span.ptr;
++    old.free();
++    std.log.info("display reservation (zig/patches/0056): embed.weight's {d:.1} MiB there ({d:.1} MiB span on {s}, {d} connectors, none connected), out of ordinary device memory", .{ @as(f64, @floatFromInt(len)) / (1 << 20), @as(f64, @floatFromInt(span.len)) / (1 << 20), std.mem.span(card), connectors });
++    return span;
++}
++
++test "the dumb buffer and prime ioctls are the kernel's numbers, and a table rounds to whole granules" {
++    try std.testing.expectEqual(@as(u32, 0xC02064B2), create_dumb);
++    try std.testing.expectEqual(@as(u32, 0xC00C642D), prime_handle_to_fd);
++    const embed: usize = 129280 * 5120 * 2;
++    try std.testing.expectEqual(@as(usize, 1325400064), rounded(embed));
++    try std.testing.expectEqual(@as(usize, 80896), rounded(embed) / dumb_row);
++    try std.testing.expectEqual(granule, rounded(1));
++    try std.testing.expectEqual(granule, rounded(granule));
++    // the dma-buf flags are O_RDWR | O_CLOEXEC as the kernel reads them
++    try std.testing.expectEqual(@as(u32, 0o2 | 0o2000000), @as(u32, @bitCast(linux.O{ .ACCMODE = .RDWR, .CLOEXEC = true })));
++}
++
++test "TF_DS_DISPLAY_EMBED: unset, empty or 0 off, 1 on, anything else refused" {
++    try std.testing.expect(!try parseSwitch(null));
++    try std.testing.expect(!try parseSwitch(""));
++    try std.testing.expect(!try parseSwitch("0"));
++    try std.testing.expect(try parseSwitch("1"));
++    for ([_][]const u8{ "2", "yes", "on", " 1", "true" }) |v| try std.testing.expectError(error.BadDisplayEmbed, parseSwitch(v));
++}
++
++test "a connected display keeps the reservation; disconnected, statusless or other cards' connectors do not" {
++    const io = std.testing.io;
++    const gpa = std.testing.allocator;
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    for ([_][]const u8{ "card0-HDMI-A-1", "card0-Unknown-1", "card0-Unknown-2", "card1-DP-1", "card0", "renderD128", "card0-Writeback-1" }) |name|
++        try tmp.dir.createDirPath(io, name);
++    try tmp.dir.writeFile(io, .{ .sub_path = "card0-HDMI-A-1/status", .data = "disconnected\n" });
++    try tmp.dir.writeFile(io, .{ .sub_path = "card0-Unknown-1/status", .data = "disconnected\n" });
++    try tmp.dir.writeFile(io, .{ .sub_path = "card0-Unknown-2/status", .data = "unknown\n" });
++    try tmp.dir.writeFile(io, .{ .sub_path = "card1-DP-1/status", .data = "connected\n" }); // another card's screen
++    var shown: [64]u8 = @splat(0);
++    try std.testing.expectEqual(@as(usize, 3), try headless(gpa, io, tmp.dir, "card0", &shown));
++    try tmp.dir.writeFile(io, .{ .sub_path = "card0-Unknown-1/status", .data = "connected\n" });
++    try std.testing.expectError(error.DisplayConnected, headless(gpa, io, tmp.dir, "card0", &shown));
++    try std.testing.expectEqualStrings("card0-Unknown-1", std.mem.sliceTo(&shown, 0));
++    try std.testing.expectError(error.DisplayConnected, headless(gpa, io, tmp.dir, "card1", &shown));
++    try std.testing.expectEqualStrings("card1-DP-1", std.mem.sliceTo(&shown, 0));
++    try std.testing.expectEqual(@as(usize, 0), try headless(gpa, io, tmp.dir, "card2", &shown));
++}
++
++test "the table's buffer leaves the weights' list whole and its names follow it; the other buffers stay" {
++    const gpa = std.testing.allocator;
++    var w: weights.Weights = .{ .gpa = gpa };
++    defer {
++        w.buffers.deinit(gpa);
++        for (w.named.items) |n| gpa.free(n.name);
++        w.named.deinit(gpa);
++    }
++    const fake: *const cuda.Driver = undefined; // never called: nothing here frees
++    for ([_]u64{ 0x1000, 0x2000, 0x3000 }, [_]usize{ 16, 1323827200, 32 }) |p, n| {
++        try w.buffers.append(gpa, .{ .d = fake, .ptr = p, .len = n });
++        try w.named.append(gpa, .{ .name = try gpa.dupe(u8, if (p == 0x2000) "embed.weight" else "other"), .ptr = p, .len = n });
++    }
++    w.embed = 0x2000;
++    const b = takeBuffer(&w, 0x2000).?;
++    try std.testing.expectEqual(@as(usize, 1323827200), b.len);
++    try std.testing.expectEqual(@as(usize, 2), w.buffers.items.len);
++    for (w.buffers.items) |x| try std.testing.expect(x.ptr != 0x2000);
++    try std.testing.expect(takeBuffer(&w, 0x2000) == null);
++    try std.testing.expectEqual(@as(usize, 1), retarget(&w, 0x2000, 0xdead0000));
++    for (w.named.items) |n| try std.testing.expectEqual(std.mem.eql(u8, n.name, "embed.weight"), n.ptr == 0xdead0000);
++}
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index c0be29d..6c83493 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -49,6 +49,7 @@ pub const sampling = @import("sampling.zig");
+ pub const model = @import("model.zig");
+ pub const lanes = @import("lanes.zig");
+ pub const pool = @import("pool.zig");
++pub const display = @import("display.zig");
+ 
+ test {
+     // every declaration of every file, so functions no test calls are still compiled
+@@ -97,4 +98,5 @@ test {
+     refAll(model);
+     refAll(lanes);
+     refAll(pool);
++    refAll(display);
+ }
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 2d6a597..7afb072 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -28,6 +28,7 @@ const link = @import("link.zig");
+ const ring2d = @import("ring2d.zig");
+ const rdma = @import("rdma.zig");
+ const pool_mod = @import("pool.zig");
++const display_mod = @import("display.zig");
+ const tri = @import("tri.zig");
+ const tri_markov = @import("tri_markov.zig");
+ 
+@@ -83,6 +84,7 @@ pub const Model = struct {
+     cache_file: std.Io.File,
+     ix: rank_cache.Index,
+     w: weights.Weights,
++    display: ?display_mod.Span = null, // zig/patches/0056: the embedding table's span in the display reservation
+     fan: prompt2d.Fan,
+     comm: comm_mod.Comm,
+     rdma_mod: ?cuda.Module = null, // the RDMA kernels (TP2's ring or world 4's rings)
+@@ -230,6 +232,7 @@ pub const Model = struct {
+         m.pgraphs = null;
+         m.two = null;
+         m.rdma_rings = null;
++        m.display = null;
+         const d = ctx.d;
+         const prefill_ep32 = try tri_markov.parsePrefillEp32(if (std.c.getenv("TF_DS_PF_EP32")) |v| std.mem.span(v) else null);
+         const prefill_aot: ?[]const u8 = if (std.c.getenv("TF_DS_PREFILL_AOT")) |v| std.mem.span(v) else null;
+@@ -252,6 +255,10 @@ pub const Model = struct {
+         m.w = try weights.load(gpa, d, .{ .cache = .{ .file = m.cache_file, .index = &m.ix, .io = io } }, c.*, sp, o.drafts);
+         errdefer m.w.deinit();
+         if (o.drafts and m.w.dspark == null) return error.NoDrafter;
++        // zig/patches/0056 (TF_DS_DISPLAY_EMBED=1): the embedding table into the display reservation, before any kernel
++        // or graph has its address (the prompt chunks', the rounds' and the drafter's embedInit read w.embed as they run)
++        if (try display_mod.wanted()) m.display = try display_mod.moveEmbed(gpa, io, d, &m.w);
++        errdefer if (m.display) |*s| s.close();
+ 
+         // the ranks' link and NCCL (rank 0 listens: rank 1 retries its connect while rank 0 loads)
+         m.fan = try prompt2d.Fan.open(io, o.master, o.port, o.rank, o.world);
+@@ -485,6 +492,7 @@ pub const Model = struct {
+         m.comm.deinit();
+         m.fan.close();
+         m.w.deinit();
++        if (m.display) |*s| s.close();
+         m.cache_file.close(m.io);
+         m.ix.deinit();
+         m.cache_dir.close(m.io);
