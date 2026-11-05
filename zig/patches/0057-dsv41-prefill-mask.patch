@@ -1,0 +1,156 @@
+From 667af413dfb6273c4dd24da9d0b47d446d23d672 Mon Sep 17 00:00:00 2001
+From: Local verification <local@localhost>
+Date: Thu, 29 Oct 2026 11:47:39 +0900
+Subject: [PATCH] dsv41: request-window-sized prefill mask only; retain
+ pool-sized decode and other scratch
+
+---
+ zig/src/families/dsv41/model.zig  |  4 +-
+ zig/src/families/dsv41/prompt.zig | 78 +++++++++++++++++++++++++++++--
+ 2 files changed, 77 insertions(+), 5 deletions(-)
+
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 9bc951d..7731d79 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -339,7 +339,9 @@ pub const Model = struct {
+         m.pair_reuse = if (std.c.getenv("TF_DS_PAIR_REUSE")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+         if (m.pair_reuse and !m.pair_on) return error.PairReuseNeedsPairs;
+         if (m.pair_on) prompt.pair_rows = 2 * chunk_rows;
+-        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, o.pool);
++        // The persistent prefill candidate mask follows the request window. Other scratch and all physical KV
++        // storage keep their pool-sized bounds; decode's speculative/forced tail is deliberately unchanged.
++        m.ch = try prompt.Chunk.initWithMaskLimit(&m.eng, &m.arena, chunk_rows, o.pool, win);
+         if (m.pair_on) {
+             m.ch2 = try prompt.partner(&m.ch, &m.eng, &m.arena);
+             m.pair = try prompt.PairMoe.init(&m.eng, &m.arena, chunk_rows);
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index b28f438..f5110e5 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -163,8 +163,19 @@ fn overlap(sp: Span, start: usize, n: usize) ?[2]usize {
+     return if (lo < hi) .{ lo - start, hi - start } else null;
+ }
+ 
++// The mask is indexed by a request-relative compressed position, never by its physical KV extent base.
++fn maskColumns(tokens: usize, ratio: usize, candidate_block: usize) usize {
++    const compressed = tokens / ratio;
++    return compressed / candidate_block + @intFromBool(compressed % candidate_block != 0);
++}
++
++fn prefillFits(tokens: usize, start: usize, rows: usize) bool {
++    return start <= tokens and rows <= tokens - start; // no overflow in start + rows
++}
++
+ pub const Chunk = struct {
+     cap: usize,
++    prefill_tokens: usize, // logical prefill end bound; unrelated to the physical KV extent's base
+     spans: []const Span = &.{}, // the prompt's image spans (absolute positions)
+     img_rows: u64 = 0, // bf16 [span tokens, D]: their rows
+     pick_vl: u64 = 0, // int32 [cap, slots]: the routing of span rows with the image bias, before it joins pick
+@@ -272,6 +283,13 @@ pub const Chunk = struct {
+     /// Every buffer for `cap` rows from `a`, the compressed layers' for chunks ending by position `tokens`; the scratch
+     /// the served build zeros (or fills with -1) is set the same.
+     pub fn init(e: *const Engine, a: *Arena, cap: usize, tokens: usize) !Chunk {
++        return initWithMaskLimit(e, a, cap, tokens, tokens);
++    }
++
++    /// Only the persistent candidate mask follows `mask_tokens` (the request window). Keep every other scratch
++    /// allocation, phase-arena maximum, KV cache and decode bucket on the previous `tokens` (pool) bound.
++    pub fn initWithMaskLimit(e: *const Engine, a: *Arena, cap: usize, tokens: usize, mask_tokens: usize) !Chunk {
++        if (mask_tokens == 0 or mask_tokens > tokens) return error.BadPrefillWindow;
+         const c = e.c;
+         const d = c.hidden;
+         const hc = c.hc;
+@@ -343,6 +361,7 @@ pub const Chunk = struct {
+         ch.spans = &.{};
+         ch.img_rows = 0;
+         ch.cap = cap;
++        ch.prefill_tokens = mask_tokens;
+         ch.n = 0;
+         ch.start = 0;
+         ch.pending = false;
+@@ -412,10 +431,11 @@ pub const Chunk = struct {
+             ch.cidxp = try a.take(cap * (c.index_topk + 16) * 8);
+             // the pool: only past candidate_blocks blocks, so a row block holds at most key_elems / 2048 rows there
+             const cb = c.candidate_block;
+-            ch.pool_ms = (ch.max_comp + cb - 1) / cb;
+-            if (ch.pool_ms > c.candidate_blocks) {
++            const previous_pool_ms = maskColumns(tokens, min_ratio, cb);
++            ch.pool_ms = maskColumns(mask_tokens, min_ratio, cb);
++            if (previous_pool_ms > c.candidate_blocks) {
+                 ch.pool = try a.take(cap * ch.pool_ms);
+-                ch.bmax = try phase.take(a, .attention, @max(16 * ch.pool_ms, key_elems / cb + cap) * 4);
++                ch.bmax = try phase.take(a, .attention, @max(16 * previous_pool_ms, key_elems / cb + cap) * 4);
+                 ch.pidx = try phase.take(a, .attention, cap * c.candidate_blocks * 8);
+             }
+             ch.every = try a.take(cap * 8);
+@@ -695,7 +715,7 @@ pub const Shared = struct { kv_layer: ?usize = null, kk: ?usize = null, pool: bo
+ /// row) and pre [n, hc] = (1, 0, 0, 0): embed_init, the bytes of forward()'s embedding rows expanded over the streams.
+ pub fn begin(e: *const Engine, ch: *Chunk, ids: []const i64, start: usize, host_pos: []i64) !void {
+     const n = ids.len;
+-    if (n > ch.cap or host_pos.len < n) return error.ChunkTooLong;
++    if (n > ch.cap or host_pos.len < n or !prefillFits(ch.prefill_tokens, start, n)) return error.ChunkTooLong;
+     ch.n = n;
+     ch.start = start;
+     ch.pending = false;
+@@ -706,6 +726,56 @@ pub fn begin(e: *const Engine, ch: *Chunk, ids: []const i64, start: usize, host_
+     try tri_basic.embedInit(e.t, e.w.embed, ch.ids, ch.h, ch.pre, n, e.c.hidden, e.c.hc);
+ }
+ 
++test "prefill mask: only 256 MiB per rank removed at pool 2M and window 1M" {
++    const chunk_rows = 2048;
++    const old = chunk_rows * maskColumns(2097152, 1, 8);
++    const new = chunk_rows * maskColumns(1048576, 1, 8);
++    try std.testing.expectEqual(@as(usize, 512 << 20), old);
++    try std.testing.expectEqual(@as(usize, 256 << 20), new);
++    try std.testing.expectEqual(@as(usize, 256 << 20), old - new);
++    try std.testing.expectEqual(@as(usize, 0), maskColumns(1, 2, 8));
++    try std.testing.expectEqual(@as(usize, 1), maskColumns(2, 2, 8));
++    try std.testing.expectEqual(@as(usize, 3), maskColumns(17, 1, 8));
++}
++
++test "prefill mask: every chunk and paired tail fits through exactly 1M, independent of physical placement" {
++    const window = 1048576;
++    const cap = 2048;
++    for ([_]usize{ 1, 2 }) |ratio| {
++        const columns = maskColumns(window, ratio, 8);
++        var start: usize = 0;
++        while (start < window) : (start += cap) {
++            const n = @min(cap, window - start);
++            try std.testing.expect(prefillFits(window, start, n));
++            try std.testing.expect(maskColumns(start + n, ratio, 8) <= columns);
++        }
++        // Two chunks at the end of a paired prefill, then a one-row tail after an odd boundary.
++        for ([_][2]usize{ .{ window - 4096, 2048 }, .{ window - 2048, 2048 }, .{ window - 1, 1 } }) |span| {
++            try std.testing.expect(prefillFits(window, span[0], span[1]));
++            try std.testing.expect(maskColumns(span[0] + span[1], ratio, 8) <= columns);
++        }
++    }
++    try std.testing.expect(prefillFits(window, window, 0));
++    try std.testing.expect(!prefillFits(window, window, 1));
++    try std.testing.expect(!prefillFits(window, window - 1, 2));
++    try std.testing.expect(!prefillFits(window, std.math.maxInt(usize), 2));
++    try std.testing.expect(!prefillFits(window, 1, std.math.maxInt(usize)));
++}
++
++test "prefill mask: out-of-bound begin refuses before any upload or host-state change" {
++    var ch: Chunk = undefined;
++    ch.cap = 2048;
++    ch.prefill_tokens = 1048576;
++    ch.n = 17;
++    ch.start = 23;
++    var e: Engine = undefined; // any CUDA access before the bounds check is a test failure
++    var pos: [1]i64 = .{-1};
++    try std.testing.expectError(error.ChunkTooLong, begin(&e, &ch, &.{7}, 1048576, &pos));
++    try std.testing.expectEqual(@as(usize, 17), ch.n);
++    try std.testing.expectEqual(@as(usize, 23), ch.start);
++    try std.testing.expectEqual(@as(i64, -1), pos[0]);
++}
++
+ /// merge_image_embeddings on the chunk: each span row's embedding (in every one of the hc streams) replaced by its
+ /// image row (the delimiters' learned rows and the aligner's), before the first layer.
+ pub fn embedSpans(e: *const Engine, ch: *Chunk) !void {
+-- 
+2.43.0
+
