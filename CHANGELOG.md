@@ -5,6 +5,24 @@
 This recipe's changes to Mia's AI Lab's at `31eea46`. Everything below this section is Mia's AI Lab's changelog; its
 issue and pull-request numbers are their repository's.
 
+- **The pair's local stack of 2026-10-31 .. 2026-11-06** (`zig/patches/0058`, `research/LOCAL-STACK-20261106.md`).
+  Every change was A/B-checked on the pair, with replies exact on a 88-92 request manifest:
+  - **Memory:** the decode indexer's scratch in row blocks, no longer pool-sized; one host copy of kept tokens; smaller
+    prepare scratch; rank 0's vision tower opened on the first picture and closed after 30 idle minutes (about 1.3 GiB
+    back while no picture is open).
+  - **Fixes:** `tool_choice: required` lost the template's blank lines and began with a stray token; a nested-id
+    `/v1/completions` crashed rank 0; a streamed think lost its tail; a stop inside a DSML block left markup in the
+    whole reply.
+  - **Recovery:** a broken pair (a failed RDMA ring, a closed follower link) exits 75, and a lost context (CUDA 709)
+    exits 70, so the service restarts. A killed worker now costs about 70 s.
+  - **/metrics:** cached prompt tokens, replies by finish reason, reasoning tokens, thinking-budget closes.
+  - **Opt-in:** `TF_DS_PAIR_UNDER_LOAD=1` pairs prompt chunks while other streams decode (a cold 32K prompt's TTFT
+    -3.7 %; that stream's largest gap went from 0.92 to 1.68 s). `TF_DS_STALL_EXIT_S` exits a stalled lane host.
+- **Defaults `TF_DS_GRAPH_CAP=64` and `TF_DS_ENGRAM_CACHE_MB=128`** (were 128 and 256): exact. Rank 0's least
+  MemAvailable in the bench went from 6537 to 7102 MiB, with decode and long-prompt TTFT within noise.
+- **Each rank's container log rotates** (`LOG_MAX_SIZE` 100m, `LOG_MAX_FILE` 3).
+- **The prefill mask follows the request window** (`zig/patches/0057`): 256 MiB less a rank at POOL 2M.
+
 - **The indexer's top-k sooner** (`zig/patches/0034`): the decode rounds' top-k of 32,768 candidate keys 89.7 -> 16.3 us
   and of the 610 tile maxima 23.9 -> 4.9 us (a row in slices over many blocks, keys in registers); decode at 78K tokens
   42.13 -> 41.86 ms a round (+0.6 %), the same bits; short contexts and prefill unchanged.

@@ -167,7 +167,7 @@ export NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-8}"
 # A round runs as CUDA graphs, one per (rows, context bucket, stretch), each holding ~3.6 MiB of the driver's memory; they
 # pile up with every new shape (1.6 GiB after a day's mixed load). 128 at most, the least recently replayed destroyed first
 # (zig/patches/0024; 0: no cap): a recapture costs a few ms, the replies are the same.
-export TF_DS_GRAPH_CAP="${TF_DS_GRAPH_CAP:-128}"
+export TF_DS_GRAPH_CAP="${TF_DS_GRAPH_CAP:-64}"   # 2026-11-05: 64 (was 128): exact, about 0.25 GiB a rank back, decode within noise (research/LOCAL-STACK-20261106.md)
 # A long prompt's chunks before the decoder's replay run only the encoder layers: two of them side by side, their routed
 # experts in one call (zig/patches/0025; 0: one chunk at a time). Prefill 5-14 % faster (more on longer prompts) for
 # ~1.0 GiB more arena a Spark; the replies are the same.
@@ -183,7 +183,10 @@ export TF_DS_EXPERTS_CUBIN="${TF_DS_EXPERTS_CUBIN-/opt/tensorfold/kit-overlay/ex
 # (TF_DS_ENGRAM_DEDUP, 0: off), and the rows read last kept in host memory (TF_DS_ENGRAM_CACHE_MB a Spark, 0: off),
 # so a chunk reads from the NVMe only the rows neither holds. The same bytes either way; ~0.3 GiB more a Spark.
 export TF_DS_ENGRAM_DEDUP="${TF_DS_ENGRAM_DEDUP:-1}"
-export TF_DS_ENGRAM_CACHE_MB="${TF_DS_ENGRAM_CACHE_MB:-256}"
+export TF_DS_ENGRAM_CACHE_MB="${TF_DS_ENGRAM_CACHE_MB:-128}"   # 2026-11-05: 128 (was 256): exact, long-prompt TTFT within noise
+# zig/patches/0058: 1 pairs prompt chunks (TF_DS_PAIR) even while other streams' rounds wait: a cold 32K prompt beside one
+# decoding stream starts 3.7 % sooner and that stream's largest gap during it doubles (0.92 -> 1.68 s); exact. 0: off.
+export TF_DS_PAIR_UNDER_LOAD="${TF_DS_PAIR_UNDER_LOAD:-0}"
 # The engine's settings as BertholomusAI's served two-node launch has them: CUDA graphs, the mixes' side stream, the
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
 # NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).
