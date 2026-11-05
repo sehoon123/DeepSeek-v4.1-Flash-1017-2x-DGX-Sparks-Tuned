@@ -243,6 +243,10 @@ fi
 STATE_DIR="${STATE_DIR:-$HOME/.local/state/dsv41-tensorfold}"   # locks and the prepared marker
 LOG_DIR="${LOG_DIR:-$HOME/.cache/dsv41-tensorfold/logs}"
 LOG_KEEP="${LOG_KEEP:-10}"
+# Each rank's container log (docker's json-file driver) rotates once it reaches LOG_MAX_SIZE, keeping LOG_MAX_FILE files: the
+# engine writes a line for every response (MiaAI-Lab upstream, issue #49). LOG_MAX_SIZE= (empty) leaves the daemon's settings.
+LOG_MAX_SIZE="${LOG_MAX_SIZE-100m}"
+LOG_MAX_FILE="${LOG_MAX_FILE:-3}"
 HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 # Rank 0 can read the checkpoint over NFS too, from HEAD_NFS_SERVER (an address of the NFS server that reaches this Spark),
 # through a docker volume HEAD_NFS_VOLUME that start.sh creates here (the docker daemon mounts it: no root, and it survives a
