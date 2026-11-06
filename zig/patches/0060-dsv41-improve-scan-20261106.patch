@@ -1,0 +1,359 @@
+Subject: [PATCH] the 2026-11-06 improve-scan's exact units on 2 x DGX Spark (both ranks)
+
+On top of 0059 (the bundle-9 tree), three changes a read-only scan of the served engine found (bundle 10): the
+Responses route grows a streamed item's text and arguments in place instead of copying the whole text per delta (a think
+at the budget held about 0.66 GB a stream); a stream whose copy ahead holds asks the drafter for no drafts (the next
+window took the copy and dropped them); the follower ends the pair when a kept state's restore or a prompt's image rows
+fail on it (rank 0 went on with a different state, wrong tokens and no error). CPU-tested with red copies, source-
+reviewed, and A/B-checked on the pair: 92/92 replies exact against bundle 9, no decode regression
+(research/LOCAL-STACK-20261106.md, "Bundle 10"). Generated with `git diff --binary` in a checkout of the 0059 tree;
+`git apply` of it gives the served source file for file (1286 files, sha256-compared).
+
+diff --git a/zig/src/core/lanes/copy_batch_test.zig b/zig/src/core/lanes/copy_batch_test.zig
+index d3bc326..aa5536c 100644
+--- a/zig/src/core/lanes/copy_batch_test.zig
++++ b/zig/src/core/lanes/copy_batch_test.zig
+@@ -8,14 +8,23 @@ const proposer = @import("proposer.zig");
+ const Sampling = @import("sampling.zig").Sampling;
+ const gpa = std.testing.allocator;
+ 
+-const Mode = enum { copies, transition, mixed, rejected, budget, no_copies, single_copy_end };
++// spans, wrong_spans (bundle 10): copies only over a span of the reply after its first rounds; wrong_spans' copies for
++// stream i are wrong at token i (stream 0's at the first)
++const Mode = enum { copies, transition, mixed, rejected, budget, no_copies, single_copy_end, spans, wrong_spans };
++
++const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
++
++fn samplingOf(i: usize, sampled: bool) ?Sampling {
++    return if (sampled) .{ .seed = 17 + i, .temperature = 1.0 } else null;
++}
+ 
+ /// A deterministic proposer, including deliberate misses and an abrupt end of copying. Its guesses do not bypass
+ /// the fake target, whose outputs depend on the full history and keyed position (including sampled requests).
+ const Copies = struct {
+     enabled: bool = true,
++    start: usize = 0,
+     stop: usize = std.math.maxInt(usize),
+-    reject: bool = false,
++    wrong_at: usize = std.math.maxInt(usize),
+     sampling: ?Sampling = null,
+     out: [32]u32 = undefined,
+ 
+@@ -27,14 +36,14 @@ const Copies = struct {
+     }
+     fn propose(ptr: *anyopaque, context: []const u32, max: i64) ![]const u32 {
+         const c: *Copies = @ptrCast(@alignCast(ptr));
+-        if (!c.enabled or context.len >= c.stop or max <= 0) return &.{};
++        if (!c.enabled or context.len < c.start or context.len >= c.stop or max <= 0) return &.{};
+         var h: std.ArrayList(u32) = .empty;
+         defer h.deinit(gpa);
+         try h.appendSlice(gpa, context);
+         const n: usize = @intCast(@min(max, c.out.len));
+         for (c.out[0..n], 0..) |*t, i| {
+             t.* = fake.next(h.items, c.sampling, h.items.len);
+-            if (c.reject and i == 0) t.* = (t.* + 1) % fake.vocab;
++            if (i == c.wrong_at) t.* = (t.* + 1) % fake.vocab;
+             try h.append(gpa, t.*);
+         }
+         return c.out[0..n];
+@@ -46,6 +55,8 @@ const Result = struct {
+     reasons: [4]sm.Reason = undefined,
+     calls: usize = 0,
+     drafted: usize = 0,
++    copies: usize = 0, // (bundle 10) copy windows, and those verified while the head held drafts for their stream
++    dropped: usize = 0,
+     fn deinit(r: Result) void {
+         for (r.tokens) |t| gpa.free(t);
+     }
+@@ -82,13 +93,14 @@ fn run(n: usize, mode: Mode, sampled: bool, skip: bool, master: bool) !Result {
+     var streams: [4]sm.Stream = undefined;
+     var made: usize = 0;
+     defer for (streams[0..made]) |*s| s.deinit(gpa);
+-    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
++    const span = mode == .spans or mode == .wrong_spans;
+     for (0..n) |i| {
+-        const sampling: ?Sampling = if (sampled) .{ .seed = 17 + i, .temperature = 1.0 } else null;
++        const sampling = samplingOf(i, sampled);
+         copies[i] = .{
+             .enabled = mode != .no_copies and (mode != .mixed or i % 2 == 0),
+-            .stop = if (mode == .transition) prompt.len + 25 + i else if (mode == .single_copy_end) prompt.len + 7 else std.math.maxInt(usize),
+-            .reject = mode == .rejected,
++            .start = if (span) prompt.len + 6 + 3 * i else 0,
++            .stop = if (mode == .transition) prompt.len + 25 + i else if (mode == .single_copy_end) prompt.len + 7 else if (span) prompt.len + 40 + 3 * i else std.math.maxInt(usize),
++            .wrong_at = if (mode == .rejected) 0 else if (mode == .wrong_spans) i else std.math.maxInt(usize),
+             .sampling = sampling,
+         };
+         streams[i] = try sm.Stream.init(gpa, .{
+@@ -110,7 +122,7 @@ fn run(n: usize, mode: Mode, sampled: bool, skip: bool, master: bool) !Result {
+     var steps: usize = 0;
+     while (e.activeCount() > 0 and steps < 512) : (steps += 1) try e.step();
+     try std.testing.expectEqual(@as(usize, 0), e.activeCount());
+-    var result: Result = .{ .calls = target.draft_calls, .drafted = target.drafted_streams };
++    var result: Result = .{ .calls = target.draft_calls, .drafted = target.drafted_streams, .copies = target.host_windows, .dropped = target.held_dropped };
+     errdefer result.deinit();
+     for (streams[0..n], 0..) |*s, i| {
+         result.tokens[i] = try gpa.dupe(u32, s.emitted());
+@@ -137,8 +149,10 @@ test "batch copy skip preserves tokens/finishes through misses, cuts, mixed stre
+             if (mode == .rejected or mode == .no_copies or mode == .single_copy_end) {
+                 try std.testing.expectEqual(baseline.drafted, candidate.drafted);
+                 try std.testing.expectEqual(baseline.calls, candidate.calls);
+-            } else {
+-                try std.testing.expect(candidate.drafted < baseline.drafted);
++            } else if (mode == .copies) {
++                // (bundle 10) neither asks drafts for a copy ahead; the skip leaves those streams out of the draft call
++                try std.testing.expectEqual(baseline.drafted, candidate.drafted);
++                try std.testing.expect(candidate.calls < baseline.calls);
+             }
+         }
+     };
+@@ -153,3 +167,22 @@ test "batch skip is opt-in and requires the existing copy-skip master switch" {
+     try std.testing.expectEqual(baseline.drafted, disabled.drafted);
+     try std.testing.expectEqual(baseline.calls, disabled.calls);
+ }
++
++test "bundle10: a stream with a copy ahead asks the head for no drafts, and its tokens stay the target's" {
++    for ([_]Mode{ .spans, .wrong_spans }) |mode| for ([_]usize{ 1, 2, 4 }) |n| for ([_]bool{ false, true }) |sampled| for ([_]bool{ false, true }) |skip| {
++        const r = try run(n, mode, sampled, skip, skip);
++        defer r.deinit();
++        try std.testing.expect(r.copies > 0 and r.drafted > n);
++        try std.testing.expectEqual(@as(usize, 0), r.dropped);
++        for (0..n) |i| {
++            var history: std.ArrayList(u32) = .empty;
++            defer history.deinit(gpa);
++            try history.appendSlice(gpa, &prompt);
++            for (r.tokens[i]) |t| {
++                try std.testing.expectEqual(fake.next(history.items, samplingOf(i, sampled), history.items.len), t);
++                try history.append(gpa, t);
++            }
++            try std.testing.expectEqual(@as(usize, 56 + i * 11), r.tokens[i].len);
++        }
++    };
++}
+diff --git a/zig/src/core/lanes/depth.zig b/zig/src/core/lanes/depth.zig
+index 015136a..e3d72cc 100644
+--- a/zig/src/core/lanes/depth.zig
++++ b/zig/src/core/lanes/depth.zig
+@@ -41,6 +41,7 @@ pub const Who = struct {
+ pub const Probe = struct {
+     ptr: *anyopaque,
+     copy: *const fn (ptr: *anyopaque, who: *const Who) bool,
++    holds: bool, // (bundle 10) a copy ahead is surely the stream's next window, whose plan drops held drafts
+ };
+ 
+ pub const Overhead = struct { streams: u32, ms: f64 };
+@@ -175,14 +176,15 @@ pub const Rule = struct {
+         return true;
+     }
+ 
+-    /// Python `_head_depth`: the next round's head drafts for a stream (0 when forced, 1 with a copy ahead).
++    /// Python `_head_depth`: the next round's head drafts for a stream (0 when forced, 1 with a copy ahead; bundle 10: 0
++    /// when that copy holds, as its window would drop the drafts and their pass would run for nothing).
+     pub fn headDepth(r: *Rule, who: *const Who, budget: ?i64, probe: Probe) !i64 {
+         const d: i64 = if (who.finished) 0 else if (budget) |b| b else if (r.node_probabilities)
+             @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1))
+         else
+             try r.depth(who.*);
+         if (who.forced) return 0;
+-        if (d != 0 and probe.copy(probe.ptr, who)) return 1;
++        if (d != 0 and probe.copy(probe.ptr, who)) return if (probe.holds) 0 else 1;
+         return d;
+     }
+ 
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index 40a5749..5d1a407 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -32,6 +32,8 @@ pub const Fake = struct {
+     rounds: u64 = 0,
+     draft_calls: usize = 0, // test instrumentation: calls and nonzero-depth streams actually drafted
+     drafted_streams: usize = 0,
++    host_windows: usize = 0, // (bundle 10) windows of host tokens (copies, forced), and those verified while drafts were held
++    held_dropped: usize = 0,
+     cycle_after: ?usize = null,
+     probe_prompt: usize = 0,
+     pattern: []const u32 = &.{ 11, 12, 13 },
+@@ -215,6 +217,10 @@ pub const Fake = struct {
+         x.rounds += 1;
+         for (windows, out) |w, o| {
+             const l = x.lane(w.stream);
++            if (w.held == 0 and w.tokens.len > 0) {
++                x.host_windows += 1;
++                x.held_dropped += @intFromBool(l.held.items.len > 0);
++            }
+             l.base = l.history.items.len;
+             l.rows.clearRetainingCapacity();
+             try l.rows.append(x.gpa, w.pending);
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index eb82f2f..987b5ad 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -161,7 +161,12 @@ pub fn copyAhead(ptr: *anyopaque, w: *const depth.Who) bool {
+ }
+ 
+ pub fn probe(e: *Engine) depth.Probe {
+-    return .{ .ptr = e, .copy = copyAhead };
++    // (bundle 10) a copy ahead is the stream's next copyProposal too, whatever the live streams by then: only copy_multi
++    // and its share (batch_rows / live streams - 1) can make that width less than the two tokens a copy takes, and a
++    // backend of shared rounds holds batch_streams live streams at most (dsv41: its pool slots)
++    const c = e.cfg;
++    const holds = c.copy_multi == 0 or (c.copy_multi >= 2 and c.family_streams and c.batch_rows / c.batch_streams >= 3);
++    return .{ .ptr = e, .copy = copyAhead, .holds = holds };
+ }
+ 
+ pub fn who(s: *Stream) depth.Who {
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 680fa19..3cacc0b 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -1462,6 +1462,14 @@ fn survivalsBiased(conf: []const f32, out: []f64, bias: f64) void {
+     }
+ }
+ 
++/// (bundle 10) A primitive that sets this rank's state with no collective in it (a kept state's restore, a prompt's
++/// image rows) failed here. Rank 0's own may have succeeded, and nothing makes it wait on this rank's: the pair would go
++/// on with different states, wrong tokens and no error. End the follower, as on a broken ring (rank 0 exits 75).
++fn diverged(what: []const u8, err: anyerror) void {
++    std.debug.print("{{\"follow_diverged\": \"{s}\", \"error\": \"{s}\"}}\n", .{ what, @errorName(err) });
++    broken("rank 1 failed to set its state", what);
++}
++
+ /// Image rows past this many bytes are given back after their prompt (host and device; bug hunt K9-M4).
+ const big_image_rows = model.big_image_rows;
+ 
+@@ -1611,7 +1619,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 if (off != img_rows.items.len or off + piece.len > total or piece.len == 0) return error.BadFrame;
+                 try img_rows.appendSlice(gpa, piece);
+                 if (img_rows.items.len == total) {
+-                    m.setImages(spans.items, img_rows.items) catch |err| refused(m, err);
++                    m.setImages(spans.items, img_rows.items) catch |err| diverged("its image rows", err);
+                     // (bug hunt K9-M4) a large prompt's rows are not kept for the life of the process
+                     if (img_rows.capacity > big_image_rows) img_rows.clearAndFree(gpa) else img_rows.clearRetainingCapacity();
+                 }
+@@ -1636,8 +1644,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 const to: usize = @intCast(try r.int(u64));
+                 const at: usize = @intCast(try r.int(u64));
+                 const b = kept.get(id) orelse return error.UnknownSnapshot; // rank 0 restores only states both ranks keep
+-                if (from != to) m.copyExtent(from, to, at) catch |err| refused(m, err);
+-                m.snapCopy(s, b.ptr, false) catch |err| refused(m, err);
++                if (from != to) m.copyExtent(from, to, at) catch |err| diverged("a kept state's restore", err);
++                m.snapCopy(s, b.ptr, false) catch |err| diverged("a kept state's restore", err);
+             },
+             .snap_drop => {
+                 const id = try r.int(u64);
+@@ -2146,3 +2154,20 @@ test "bug hunt: a follower's refused primitive on its own broken ring ends the f
+     refused(&m, error.Example);
+     try std.testing.expect(Seen.what == null);
+ }
++
++test "bundle10: a follower whose restore or image rows failed ends the pair instead of going on apart" {
++    const Seen = struct {
++        var what: ?[]const u8 = null;
++        var why: ?[]const u8 = null;
++        fn saw(w: []const u8, y: []const u8) void {
++            what = w;
++            why = y;
++        }
++    };
++    const was = broken;
++    defer broken = was;
++    broken = Seen.saw;
++    diverged("a kept state's restore", error.Example);
++    try std.testing.expectEqualStrings("rank 1 failed to set its state", Seen.what.?);
++    try std.testing.expectEqualStrings("a kept state's restore", Seen.why.?);
++}
+diff --git a/zig/src/server/responses.zig b/zig/src/server/responses.zig
+index 77b90af..b8fa4da 100644
+--- a/zig/src/server/responses.zig
++++ b/zig/src/server/responses.zig
+@@ -246,6 +246,9 @@ const Reply = struct {
+     items: std.ArrayList(*json.Object) = .empty,
+     current: ?*json.Object = null,
+     calls: std.AutoArrayHashMapUnmanaged(i64, *json.Object) = .empty,
++    /// (bundle 10) each item's text or arguments so far, grown in place: a fresh copy of the whole text per delta held
++    /// the square of its length until the reply ended (about 0.66 GB for a think run to the budget)
++    grown: std.AutoHashMapUnmanaged(*json.Object, std.ArrayList(u8)) = .empty,
+     seq: u64 = 0,
+     final: ?Value = null,
+ 
+@@ -352,7 +355,7 @@ const Reply = struct {
+         const reuse = if (r.current) |c| std.mem.eql(u8, c.get("type").?.string, kind) else false;
+         const item = if (reuse) r.current.? else try r.open(kind, "", "");
+         const part = item.get("content").?.array[0].object;
+-        try r.put(part, "text", .{ .string = std.mem.concat(r.a, u8, &.{ part.get("text").?.string, text }) catch return error.Closed });
++        try r.put(part, "text", .{ .string = try r.append(item, text) });
+         const where_id = item.get("id").?;
+         const where_index = try r.int(r.index(item));
+         if (std.mem.eql(u8, kind, "message")) {
+@@ -360,6 +363,15 @@ const Reply = struct {
+         } else try r.event("response.reasoning_text.delta", &.{ .{ "item_id", where_id }, .{ "output_index", where_index }, .{ "content_index", .{ .int = "0" } }, .{ "delta", .{ .string = text } } });
+     }
+ 
++    /// `item`'s text (or arguments) with `piece` appended, in its buffer: the earlier slices stay valid (the request's
++    /// arena keeps them), and a buffer that grows by doubling copies each byte a few times instead of once a delta.
++    fn append(r: *Reply, item: *json.Object, piece: []const u8) E![]const u8 {
++        const got = r.grown.getOrPut(r.a, item) catch return error.Closed;
++        if (!got.found_existing) got.value_ptr.* = .empty;
++        got.value_ptr.appendSlice(r.a, piece) catch return error.Closed;
++        return got.value_ptr.items;
++    }
++
+     fn textOf(v: ?Value) ?[]const u8 {
+         const x = v orelse return null;
+         return if (x == .string and x.string.len > 0) x.string else null;
+@@ -383,7 +395,7 @@ const Reply = struct {
+                 break :blk made;
+             };
+             if (textOf(function.get("arguments"))) |args| {
+-                try r.put(item, "arguments", .{ .string = std.mem.concat(r.a, u8, &.{ item.get("arguments").?.string, args }) catch return error.Closed });
++                try r.put(item, "arguments", .{ .string = try r.append(item, args) });
+                 try r.event("response.function_call_arguments.delta", &.{ .{ "item_id", item.get("id").? }, .{ "output_index", try r.int(r.index(item)) }, .{ "delta", .{ .string = args } } });
+             }
+         }
+@@ -492,3 +504,22 @@ const Reply = struct {
+         return r.finish(if (reason != null and reason.? == .string) reason.?.string else null, data.get("usage"), data.get("tensorfold"));
+     }
+ };
++
++test "bundle10: a long streamed reply's text grows in place, not a copy of it per delta" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    // (the writes need only the allocator and the items; a reply that does not stream sends no events)
++    var r: Reply = .{ .srv = undefined, .a = arena.allocator(), .conn = undefined, .base = undefined, .streaming = false, .keep = false, .added = &.{}, .cx = undefined };
++    const pieces = 4000;
++    for (0..pieces) |_| try r.write("reasoning", "abcd");
++    for (0..pieces) |_| try r.write("message", "efgh");
++    try std.testing.expectEqual(@as(usize, 2), r.items.items.len);
++    const thought = r.items.items[0].get("content").?.array[0].object.get("text").?.string;
++    const said = r.items.items[1].get("content").?.array[0].object.get("text").?.string;
++    try std.testing.expectEqual(@as(usize, 4 * pieces), thought.len);
++    try std.testing.expectEqual(@as(usize, 4 * pieces), said.len);
++    try std.testing.expectEqualStrings("abcdabcd", thought[0..8]);
++    try std.testing.expectEqualStrings("efghefgh", said[said.len - 8 ..]);
++    // 32 KB of text: a copy per delta allocated about 64 MB; grown in place, well under 1 MiB
++    try std.testing.expect(arena.queryCapacity() < 1 << 20);
++}
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index e245a7a..dccae3f 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -22,6 +22,7 @@ test {
+     _ = @import("reply_text.zig");
+     _ = @import("tool_parse.zig");
+     _ = @import("tool_stream.zig");
++    _ = @import("responses.zig"); // (bundle 10: its tests also run when filtered)
+     _ = @import("tool_params.zig");
+     _ = @import("pyrepr.zig");
+     _ = @import("metrics.zig");
+diff --git a/zig/tests/lanes_units.zig b/zig/tests/lanes_units.zig
+index a051746..0e7ae68 100644
+--- a/zig/tests/lanes_units.zig
++++ b/zig/tests/lanes_units.zig
+@@ -80,7 +80,7 @@ fn depthCase(a: std.mem.Allocator, case: fx.Value) !void {
+     const stubs = try a.alloc(Stub, ids.len);
+     for (stubs) |*s| s.* = .{};
+     defer for (stubs) |*s| if (s.state) |*st| st.deinit(gpa);
+-    const probe: depth.Probe = .{ .ptr = undefined, .copy = Stub.copyAhead };
++    const probe: depth.Probe = .{ .ptr = undefined, .copy = Stub.copyAhead, .holds = false }; // (the recorded Python vectors: 1 draft)
+     const index = struct {
+         fn of(names: []const fx.Value, name: []const u8) usize {
+             for (names, 0..) |n, i| if (std.mem.eql(u8, fx.str(n), name)) return i;

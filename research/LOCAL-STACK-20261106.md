@@ -120,6 +120,27 @@ failing by assertion (or a panic) for each testable one.
 - **The recipe's scripts:** `start.sh` turns an unasked clean exit of rank 0 into exit 75, so `Restart=on-failure`
   restarts it, and `stop.sh` marks a requested stop. `TF_DS_STALL_EXIT_S=300` is served as a drop-in.
 
+**Bundle 10: the improve-scan's exact units (`zig/patches/0060-dsv41-improve-scan-20261106.patch`, both ranks)**
+
+Six read-only scouts (decode path, speculation, prompt cache and TTFT, memory, stability and deploys, the API) looked for
+what was left; most levers were under 1 % or changed tokens. Three exact ones went in:
+- **Responses streams:** an item's text and arguments grow in place. Before, every delta copied the whole text, so a
+  think at the 28,672-token budget held about 0.66 GB a stream until the reply ended (four streams: about 2.6 GB).
+- **No drafts for a copy ahead:** when the copy proposer has a copy the next window surely takes, the drafter is asked
+  for 0 drafts, so its pass (about 3 ms) is skipped or the stream leaves the batched pass. The old draft was dropped by
+  that window. With `TF_DS_COPY_MULTI=1`, or more live streams than the round's rows can give two each, the draft can
+  be used, and the old behaviour stays.
+- **Follower divergence:** a kept state's restore or a prompt's image rows that fail on rank 1 end the pair (exit 75).
+  Before, rank 1 logged and went on with a different state while rank 0 had its own: wrong tokens, no error.
+- **Checks:** CPU 679 tests and two red copies; GPU A/B 92/92 exact against bundle 9 (the A arm was bundle 9's saved run of
+  the same manifest and settings, which halved the fenced time to 13 minutes). Decode +0.06 to +0.71 % (code at one
+  stream the most, as the skipped passes predict), within the spread of a saved arm; TTFT within 4 %.
+- **Proxy (same day, `mia-local/auth-proxy.py` in the served setup):** a stream the engine closes before its final event
+  ends with an error in the route's format; the warm-ahead and the re-warm count the tokens two next-turn renderings share
+  (a thinking chat without tools now keeps a state: 2,048 -> 4,096 on the probe); TCP_NODELAY.
+- **The recipe's scripts:** `start.sh` saves an exited container's log before removing it (a crash's restart deleted the
+  only record of why).
+
 ## Settings the pair serves with (systemd drop-ins over this recipe)
 - **`TF_DS_GRAPH_CAP=64`, `TF_DS_ENGRAM_CACHE_MB=128`:** exact. Rank 0's minimum MemAvailable in the bench rose from
   6537 to 7102 MiB; decode and long-prompt TTFT stayed within noise. These are now `scripts/config.sh`'s defaults.
@@ -130,6 +151,8 @@ failing by assertion (or a panic) for each testable one.
 - **`PROMPT_CACHE_GIB=0.5`:** the bench used about 40 MB of it, so a 1 GiB budget mostly holds stale entries.
 - **`TF_DS_PAIR_UNDER_LOAD=1`.**
 - **`TF_DS_STALL_EXIT_S=300`:** a lane host stalled for 5 minutes exits, for systemd to restart the pair.
+- **The unit:** `TimeoutStartSec=660` (the worker wait's 600 s), `RestartSec=5`, `SuccessExitStatus=130` (a requested
+  stop ends inactive, so the watchdog leaves it stopped).
 
 ## Checked and not changed
 - **The served round-cost table:** measured marginal costs per row match it within about 20 %. The drafter saturates at
