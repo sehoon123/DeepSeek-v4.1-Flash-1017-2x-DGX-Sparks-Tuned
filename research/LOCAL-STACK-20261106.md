@@ -88,6 +88,38 @@ high-offset pool case (92).
   - Cost: that stream's largest gap went from 0.92 to 1.68 s.
   - Exact, pairs against singles.
 
+**Bundle 9: the bug hunt's fixes (`zig/patches/0059-dsv41-bug-hunt-20261106.patch`, both ranks)**
+
+Ten read-only scouts went over the served engine; the confirmed findings were fixed, with a red copy of the old code
+failing by assertion (or a panic) for each testable one.
+- **Server input:**
+  - a `<tool_call>` wrapping an unclosed DSML block is kept as text. Before, it sliced past its end (a panic in safe
+    builds, undefined in ReleaseFast);
+  - a lone surrogate in JSON (`\ud800`) no longer turns off the special-token protection of the whole conversation;
+  - top_k 0 or past 56 with a temperature above 0 is refused before the prompt pass, not after it.
+- **Pictures:**
+  - a PNG's rows are inflated only to the size its header names: a 1x1 header over megabytes of zeros inflated
+    everything before;
+  - a picture's decode first checks rank 0's room (16 B a pixel from the PNG or JPEG header, 1 GiB above memguard's
+    line). A picture that does not fit gets a retry message instead of memguard ending the rank;
+  - its decode scratch is freed with the picture, not kept until the reply ends;
+  - Pillow's child is started again after a reply it read only in part;
+  - 15 PNGs of every color type, depth and Adam7 decode exactly as Pillow 12.3 does.
+- **Engine:**
+  - all-greedy rounds take the sampling candidates (count 1), so a NaN row faults its stream. Before, it drew token 0
+    to max_tokens;
+  - a round that fails after a stream finished discards it from the core. Before, the core kept a pointer to the
+    freed stream;
+  - the Engram row cache's index is rebuilt every cache-size evictions. Its tombstones only grew before, so a missing
+    row's lookup probed ever longer;
+  - large image-row buffers (host, device) are given back after their prompt and when the tower closes.
+- **The pair:** the follower ends (rank 0 then exits 75 and systemd restarts both) when its own RDMA ring failed.
+  Before, rank 0 waited on its gathers for good with /health ok.
+- **Checks:** CPU 696 tests, five red copies; GPU A/B 92/92 exact against bundle 8 with both ranks built from this
+  tree. Decode -0.26 to +0.08 % (noise); TTFT within 0.6 %, prose at 4 streams 5 % lower; top_k 0 refused in 5 ms.
+- **The recipe's scripts:** `start.sh` turns an unasked clean exit of rank 0 into exit 75, so `Restart=on-failure`
+  restarts it, and `stop.sh` marks a requested stop. `TF_DS_STALL_EXIT_S=300` is served as a drop-in.
+
 ## Settings the pair serves with (systemd drop-ins over this recipe)
 - **`TF_DS_GRAPH_CAP=64`, `TF_DS_ENGRAM_CACHE_MB=128`:** exact. Rank 0's minimum MemAvailable in the bench rose from
   6537 to 7102 MiB; decode and long-prompt TTFT stayed within noise. These are now `scripts/config.sh`'s defaults.
@@ -97,6 +129,7 @@ high-offset pool case (92).
   - 2M measured 1.4 s against 139 s TTFT for alternating 340K sessions, against 1M.
 - **`PROMPT_CACHE_GIB=0.5`:** the bench used about 40 MB of it, so a 1 GiB budget mostly holds stale entries.
 - **`TF_DS_PAIR_UNDER_LOAD=1`.**
+- **`TF_DS_STALL_EXIT_S=300`:** a lane host stalled for 5 minutes exits, for systemd to restart the pair.
 
 ## Checked and not changed
 - **The served round-cost table:** measured marginal costs per row match it within about 20 %. The drafter saturates at
@@ -106,8 +139,7 @@ high-offset pool case (92).
 - **The DSpark pass trim** (under 0.5 % exact) and **TF_DS_PROMPT_ALIAS** (0.1-0.2 GiB, lifetime risk): not done.
 
 ## What is not established
-- **The follower in a fresh build.** On the pair, rank 1 ran a follower built after bundle 2b. A build of this tree
-  compiles both ranks from it. The later changes are rank-0 paths, except the 709 entry in `cuda/driver.zig`; that
-  follower was not separately qualified.
+- **The follower before bundle 9.** Up to bundle 8, rank 1 ran a follower built after bundle 2b. From bundle 9 (0059)
+  both ranks run builds of the same tree, A/B-checked together.
 - **Long soak** at these settings, and a VisionShortOfMemory refusal under real memory pressure.
 EOF

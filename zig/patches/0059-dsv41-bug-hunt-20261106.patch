@@ -1,0 +1,952 @@
+Subject: [PATCH] the 2026-11-06 bug hunt's fixes on 2 x DGX Spark (both ranks)
+
+On top of 0058 (the bundle-8 tree), the fixes of a read-only bug hunt over the served engine (bundle 9): server
+input that could crash or mis-tokenize, picture decoding without bounds, lifecycle and recovery gaps. Every change
+CPU-tested (red copies of the old code fail), source-reviewed, and A/B-checked on the GPU pair: 92/92 replies exact
+against bundle 8, decode within 0.3 % (research/LOCAL-STACK-20261106.md, "Bundle 9"). Rank 1 ran a follower built
+from this tree in that check. Generated with `git diff --binary` in a checkout of the 0058 tree; `git apply` of it
+gives the served source file for file (1286 files, sha256-compared).
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 4e314cd..3bfc375 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -149,6 +149,9 @@ pub const Info = struct {
+     efforts: []const Effort = &.{},
+     /// A vision family's image input; null: the server refuses images.
+     vision: ?Vision = null,
++    /// The largest top_k the engine's sampler takes at a temperature above 0 (0: any); the server refuses others, and
++    /// top_k 0, before the prompt pass (bug hunt K10-M1).
++    max_top_k: u32 = 0,
+ };
+ 
+ /// A checkpoint family an engine reads: its config ``model_type`` and weight formats, as gate entries name them.
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index c82a783..2094bc8 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -402,7 +402,9 @@ pub const LaneHost = struct {
+             if (keep) |k| if (id == k) continue; // its pass ends it (error.Cancelled) and admitOne finishes it
+             if (outer) |o| if (id == o) continue;
+             for (h.admitted.items, 0..) |job, i| if (job.id == id) {
+-                if (!job.stream.finished) h.core.discard(&job.stream);
++                // (bug hunt K6-M1) a stream that finished in a round that then failed is still the core's: discard every
++                // started one (discard is safe twice: the backend's release finds nothing, the round state is cleared)
++                if (job.started) h.core.discard(&job.stream);
+                 h.lock();
+                 _ = h.admitted.orderedRemove(i);
+                 h.unlock();
+@@ -841,7 +843,7 @@ pub const LaneHost = struct {
+ 
+     fn drop(h: *LaneHost, job: *Job, message: []const u8) bool {
+         h.remove(job);
+-        if (job.started and !job.stream.finished) h.core.discard(&job.stream);
++        if (job.started) h.core.discard(&job.stream); // (as failAll: a finished one is still the core's)
+         h.finish(job, .failed, message);
+         return true;
+     }
+@@ -954,7 +956,7 @@ pub const LaneHost = struct {
+             if (h.admitted.items.len == 0) return h.unlock();
+             const job = h.admitted.orderedRemove(0);
+             h.unlock();
+-            if (!job.stream.finished) h.core.discard(&job.stream);
++            if (job.started) h.core.discard(&job.stream); // (bug hunt K6-M1: finished ones too, see takeCancelsKeeping)
+             h.finish(job, .failed, message);
+         }
+     }
+@@ -2163,4 +2165,33 @@ test "hardening red: lane host: a failed round ends every admitted job while all
+     try std.testing.expectEqual(@as(?Reason, .failed), rec.finished[2]);
+     try std.testing.expectEqual(@as(usize, 0), host.admitted.items.len);
+ }
++
++test "bug hunt: a failed round leaves no finished stream in the core (it would be freed under it)" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 4 });
++    defer host.admitted.deinit(gpa);
++    var rec: HardeningRec = .{};
++    const tokens = [_]u32{ 1, 2, 3 };
++    const request: Request = .{ .prompt = &tokens, .max_tokens = 4 };
++    for (1..3) |id| {
++        const job = try gpa.create(LaneHost.Job);
++        job.* = .{ .host = &host, .id = @intCast(id), .request = &request, .sink = rec.sink(), .started = true, .prefilled = 1 };
++        job.proposer = try lanes.SuffixLookup.init(gpa, .{ .min_match = 4 }); // (finish deinits a started job's)
++        job.stream = try lanes.Stream.init(gpa, .{ .id = "toy", .prompt = &tokens, .max_new = 4, .proposer = job.proposer.proposer() });
++        try host.admitted.append(gpa, job);
++        try core.live.append(gpa, &job.stream);
++    }
++    host.admitted.items[0].stream.finished = true; // it hit its end in the round, then the round failed (a draft or keep)
++    host.failAll("the round failed");
++    try std.testing.expectEqual(@as(usize, 0), core.live.items.len);
++    try std.testing.expectEqual(@as(?Reason, .failed), rec.finished[1]);
++    try std.testing.expectEqual(@as(?Reason, .failed), rec.finished[2]);
++}
+ // hardening red tests end
+diff --git a/zig/src/core/tokenizer/tokenizer.zig b/zig/src/core/tokenizer/tokenizer.zig
+index 88f2558..d512bb9 100644
+--- a/zig/src/core/tokenizer/tokenizer.zig
++++ b/zig/src/core/tokenizer/tokenizer.zig
+@@ -160,12 +160,25 @@ pub const Tokenizer = struct {
+         }
+     };
+ 
++    /// encodeProtected of a text that is not UTF-8: the lossy text encode reads (unicode.appendLossy's), its spans at the
++    /// lossy text's offsets.
++    fn encodeLossyProtected(t: *const Tokenizer, a: Allocator, text: []const u8, spans: []const [2]usize, keep: []const u32) Error![]u32 {
++        var arena = std.heap.ArenaAllocator.init(a);
++        defer arena.deinit();
++        const sa = arena.allocator();
++        const fixed = try lossyWithSpans(sa, text, spans);
++        return t.encodeProtected(a, fixed.text, fixed.spans, keep);
++    }
++
+     /// encode's ids, but an added token's text that overlaps one of `spans` (byte ranges of `text`, sorted, apart) is
+     /// read as plain text, not as the token: a chat message's content keeps the characters it has. A text with no
+     /// added token inside a span gets encode's ids exactly (the same split, the same pieces). Only a valid UTF-8 text
+     /// (else encode, whose lossy read moves the offsets); a segment its normalizer changes keeps its matches.
+     pub fn encodeProtected(t: *const Tokenizer, a: Allocator, text: []const u8, spans: []const [2]usize, keep: []const u32) Error![]u32 {
+-        if (spans.len == 0 or !std.unicode.utf8ValidateSlice(text)) return t.encode(a, text);
++        if (spans.len == 0) return t.encode(a, text);
++        // (bug hunt K8-F1) one lone surrogate (JSON's WTF-8) used to turn the whole text's protection off: the lossy text
++        // encode reads (each maximal invalid subpart a U+FFFD), with the spans moved to its offsets
++        if (!std.unicode.utf8ValidateSlice(text)) return t.encodeLossyProtected(a, text, spans, keep);
+         var arena = std.heap.ArenaAllocator.init(a);
+         defer arena.deinit();
+         var word = std.heap.ArenaAllocator.init(arena.allocator()); // (one word's BPE scratch at a time: see encode)
+@@ -215,7 +228,8 @@ pub const Tokenizer = struct {
+ 
+     /// encodeProtected's ids, reusing independent prefix segments only with identical protection metadata.
+     pub fn encodeProtectedReusing(t: *const Tokenizer, a: Allocator, keep: Allocator, text: []const u8, spans: []const [2]usize, keep_tokens: []const u32, prev: ?*const Memo, next: ?*Memo) Error![]u32 {
+-        if (!std.unicode.utf8ValidateSlice(text)) return t.encode(a, text); // (the lossy text's offsets are another text's)
++        // (the lossy text's offsets are another text's: no memo; its spans moved, as encodeProtected does)
++        if (!std.unicode.utf8ValidateSlice(text)) return if (spans.len == 0) t.encode(a, text) else t.encodeLossyProtected(a, text, spans, keep_tokens);
+         var arena = std.heap.ArenaAllocator.init(a);
+         defer arena.deinit();
+         var word = std.heap.ArenaAllocator.init(arena.allocator()); // (one word's BPE scratch at a time: see encode)
+@@ -795,3 +809,35 @@ test "protected memo: metadata owns its spans and keep-token list" {
+     try std.testing.expectEqual(@as(usize, 2), memo.spans[0][0]);
+     try std.testing.expectEqual(id, memo.keep_tokens[0]);
+ }
++
++/// `text` read as unicode.appendLossy reads it (each maximal invalid subpart a U+FFFD), and `spans` (byte ranges of
++/// `text`) at the new text's offsets: a range's ends move with the bytes before them.
++fn lossyWithSpans(a: Allocator, text: []const u8, spans: []const [2]usize) Allocator.Error!struct { text: []const u8, spans: []const [2]usize } {
++    var out: std.ArrayList(u8) = .empty;
++    const at = try a.alloc(usize, text.len + 1); // the new offset of each byte of `text` (and of its end)
++    var i: usize = 0;
++    while (i < text.len) {
++        const step = unicode.scan(text, i);
++        for (0..step.len) |k| at[i + k] = out.items.len;
++        if (step.cp == null) try out.appendSlice(a, "\u{FFFD}") else try out.appendSlice(a, text[i .. i + step.len]);
++        i += step.len;
++    }
++    at[text.len] = out.items.len;
++    const moved = try a.alloc([2]usize, spans.len);
++    for (spans, moved) |sp, *m| m.* = .{ at[sp[0]], at[sp[1]] };
++    return .{ .text = out.items, .spans = moved };
++}
++
++test "bug hunt: a text that is not UTF-8 keeps its spans' offsets when read lossily" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    // "x" + a lone surrogate (3 invalid bytes: 3 U+FFFD) + " ab" with the span over "ab"
++    const text = "x\xED\xA0\x80 ab";
++    const got = try lossyWithSpans(a, text, &.{.{ 5, 7 }});
++    var lossy: std.ArrayList(u8) = .empty;
++    try unicode.appendLossy(&lossy, a, text);
++    try std.testing.expectEqualStrings(lossy.items, got.text); // the text encode reads
++    try std.testing.expectEqualStrings("ab", got.text[got.spans[0][0]..got.spans[0][1]]);
++    try std.testing.expect(std.unicode.utf8ValidateSlice(got.text));
++}
+diff --git a/zig/src/families/dsv41/engram_aio.zig b/zig/src/families/dsv41/engram_aio.zig
+index 579dfc9..9b8edc4 100644
+--- a/zig/src/families/dsv41/engram_aio.zig
++++ b/zig/src/families/dsv41/engram_aio.zig
+@@ -89,6 +89,8 @@ pub const RowCache = struct {
+     hand: usize = 0,
+     hits: u64 = 0,
+     misses: u64 = 0,
++    evicted: usize = 0, // evictions since the index was last rebuilt
++    rehashes: u64 = 0,
+ 
+     fn create(gpa: std.mem.Allocator, mb: usize) !*RowCache {
+         return createRows(gpa, @max(1, mb * (1 << 20) / 272)); // 264 bytes a row (256 FP8 values, 8 scales) and the bookkeeping
+@@ -151,7 +153,10 @@ pub const RowCache = struct {
+                 c.hand = (c.hand + 1) % c.cap;
+             }
+             const at = c.hand;
+-            if (c.live[at]) _ = c.map.remove(c.keys[at]);
++            if (c.live[at]) {
++                _ = c.map.remove(c.keys[at]);
++                c.evicted += 1;
++            }
+             c.keys[at] = key;
+             c.live[at] = true;
+             c.used[at] = false;
+@@ -160,6 +165,14 @@ pub const RowCache = struct {
+             @memcpy(dst[b.row_w..][0..b.row_s], b.out_s.?[@as(usize, i) * b.row_s ..][0..b.row_s]);
+             c.map.putAssumeCapacity(key, @intCast(at));
+             c.hand = (c.hand + 1) % c.cap;
++            // (bug hunt K3-H1/K9-H3) each eviction leaves a tombstone in the index and inserts reuse only the ones on their
++            // probe path: free slots only ever fell, so a missing row's lookup probed ever longer. A rebuild once every
++            // `cap` evictions (O(capacity), under the mutex) keeps the probes short; the rows are untouched
++            if (c.evicted >= c.cap) {
++                c.map.rehash(std.hash_map.AutoContext(Key){});
++                c.evicted = 0;
++                c.rehashes += 1;
++            }
+         }
+     }
+ };
+@@ -490,3 +503,30 @@ test "AIO rows equal the pool's, across a ring that wraps" {
+     }
+     try std.testing.expect(c.hits > 0 and c.misses > 0);
+ }
++
++test "bug hunt: the row cache's index is rebuilt as rows come and go, and every live row is still found" {
++    const gpa = std.testing.allocator;
++    const c = try RowCache.createRows(gpa, 64);
++    defer c.destroy();
++    const rw = 4;
++    const rs = 2;
++    var no_dst: [0]?[*]u8 = .{};
++    var no_us: [0]usize = .{};
++    // 1000 single-row batches through a 64-row cache: 936 evictions, so 14 rebuilds
++    for (0..1000) |n| {
++        var w: [rw]u8 = @splat(@truncate(n));
++        var sc: [rs]u8 = @splat(@truncate(n +% 1));
++        var miss = [_]u32{0};
++        var rows = [_]u64{n};
++        const b: Batch = .{ .first = 0, .n = 1, .left = 0, .dst = &no_dst, .skew = &no_us, .bytes = &no_us, .miss = &miss, .rows = &rows, .out_w = &w, .out_s = &sc, .fd = 3, .base = 0, .row_w = rw, .row_s = rs };
++        c.put(&b);
++    }
++    try std.testing.expectEqual(@as(u64, 14), c.rehashes);
++    try std.testing.expectEqual(@as(usize, 64), c.map.count());
++    // the newest 64 rows are found, with their bytes; an evicted one is not
++    for (936..1000) |n| {
++        const got = c.map.get(.{ .fd = 3, .base = 0, .row = n }) orelse return error.TestUnexpectedResult;
++        try std.testing.expectEqual(@as(u8, @truncate(n)), c.data[@as(usize, got) * c.stride]);
++    }
++    try std.testing.expect(c.map.get(.{ .fd = 3, .base = 0, .row = 935 }) == null);
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 4960911..680fa19 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -1041,19 +1041,20 @@ pub const Lanes = struct {
+         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
+         try m.verify(rows, self.built.absorb[0..windows.len]);
+         const t2 = m.now();
+-        // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
++        // every row greedy: each row's first candidate (the argmax: the largest value, ties to the lower id), whose NaN
++        // flag faults the stream as a sampled round's does (bug hunt K2/K10: the argmax kernel has no flag, and an
++        // all-greedy round drew token 0 from NaN rows to max_tokens); else the logits for the host's draws
+         var greedy = true;
+         for (windows) |w| {
+             if (w.stream.sampling) |sm| if (sm.temperature > 0) {
+                 greedy = false;
+             };
+         }
+-        const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
+         // sampled: each row's candidates from the device (sampling.topCandidates' first `count` in its order), unless
+         // a stream's sampling needs its whole row (no top_k, or more candidates than the device keeps)
+         const V = m.vocab;
+         var count: usize = 1;
+-        var whole = greedy;
++        var whole = false;
+         if (!greedy) for (windows) |w| {
+             const sm = w.stream.sampling orelse continue;
+             if (sm.temperature <= 0) continue;
+@@ -1061,7 +1062,7 @@ pub const Lanes = struct {
+             count = @max(count, @min(V, sm.top_k + sampling.margin));
+         };
+         const recs: []const u32 = if (whole) &.{} else try m.roundCandidates(rows.ids.len, count);
+-        const logits: []const f32 = if (greedy or !whole) &.{} else try m.roundLogits(rows.ids.len);
++        const logits: []const f32 = if (!whole) &.{} else try m.roundLogits(rows.ids.len);
+         const t3 = m.now();
+         defer if (self.prof) |*p| {
+             p.send += t1 - t0;
+@@ -1075,7 +1076,7 @@ pub const Lanes = struct {
+         };
+         for (windows, out, 0..) |w, *o, k| {
+             const row0 = self.built.wins[k].row;
+-            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else (if (recs.len == 0) draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling) else drawCandidates(m, recs, count, row0 + r, w.positions[r], w.stream.sampling)) catch |e| if (e == error.NanLogits) faulted(w.stream, w.positions[r]) else return e;
++            for (0..w.rows()) |r| o.sampled[r] = (if (recs.len == 0) draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling) else drawCandidates(m, recs, count, row0 + r, w.positions[r], w.stream.sampling)) catch |e| if (e == error.NanLogits) faulted(w.stream, w.positions[r]) else return e;
+             const l = self.streams.getPtr(w.stream).?;
+             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
+             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
+@@ -1461,10 +1462,18 @@ fn survivalsBiased(conf: []const f32, out: []f64, bias: f64) void {
+     }
+ }
+ 
++/// Image rows past this many bytes are given back after their prompt (host and device; bug hunt K9-M4).
++const big_image_rows = model.big_image_rows;
++
+ /// A primitive this rank refused: rank 0 runs the same one on the same inputs and refuses it at the same step (its
+-/// request ends with the error), so the follower reports it and takes the next frame instead of ending.
+-fn refused(err: anyerror) void {
++/// request ends with the error), so the follower reports it and takes the next frame instead of ending, unless its own
++/// ring failed (below).
++fn refused(m: *const Model, err: anyerror) void {
+     std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
++    // (bug hunt K5-H1) this rank's RDMA ring failed: every later primitive fails on it too, and rank 0 waits for this
++    // rank's gathers for good (its own ring is fine, /health ok). End the follower, so the link closes and rank 0's
++    // watch exits 75: the service restarts the pair
++    if (ringBroken(m.ring)) |why| broken("rank 1's own RDMA ring failed", why);
+ }
+ 
+ /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
+@@ -1522,7 +1531,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 if (slot >= max_streams) return error.BadSlot;
+                 img_rows.clearRetainingCapacity();
+                 try r.ids(gpa, &seqs[slot]);
+-                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
++                m.fillBegin(slot, @intCast(base)) catch |err| refused(m, err);
+                 m.fill_seq = seqs[slot].items;
+             },
+             .fill_resume => {
+@@ -1530,7 +1539,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 slot = try r.int(u32);
+                 const base = try r.int(u64);
+                 if (slot >= max_streams) return error.BadSlot;
+-                m.fillResume(slot, @intCast(base)) catch |err| refused(err);
++                m.fillResume(slot, @intCast(base)) catch |err| refused(m, err);
+                 m.fill_seq = seqs[slot].items;
+             },
+             .fill_chunk => {
+@@ -1539,7 +1548,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 const replay: usize = @intCast(try r.int(u64));
+                 if (start + n > seqs[slot].items.len) return error.BadChunk;
+                 m.fill_seq = seqs[slot].items; // (a round between two chunks cleared it: the next chunk's read-ahead again)
+-                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
++                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(m, err);
+             },
+             .fill_pair => {
+                 const start: usize = @intCast(try r.int(u64));
+@@ -1548,7 +1557,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 const replay: usize = @intCast(try r.int(u64));
+                 if (start + n1 + n2 > seqs[slot].items.len) return error.BadChunk;
+                 m.fill_seq = seqs[slot].items;
+-                m.fillPair(seqs[slot].items[0 .. start + n1 + n2], start, n1, n2, replay) catch |err| refused(err);
++                m.fillPair(seqs[slot].items[0 .. start + n1 + n2], start, n1, n2, replay) catch |err| refused(m, err);
+             },
+             .verify => {
+                 const nw = try r.int(u32);
+@@ -1564,7 +1573,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                     wins[k] = .{ .slot = s, .base = base, .end = end, .start = start, .absorb = absorb, .ids = win_ids[k].items };
+                 }
+                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
+-                m.verify(rows, built.absorb[0..nw]) catch |err| refused(err);
++                m.verify(rows, built.absorb[0..nw]) catch |err| refused(m, err);
+                 if (m.prof) {
+                     follow_prof.rounds += 1;
+                     follow_prof.enqueue += m.t_enqueue;
+@@ -1583,7 +1592,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                     q0[i] = try r.int(i64);
+                     slots[i] = try r.int(i64);
+                 }
+-                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(err);
++                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(m, err);
+             },
+             .fill_images => {
+                 const count = try r.int(u32);
+@@ -1602,8 +1611,9 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 if (off != img_rows.items.len or off + piece.len > total or piece.len == 0) return error.BadFrame;
+                 try img_rows.appendSlice(gpa, piece);
+                 if (img_rows.items.len == total) {
+-                    m.setImages(spans.items, img_rows.items) catch |err| refused(err);
+-                    img_rows.clearRetainingCapacity();
++                    m.setImages(spans.items, img_rows.items) catch |err| refused(m, err);
++                    // (bug hunt K9-M4) a large prompt's rows are not kept for the life of the process
++                    if (img_rows.capacity > big_image_rows) img_rows.clearAndFree(gpa) else img_rows.clearRetainingCapacity();
+                 }
+             },
+             .snap_save => {
+@@ -1613,7 +1623,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 var b = try cuda.DeviceBuffer.alloc(m.ctx.d, m.snapBytes());
+                 m.snapCopy(s, b.ptr, true) catch |err| {
+                     b.free();
+-                    refused(err);
++                    refused(m, err);
+                     continue;
+                 };
+                 try kept.put(gpa, id, b);
+@@ -1626,8 +1636,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 const to: usize = @intCast(try r.int(u64));
+                 const at: usize = @intCast(try r.int(u64));
+                 const b = kept.get(id) orelse return error.UnknownSnapshot; // rank 0 restores only states both ranks keep
+-                if (from != to) m.copyExtent(from, to, at) catch |err| refused(err);
+-                m.snapCopy(s, b.ptr, false) catch |err| refused(err);
++                if (from != to) m.copyExtent(from, to, at) catch |err| refused(m, err);
++                m.snapCopy(s, b.ptr, false) catch |err| refused(m, err);
+             },
+             .snap_drop => {
+                 const id = try r.int(u64);
+@@ -2120,3 +2130,19 @@ test "bundle2: snapshot saves stamp the lanes' clock" {
+     try std.testing.expectEqual(@as(usize, 0), ln.snaps.items.len);
+ }
+ // bundle red tests end
++
++test "bug hunt: a follower's refused primitive on its own broken ring ends the follower" {
++    const Seen = struct {
++        var what: ?[]const u8 = null;
++        fn saw(w: []const u8, _: []const u8) void {
++            what = w;
++        }
++    };
++    const was = broken;
++    defer broken = was;
++    broken = Seen.saw;
++    var m: Model = undefined;
++    m.ring = null; // no ring (TCP): a refusal is only logged, as before
++    refused(&m, error.Example);
++    try std.testing.expect(Seen.what == null);
++}
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index ca88459..f4d096d 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -68,6 +68,9 @@ pub const Options = struct {
+     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
+ };
+ 
++/// Image rows past this many bytes are not kept past their prompt (bug hunt K9-M4).
++pub const big_image_rows: usize = 32 << 20;
++
+ pub const Model = struct {
+     gpa: std.mem.Allocator,
+     host: std.heap.ArenaAllocator, // allocations that live as long as the model
+@@ -673,7 +676,9 @@ pub const Model = struct {
+     /// host, after fillBegin and before its chunks.
+     pub fn setImages(m: *Model, spans: []const prompt.Span, rows: []const u8) !void {
+         if (rows.len > 0) {
+-            if (m.img_buf == null or m.img_buf.?.len < rows.len) {
++            // (bug hunt K9-M4) a buffer much larger than this prompt's rows (an earlier one's) goes back first
++            const oversized = if (m.img_buf) |b| b.len > big_image_rows and b.len > 2 * rows.len else false;
++            if (m.img_buf == null or m.img_buf.?.len < rows.len or oversized) {
+                 if (m.img_buf) |*b| b.free();
+                 m.img_buf = null;
+                 m.img_buf = try cuda.DeviceBuffer.alloc(m.ctx.d, rows.len);
+@@ -688,6 +693,13 @@ pub const Model = struct {
+         m.ch.img_rows = if (m.img_buf) |b| b.ptr else 0;
+     }
+ 
++    /// The image rows' device buffer back (no prompt pass is filling: the vision tower's idle close).
++    pub fn freeImageRows(m: *Model) void {
++        if (m.img_buf) |*b| b.free();
++        m.img_buf = null;
++        m.ch.img_rows = 0;
++    }
++
+     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
+         if (slot >= m.streams) return error.BadSlot;
+         // No Engram rows read ahead for another prompt stay ready, paired or not (MiaAI-Lab's 0012, by wojo): a pass that
+diff --git a/zig/src/families/dsv41/native.zig b/zig/src/families/dsv41/native.zig
+index f7e0c42..99dbb8b 100644
+--- a/zig/src/families/dsv41/native.zig
++++ b/zig/src/families/dsv41/native.zig
+@@ -44,6 +44,8 @@ pub const max_segments: u32 = 1;
+ pub const prompt_rows: u32 = 2048;
+ /// The served lane's reasoning effort numbers (text.zig): the server passes each name and the template hears its number.
+ pub const efforts = @import("text.zig").efforts;
++/// The sampler's candidates hold top_k plus its margin (sampling.zig): the top_k it takes at most.
++pub const max_top_k: u32 = @import("sampling.zig").max_candidates - @import("sampling.zig").margin;
+ 
+ pub const Options = struct { context: usize, drafts: bool, segments: usize = 1 };
+ 
+diff --git a/zig/src/families/dsv41/picture.zig b/zig/src/families/dsv41/picture.zig
+index 83ae2f9..f91d41c 100644
+--- a/zig/src/families/dsv41/picture.zig
++++ b/zig/src/families/dsv41/picture.zig
+@@ -155,6 +155,18 @@ pub fn pixels(data: []const u8) ?usize {
+     return @as(usize, std.mem.readInt(u32, data[16..20], .big)) * std.mem.readInt(u32, data[20..24], .big);
+ }
+ 
++/// The bytes a PNG's passes inflate to: each pass's rows, a filter byte and its stride each.
++fn inflatedSize(list: []const [4]usize, w: usize, h: usize, bits: usize) usize {
++    var n: usize = 0;
++    for (list) |ps| {
++        if (ps[0] >= w or ps[1] >= h) continue;
++        const pw = (w - ps[0] + ps[2] - 1) / ps[2];
++        const ph = (h - ps[1] + ps[3] - 1) / ps[3];
++        n += ph * (1 + (pw * bits + 7) / 8);
++    }
++    return n;
++}
++
+ /// PNG bytes to RGB as PIL's open(...).convert("RGB") gives them: 8-bit samples as they are, 16-bit ones by their high
+ /// byte, grey of 1, 2 and 4 bits scaled to 0..255 (0 / 255, x 85, x 17), 16-bit grey clipped at 255 (PIL's I;16 to L),
+ /// palette indices through PLTE (missing entries black), alpha dropped. Chunk CRCs are checked, as PIL does.
+@@ -219,22 +231,25 @@ pub fn decodePng(a: Allocator, data: []const u8) Error!Rgb {
+     const bits = channels * depth;
+     const bpp = @max(1, bits / 8);
+ 
+-    // the passes' filtered rows, inflated
+-    var raw: std.Io.Writer.Allocating = .init(a);
+-    defer raw.deinit();
++    const passes: [7][4]usize = .{ .{ 0, 0, 8, 8 }, .{ 4, 0, 8, 8 }, .{ 0, 4, 4, 8 }, .{ 2, 0, 4, 4 }, .{ 0, 2, 2, 4 }, .{ 1, 0, 2, 2 }, .{ 0, 1, 1, 2 } };
++    const one: [1][4]usize = .{.{ 0, 0, 1, 1 }};
++    const list: []const [4]usize = if (interlace == 1) &passes else &one;
++
++    // the passes' filtered rows, inflated: exactly the bytes the header implies (each pass's rows of a filter byte and a
++    // stride), read no further (bug hunt K7-C2: a 1x1 header over megabytes of zeros inflated into gigabytes; trailing
++    // data was ignored before as now)
++    const zdata = try a.alloc(u8, inflatedSize(list, w, h, bits));
++    defer a.free(zdata);
+     {
+         var in: std.Io.Reader = .fixed(idat.items);
+-        var z: std.compress.flate.Decompress = .init(&in, .zlib, &.{});
+-        _ = z.reader.streamRemaining(&raw.writer) catch return error.BadPng;
++        var window: [std.compress.flate.max_window_len]u8 = undefined;
++        var z: std.compress.flate.Decompress = .init(&in, .zlib, &window);
++        z.reader.readSliceAll(zdata) catch return error.BadPng;
+     }
+-    const zdata = raw.written();
+ 
+     // samples per pixel at full depth for the whole image: [h][w][channels] as u16
+     const samples = try a.alloc(u16, w * h * channels);
+     defer a.free(samples);
+-    const passes: [7][4]usize = .{ .{ 0, 0, 8, 8 }, .{ 4, 0, 8, 8 }, .{ 0, 4, 4, 8 }, .{ 2, 0, 4, 4 }, .{ 0, 2, 2, 4 }, .{ 1, 0, 2, 2 }, .{ 0, 1, 1, 2 } };
+-    const one: [1][4]usize = .{.{ 0, 0, 1, 1 }};
+-    const list: []const [4]usize = if (interlace == 1) &passes else &one;
+     var off: usize = 0;
+     var prev: std.ArrayList(u8) = .empty;
+     defer prev.deinit(a);
+@@ -518,6 +533,7 @@ pub fn pad(a: Allocator, src: Rgb, w: usize, h: usize) !Rgb {
+             if (nw != w) cw = nw;
+         }
+     }
++    if (cw == 0 or chh == 0) return error.ZeroSize; // (bug hunt K7-M2: an extreme aspect rounds a side to 0; PIL refuses it too)
+     var fit = try resize(a, src, cw, chh);
+     if (fit.w == w and fit.h == h) return fit;
+     defer fit.deinit(a);
+@@ -633,3 +649,61 @@ test "a span's token types" {
+     spanTypes(g, &t);
+     try std.testing.expectEqualSlices(Type, &.{ .start, .image, .image, .image, .newline, .image, .image, .image, .newline, .end }, &t);
+ }
++
++test "bug hunt: a picture's rows are inflated to the size its header names, never past it" {
++    // a 1x1 RGB PNG whose IDAT inflates to 1 MiB of zeros (a decompression bomb in small: the size check is the header's)
++    const b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAED0lEQVR42u3BMQEAAADCoPVPbQhfoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPgMA8AABnV31vQAAAABJRU5ErkJggg==";
++    var png: [1098]u8 = undefined;
++    const n = try std.base64.standard.Decoder.calcSizeForSlice(b64);
++    try std.base64.standard.Decoder.decode(png[0..n], b64);
++    // 256 KiB is all the decode may use: the old one held the whole 1 MiB stream
++    const room = try std.testing.allocator.alloc(u8, 256 << 10);
++    defer std.testing.allocator.free(room);
++    var fixed = std.heap.FixedBufferAllocator.init(room);
++    const rgb = decodePng(fixed.allocator(), png[0..n]) catch |e| {
++        std.debug.print("decode: {s}\n", .{@errorName(e)}); // the old decode ran out of the room holding the whole stream
++        return error.TestUnexpectedResult;
++    };
++    try std.testing.expectEqual(@as(usize, 1), rgb.w);
++    try std.testing.expectEqual(@as(usize, 1), rgb.h);
++    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, rgb.px);
++}
++
++test "bug hunt: the header-sized inflate decodes every color type, depth and Adam7 pass as Pillow 12.3 does" {
++    // 15 PNGs of every color type and depth, Adam7 or not, all five filters, two IDAT chunks; the RGB is Pillow 12.3's
++    // convert("RGB") of each (bundle9-deploy-20261106/pngvec/gen.py, in the served image)
++    const Case = struct { w: usize, h: usize, png: []const u8, rgb_sha256: []const u8 };
++    const cases = [_]Case{
++        .{ .w = 13, .h = 7, .png = "iVBORw0KGgoAAAANSUhEUgAAAA0AAAAHCAIAAABcElBNAAAAkUlEQVR42gEYAef+ANsyybQg71TfQnF7uvpnu3TqXRT5SezUZgvvb1o3gVKSLwCgCIOVPAKIY/rvVIdiGfslRTDBkdR9vqkHUJ06oC8BztEPDihfGmb0x8Si3j8CNwQRAo/efACTWQDhUaCJJb9gGWaAIr6ROMwrRe/CaaW6x+9f1Rz4AG6KCAp5SeB39FWH0AEQ6h/GjcvyUgAAAJJJREFUI/eObwzYNZVtqHWtcgRyRxP/8k1OwQRr2nBB0wrAlrCjEckHwSd8yxyOtHfDyA6kMJGzBL1U2MaIT25ginYCLDuvfpjrS/Ig2g6UiElRus8+m844uOwbnfFmSk1nRzExHJFVP2hBAmXIsrwFqbbNrY7GPWNNG2nuPRu/zdwWcx6O+Dv7eRV+9lXlHfEfKRxNg7rYMLEzAAAAAElFTkSuQmCC", .rgb_sha256 = "a688ce626d7aa785193e7787ecb97eeed5f79cedc91a93965d1a6b88b38594d6" },
++        .{ .w = 13, .h = 7, .png = "iVBORw0KGgoAAAANSUhEUgAAAA0AAAAHCAIAAAErFWDbAAAAlUlEQVR42gEfAeD+Ax5lLo2APgRgTAnml2YDzJJWAY8+AYX7f7f5Ar/NZTOB3jBsAgHJtO+zGvQ4THsDyJqq3BHQAAkoEErSDjgz2EYSrW1cBBuc5BMApFdaUGui3uwCleCyNrrwZADBUtAZD/wz0EImyC3MEkzdrGYEruDOVHLLw1s8qBNtRA810KD7AznwOtHTRYDIk15vUdSSA/sAAACVSURBVEIGsxM25QO6T0f7DwO18WzpKQ4EyFB6mpMEEx69yz991hLbeQijw5MvLDdkIrI8Rj6I7grp9YM/u+pp0WZOjpsMAobHaRnfSd9j2eLfJ1DnolHwcLn9zswyPh3Nj2BDBcXz4csbFR47YwKseAkBddMUxUnnP++Elt6iKzdOTN9Tmb3tH5/mKi36cXnlqgTPfwiRd4QRe5AZiwAAAABJRU5ErkJggg==", .rgb_sha256 = "893c1a412c695a9bea1a84e453e1fe59cf459c5c80dd59895be485975fd3cfbc" },
++        .{ .w = 13, .h = 7, .png = "iVBORw0KGgoAAAANSUhEUgAAAA0AAAAHEAYAAAH05yvPAAABeElEQVR42gHmAhn9AdeucR9JoEK7TGWMleL0GQQDUzSfr+61j9czE+khuLPjFQAOrl2yUkddskB3Zxg+TQEuV8qDCGdK+iI4kVNxgpNS7gHe7Bige+tzclXsw4qyurDb7gQc++uj2ewCOQf3CzZFcokXacwzHa6vSHD3pZmseXktA8JG5B8PQq+PP6O6u3Ai/zU4o29dHATiyugrz9YIrzxEv9N0fcW8zHLKWra4PlvLcbbE3dISNMD9AtnKnKECEaXvpNNy4YZfxUhk07shs8E/Yqf+9pXzvPs4ydvKMysv3U1u6crV2cc9PRagoPlOCbLKAI4N98lBBi+yFKjXmA5FQlwo8OFclCckvMhUoF9PR9VnFcAxHSsD2q6J5A0/H5RqEgQXOXwTshX5UyBe6Ii/pYmKq/3hfOTkom+a42cie62zRux3fmLWDfan7aMsSYJ8g4kE25Fm1Bul+JiCeEKXYBFHjEB61id7owP8H41enyvwA1I9YHp9yVN6KhmS1wAAAXlJREFULpH3icHftjrdApd9SM7vM9FoJQu4VSHn6EVjzfbTWkY/GW6jDjIDjeGS0czq7g7jHd2NpOuZkOL2+QN51QU8eVMZZDrK/WZrDr8vtrDRFj0SAKtRC+WulEEaXLAwJg4egYaiys4BSnrqVI6oFDBvUTKDGyLsu0nrmcc2hWjDpe+kSut1PMWujBJV9Dqqe9k0xjDQN/DTMMpalPJDOQjZnO44jQDqoECNCZ6jr54NVkvP+XGqCbwBdks55t3sVrKf988Tj+IIZqgggtM9uwuA1yIJjVQYXtisnL4rvS6yjOma4R8+xSjnTjEedrxx1/iKQaR5hJC+xSVrDoqxNwbLNx72XEgo6ihGvauC3gN5d4rfpWpxd4fodoRrRAcWALasdyaTD5kutdQpdscINLrORSj31IJmEnPe/eqYYOIJy/RS4rxHFCcLW/yLSTTTNAV2D7x8ZLcQBgMm+V5OjHC8RHg6EzlMaPSP3HEjo624JRzuIrEb8zEia9G1pyv7AAAAAElFTkSuQmCC", .rgb_sha256 = "00bbf22c2bdd8bac4018ce426526d4b809e748b1a5bb2cd3465af5951f4a25a6" },
++        .{ .w = 9, .h = 5, .png = "iVBORw0KGgoAAAANSUhEUgAAAAkAAAAFAQAAAAHIL8tQAAAAEElEQVR42mM8wNTAvIDJgZGBZQXLDOtOOwAAABFJREFUA+YNzBMYchgY8yYBAE0fBm2LTP7HAAAAAElFTkSuQmCC", .rgb_sha256 = "fd10e7487c6d03f1d02494f29697b56049b88fdd56115e39e5f5e2f2d280cca2" },
++        .{ .w = 11, .h = 3, .png = "iVBORw0KGgoAAAANSUhEUgAAAAsAAAADAgAAAAAqJLI2AAAACklEQVR42mM8erCL+fHJoP1M+QAAAAtJREFUt8wCjxcCACc6BkV3s+KOAAAAAElFTkSuQmCC", .rgb_sha256 = "ccf733adf6d74c2020d503f75b583e0d4a4e5642d3d2436c36d306c9eae7e80e" },
++        .{ .w = 10, .h = 9, .png = "iVBORw0KGgoAAAANSUhEUgAAAAoAAAAJBAAAAAGcOj9YAAAAKElEQVR42gFFALr/APoExgGwA3gDznkA3wGxA1sCI2uAA0RrawTJil0C1m7gbDtOTwAAAChJREFUA0eVmAF5duEC6JtABGG4AdmUBCyd7KCEARY42ch7ANcuunbHjXAcDTeHbDYAAAAASUVORK5CYII=", .rgb_sha256 = "d3f74152253db0641c4c8d5a3dd4160079334931fa49ddaba377dc2264d4b91c" },
++        .{ .w = 5, .h = 4, .png = "iVBORw0KGgoAAAANSUhEUgAAAAUAAAAEEAAAAAAzyHbfAAAAG0lEQVR42gEsANP/ALF4HJd1EOMwBlgCuJOJiYtLiDBY0p0KAAAAHElEQVSY2QLkVn/zz26k1P8/AAE3i7QZV5joBKirHxPlx9E/9QAAAABJRU5ErkJggg==", .rgb_sha256 = "8015f906a9f75c161232dd2b5347fb92578cde20be028876ea20c15668a8d844" },
++        .{ .w = 7, .h = 6, .png = "iVBORw0KGgoAAAANSUhEUgAAAAcAAAAGBAMAAAGKJ6nTAAAAMFBMVEW6o78DWEmAxm+TMYYaclujf7wePu7rzaDubSSSYwr8i+WHq/BeQJELdp4x4fP7hRvzQIk7AAAAF0lEQVR42mMUYChg4WOexjyPpViMMXQ38/cdjENJcgoAAAAXSURBVMJrGeQmyiYwTi+ecY7hhkxvAACwKwtNDxc+WQAAAABJRU5ErkJggg==", .rgb_sha256 = "e38de9e3db0e087eb7902dd5dd5c5acd05dc82355724ed453fdcc7946056c6a2" },
++        .{ .w = 12, .h = 2, .png = "iVBORw0KGgoAAAANSUhEUgAAAAwAAAACAQMAAABWsa/UAAAABlBMVEV/dTTg5pk5fam4AAAAB0lEQVR42mM8OJ/pRGxIhAAAAAdJREFUgAIAB/MCROVaguYAAAAASUVORK5CYII=", .rgb_sha256 = "47d5beda9925bba8365cc5732e0c338f19fe9dc87b1efce06f220d507ecd86b5" },
++        .{ .w = 6, .h = 6, .png = "iVBORw0KGgoAAAANSUhEUgAAAAYAAAAGCAMAAAGgFS/sAAADAFBMVEWuoCEFfebZmGRgjDS8i0jLDNeWpexHTlzOps9zdIejiiFCHvodHPUp6Brj/ZoTphbwaxKowvQVb3YEQisucHYRLtrDIDwnR+V1B7epOQg6DI9ykQsSN1mQ/iIXYtjhm4W1jFIJ3gb0kGwWw9hvvSZ9poINh8DGRJQ769tPPUqSvfOWAtP7dwpti6Hsw0HWy2zErNwbkpbiOLxKaKvcTYS0KKQBsg5+7bFA3bv62EapOeedR/5rKBfpFHqclJsoebfwBYLZMfGnmR2wOOZ46hBGfMG9ReSUGVijA/FQhyjTBrxpMPf3i6VpRySa0/UIzL3sT+yqEc+XqRQSj3Cwb/PTeiTAzLv/91KTYJbor+x45N3jW1dBeZETnq+EDWZnnSnjl+IXs9AJrhT6bK6bR8O6QM4o8e22bCjAW7yo4UZ8aKbN65EKhE/nhzJuehGhexsbg263VcwoBI8iHkPBShhvupQJR7KOquXrkuZDea8XanEXZVPZYEHA1p35DfpLiZPkq6RlS367gFCz2gvM/wD5AMXWgngzVYmkMmUG9aAVaK0ZGxHi9RcPRB+p5caGayZwzHNZ150BLVBWDhM7NVM0xek9i6z34mN2y3AdNhH+SBjttPqwDkyraLZAeAjg4FaubSZdRbmalWiBSBQ7sWWsSUMZjCsY95bUjSX1byga8SVFK4GJl3cKusUmy32G4DivF8Ut6HHZrRXKp2Tl7girmUJUVYPos9wcBPDJLuCSo67CqXbCAOBO1FMgCotmseMdpPJ210l2wVR758OPbaRGePNudr/xtoFBwkM2+eTIm2rHNOKyvpxu5DRWAm3BQeoIAqUOFPBjOTT14SYUZF6fo96V8VlBvHWiPxH11BIgCcV1SU9L207znkQ+k6f+ACLSPzFP4of9I+T0vXTkSGyeZ1Iy3K1dMKiwjP8X4TyS1yZGwacXM2yIFt5ur379yTpA1WbhV/aspXt0LQuf04Vibc3S0Lf4xGprAf+yxsiqyNH1I73Xq62WBwm72v9yI9sAiUVGAAAAHElEQVR42mOKYfrC9Cqc4SdzPEvKDDMmNvVQJkXtcMa8wM2Z3gAAAB1JREFUWQ8YK7/IL3wcwfhWyrZwIiPL30lMVzRSAYCVEOI6qOEOAAAAAElFTkSuQmCC", .rgb_sha256 = "9bf83a0c30b2b6d19b3058220456f3f0df2bb3af0e015776158ccfef47d281d7" },
++        .{ .w = 8, .h = 3, .png = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAADCAQAAAFzxrZVAAAAIUlEQVR42gE3AMj/An4qAWg2ANNUSsgEZHQuJByvSKwB0t52AW7K6Sc7AAAAIUlEQVSqPjMDtwVFvw219qACJweSS0lYDWHdNggOIBoakAtkEmXFUpokAAAAAElFTkSuQmCC", .rgb_sha256 = "b49b554931f2b9d7a75e6886e8e0ba9ee12d4b230e0150718047a20de72a011b" },
++        .{ .w = 3, .h = 3, .png = "iVBORw0KGgoAAAANSUhEUgAAAAMAAAADEAQAAACssaF3AAAAGUlEQVR42gEnANj/A7vdgdmyUpSlU354VgQRN2HNGPpVDQAAABlJREFUdQV5R7iwk9sCy8ng1rW4WDIwuDspfCsS6/azZZIAAAAASUVORK5CYII=", .rgb_sha256 = "470463cd7876a7da3b71e07f7a245a02f7808585298abc1250971ff3f3b2d7f5" },
++        .{ .w = 17, .h = 1, .png = "iVBORw0KGgoAAAANSUhEUgAAABEAAAABEAIAAAGQTj7jAAAAOklEQVR42gFqAJX/AK1MUSFKJcdIQJT2qbmMGo1dowHUtgNrzImFhri6mq8BsFGDRd0BwkREVxrQ6O05X5O9ccV4ZAAAADtJREFUH5CrtUXtAc6Oap0PP5cF5KjSKoON53IT2tB9IGF2Z9rKHmXNopOMpmc8J0slBrfs7sBll8zvwokoNMoMd9umAAAAAElFTkSuQmCC", .rgb_sha256 = "ab523785aca3af1dfcc7950d7e94bd3d0830d47c95d5129732249b01ddabdb3d" },
++        .{ .w = 1, .h = 17, .png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAARCAYAAAFrxPaEAAAAMElEQVR42gFVAKr/AvuCXg0BJJajkwFbqp4kAoGXUsgCcUfSzACEAKkmBMfIjK0Eshzs0gKB1uFbAAAAMElEQVRD1e7TAMQcxH0B5KkjawG1pmc+A+Nuwz0DSKwVigGDjdL/AhfH04UEPu04oAUKJQPNW9LfAAAAAElFTkSuQmCC", .rgb_sha256 = "ae0a09a9167bd7d83d30561754e3c0009ca544d9e894f43fa0704cb107b604b6" },
++        .{ .w = 2, .h = 2, .png = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAAAAAEg2mJuAAAAB0lEQVR42mNmYq5iPcBRPgAAAAhJREFUaeoHAAO+AZihg3k1AAAAAElFTkSuQmCC", .rgb_sha256 = "e24dd7ce968f0bbdfa551b70d8cb3825c92e7c75df06b9c0b6f4999676634916" },
++    };
++    for (cases) |c| {
++        var bytes: [4096]u8 = undefined;
++        const n = try std.base64.standard.Decoder.calcSizeForSlice(c.png);
++        try std.base64.standard.Decoder.decode(bytes[0..n], c.png);
++        var rgb = decodePng(std.testing.allocator, bytes[0..n]) catch |e| {
++            std.debug.print("{d}x{d}: {s}\n", .{ c.w, c.h, @errorName(e) });
++            return error.TestUnexpectedResult;
++        };
++        defer rgb.deinit(std.testing.allocator);
++        try std.testing.expectEqual(c.w, rgb.w);
++        try std.testing.expectEqual(c.h, rgb.h);
++        var digest: [32]u8 = undefined;
++        std.crypto.hash.sha2.Sha256.hash(rgb.px, &digest, .{});
++        const hex = std.fmt.bytesToHex(digest, .lower);
++        try std.testing.expectEqualStrings(c.rgb_sha256, &hex);
++    }
++}
+diff --git a/zig/src/families/dsv41/pil.zig b/zig/src/families/dsv41/pil.zig
+index 8b6269e..b86645b 100644
+--- a/zig/src/families/dsv41/pil.zig
++++ b/zig/src/families/dsv41/pil.zig
+@@ -70,10 +70,17 @@ pub const Pil = struct {
+         @memcpy(&p.version, hello[3..16]);
+     }
+ 
++    /// (bug hunt K7-M3) a reply read only in part leaves its rest in the pipe, to be read as the next picture's header:
++    /// the child killed (kill is a no-op on one already gone) and another started.
++    fn fresh(p: *Pil) void {
++        p.child.kill(p.io);
++        p.spawn() catch |e| std.log.warn("Pillow's child did not start again ({s})", .{@errorName(e)});
++    }
++
+     pub fn stop(p: *Pil, gpa: Allocator) void {
+         if (p.child.stdin) |f| f.close(p.io);
+         p.child.stdin = null;
+-        _ = p.child.wait(p.io) catch {};
++        if (p.child.id != null) _ = p.child.wait(p.io) catch {}; // (a killed child is already reaped: wait asserts an id)
+         gpa.destroy(p);
+     }
+ 
+@@ -89,12 +96,18 @@ pub const Pil = struct {
+         p.mutex.lockUncancelable(p.io);
+         defer p.mutex.unlock(p.io);
+         return p.exchange(a, data) catch |err| switch (err) {
+-            error.OutOfMemory, error.BadPillowReply => err,
++            error.OutOfMemory, error.BadPillowReply => {
++                p.fresh();
++                return err;
++            },
+             else => {
+                 std.log.warn("Pillow's child failed ({s}): starting it again", .{@errorName(err)});
+                 p.child.kill(p.io);
+                 try p.spawn();
+-                return p.exchange(a, data);
++                return p.exchange(a, data) catch |e| {
++                    if (e == error.OutOfMemory or e == error.BadPillowReply) p.fresh();
++                    return e;
++                };
+             },
+         };
+     }
+diff --git a/zig/src/families/dsv41/vision.zig b/zig/src/families/dsv41/vision.zig
+index 56eda13..38634e5 100644
+--- a/zig/src/families/dsv41/vision.zig
++++ b/zig/src/families/dsv41/vision.zig
+@@ -106,6 +106,7 @@ pub const Vision = struct {
+             o.tower.close();
+         }
+         v.loaded = null;
++        v.m.freeImageRows(); // (bug hunt K9-M4: the rows' buffer kept the largest picture prompt's size)
+     }
+ 
+     /// A prompt pass without pictures, on the lane host's thread: a tower idle for idle_ns gives its memory back.
+@@ -124,14 +125,26 @@ pub const Vision = struct {
+ 
+     fn prepareFn(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!lanes.stream.Vision.Prepared {
+         const v: *Vision = @ptrCast(@alignCast(ctx));
+-        var rgb = try v.decode(a, bytes, problem);
+-        defer rgb.deinit(a);
+-        var pic = picture.fromRgb(a, rgb, v.cfg) catch |err| {
++        // (bug hunt K7-C2, K9-H2) a picture's decode needs about decode_bytes_per_pixel of its pixels at once: refused
++        // while that would take rank 0 near memguard's line, instead of memguard ending the rank
++        // a picture past the decoders' own limit is theirs to refuse, in their words (review be23f0a3)
++        const px = picture.pixels(bytes) orelse jpegPixels(bytes);
++        const oversized = if (px) |n| n > picture.max_pixels else false;
++        if (!oversized and !roomToDecode(availableBytes(v.io), px)) {
++            problem.* = "image input: the server is short of memory for this picture right now; retry in a minute, or send a smaller image";
++            return error.BadImage;
++        }
++        // its scratch apart from the request's arena (which keeps all it is given until the reply ends): only the payload
++        // stays with the request
++        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
++        defer scratch.deinit();
++        const sa = scratch.allocator();
++        const rgb = try v.decode(sa, a, bytes, problem);
++        const pic = picture.fromRgb(sa, rgb, v.cfg) catch |err| {
+             if (err == error.OutOfMemory) return error.OutOfMemory;
+             problem.* = "image input: the image could not be prepared";
+             return error.BadImage;
+         };
+-        defer pic.deinit(a);
+         const g = pic.grid;
+         const payload = try a.alignedAlloc(u8, .@"16", header_bytes + pic.patches.len * 2);
+         @memset(payload[0..header_bytes], 0);
+@@ -141,12 +154,13 @@ pub const Vision = struct {
+     }
+ 
+     /// The image's RGB as the lane's Pillow decodes it: picture.zig's PNG, else Pillow's own (the refusal in the lane's
+-    /// words on BadImage).
+-    fn decode(v: *Vision, a: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!picture.Rgb {
++    /// words on BadImage). The RGB in `a` (the picture's scratch), a refusal's words in `keep` (the request's: the server
++    /// reads them after this picture's scratch is gone).
++    fn decode(v: *Vision, a: std.mem.Allocator, keep: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!picture.Rgb {
+         if (picture.decodePng(a, bytes)) |rgb| return rgb else |err| switch (err) {
+             error.OutOfMemory => return error.OutOfMemory,
+             error.TooLarge => {
+-                problem.* = try std.fmt.allocPrint(a, "Image size ({d} pixels) exceeds limit of {d} pixels, could be decompression bomb DOS attack.", .{ picture.pixels(bytes) orelse 0, picture.max_pixels });
++                problem.* = try std.fmt.allocPrint(keep, "Image size ({d} pixels) exceeds limit of {d} pixels, could be decompression bomb DOS attack.", .{ picture.pixels(bytes) orelse 0, picture.max_pixels });
+                 return error.BadImage;
+             },
+             else => {}, // not a PNG this decoder reads: Pillow's
+@@ -164,7 +178,7 @@ pub const Vision = struct {
+         switch (got) {
+             .rgb => |rgb| return rgb,
+             .refused => |m| {
+-                problem.* = m;
++                problem.* = try keep.dupe(u8, m);
+                 return error.BadImage;
+             },
+         }
+@@ -222,6 +236,52 @@ fn roomToOpen(available: u64) bool {
+     return available >= open_room + open_margin;
+ }
+ 
++/// A picture's decode at its peak, a pixel: the inflated rows, its 16-bit samples, the RGB, the resize and pad passes
++/// and the patches (an estimate above review be23f0a3's 12 to 15 for an 8-bit PNG and its compressed copy).
++const decode_bytes_per_pixel: u64 = 16;
++
++/// A picture whose size its header does not say here (not a PNG or a JPEG: Pillow's) counts as a large photo.
++/// shortcut: Pillow opens up to 2 x 89.5 MP of such formats; read their headers too if they come in that large.
++const unknown_pixels: u64 = 24_000_000;
++
++/// Room for one picture's decode above memguard's line (4.25 GiB) and a 1 GiB margin.
++/// shortcut: each request checks alone, so two large pictures at once can pass together; count the decodes in flight
++/// if that is seen.
++fn roomToDecode(available: u64, pixels: ?usize) bool {
++    const px: u64 = pixels orelse unknown_pixels;
++    const need = std.math.mul(u64, px, decode_bytes_per_pixel) catch return false;
++    return available >= need +| ((17 << 28) + open_margin);
++}
++
++/// A JPEG's pixels from its frame header (SOFn: height, width), else null.
++fn jpegPixels(bytes: []const u8) ?usize {
++    if (bytes.len < 4 or bytes[0] != 0xFF or bytes[1] != 0xD8) return null;
++    var at: usize = 2;
++    while (at + 4 <= bytes.len) {
++        if (bytes[at] != 0xFF) return null;
++        const marker = bytes[at + 1];
++        if (marker == 0xFF) { // fill bytes
++            at += 1;
++            continue;
++        }
++        if (marker == 0xD8 or marker == 0x01 or (marker >= 0xD0 and marker <= 0xD7)) { // no length
++            at += 2;
++            continue;
++        }
++        const len = std.mem.readInt(u16, bytes[at + 2 ..][0..2], .big);
++        const sof = marker >= 0xC0 and marker <= 0xCF and marker != 0xC4 and marker != 0xC8 and marker != 0xCC;
++        if (sof) {
++            if (len < 7 or at + 9 > bytes.len) return null;
++            const h = std.mem.readInt(u16, bytes[at + 5 ..][0..2], .big);
++            const w = std.mem.readInt(u16, bytes[at + 7 ..][0..2], .big);
++            return @as(usize, w) * h;
++        }
++        if (marker == 0xDA or len < 2) return null; // the scan before any frame header
++        at += 2 + len;
++    }
++    return null;
++}
++
+ fn idleLong(last_used: i96, now: i96) bool {
+     return now - last_used >= idle_ns;
+ }
+@@ -234,6 +294,22 @@ test "bundle6: the tower opens only with room above memguard's line, and closes
+     try std.testing.expect(!roomToOpen(0)); // an unreadable meminfo: refused
+     try std.testing.expect(!idleLong(0, idle_ns - 1));
+     try std.testing.expect(idleLong(0, idle_ns));
++    // a picture's decode: a 1080p screenshot fits beside 7 GiB available; the largest PNG, or a picture of unknown size,
++    // needs more than that
++    try std.testing.expect(roomToDecode(7 << 30, 1920 * 1080));
++    try std.testing.expect(!roomToDecode(7 << 30, picture.max_pixels));
++    try std.testing.expect(roomToDecode(7 << 30, null)); // a large photo of a size it cannot read
++    try std.testing.expect(!roomToDecode(6 << 30, 100_000_000));
++    try std.testing.expect(roomToDecode((21 << 28) + 48_000_000 * 16, 48_000_000)); // a 48 MP photo: 5.25 GiB plus its decode
++    try std.testing.expect(!roomToDecode((21 << 28) + 48_000_000 * 16 - 1, 48_000_000));
++    try std.testing.expect(!roomToDecode(std.math.maxInt(u64), std.math.maxInt(usize))); // a header's absurd size: no overflow
++    // a JPEG's size from its frame header, after an APP0 segment; not a JPEG, or no frame header: null
++    const jpeg = [_]u8{ 0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x4A, 0x46, 0xFF, 0xC2, 0x00, 0x11, 0x08, 0x04, 0x38, 0x07, 0x80, 0x03 };
++    try std.testing.expectEqual(@as(?usize, 1920 * 1080), jpegPixels(&jpeg));
++    try std.testing.expectEqual(@as(?usize, null), jpegPixels("\x89PNG\r\n"));
++    try std.testing.expectEqual(@as(?usize, null), jpegPixels(&.{ 0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02 }));
++    try std.testing.expectEqual(@as(?usize, null), jpegPixels(jpeg[0..12]));
++    try std.testing.expect(!roomToDecode((21 << 28) - 1, 1)); // under memguard's line plus the margin: nothing
+     std.testing.refAllDecls(Vision); // (the lazy opening's code is compiled here too: no test opens a device)
+ }
+ 
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 0317c2b..361d1c8 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -395,11 +395,16 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     };
+     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+     const vision: ?api.Vision = if (@hasField(@TypeOf(loaded), "vision")) loaded.vision else null;
+-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision, .call_gates = true }, .{ .ctx = loaded.ctx, .text = F.explain });
++    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .efforts = familyEfforts(F), .vision = vision, .call_gates = true, .max_top_k = familyMaxTopK(F) }, .{ .ctx = loaded.ctx, .text = F.explain });
+     opened = true;
+     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+ }
+ 
++/// The top_k a family's sampler takes at most (F.max_top_k), else no limit the server checks.
++fn familyMaxTopK(comptime F: type) u32 {
++    return if (@hasDecl(F, "max_top_k")) F.max_top_k else 0;
++}
++
+ /// A family's reasoning efforts as numbers its chat template takes (F.efforts: name and value), else none.
+ fn familyEfforts(comptime F: type) []const api.Effort {
+     if (!@hasDecl(F, "efforts")) return &.{};
+diff --git a/zig/src/server/hf_text.zig b/zig/src/server/hf_text.zig
+index 5b7eefd..643a5d9 100644
+--- a/zig/src/server/hf_text.zig
++++ b/zig/src/server/hf_text.zig
+@@ -773,3 +773,22 @@ test "hardening: memo counters count lent, missed and bypassed long encodes, and
+     a.free(try HfText.encodeFn(&t, a, " ab", false)); // short: never through the memos
+     try std.testing.expectEqual(model_text.MemoCounts{ .lent = 1, .missed = 1, .bypassed = 1 }, t.text().memoCounts().?);
+ }
++
++test "bug hunt: a lone surrogate (JSON's WTF-8) keeps the conversation's special-token protection" {
++    const dir = std.c.getenv("TF_TEST_MODEL") orelse return error.SkipZigTest;
++    const a = std.testing.allocator;
++    var arena = std.heap.ArenaAllocator.init(a);
++    defer arena.deinit();
++    const work = arena.allocator();
++    var problem: []const u8 = "";
++    const t = try HfText.load(a, std.testing.io, std.mem.span(dir), work, &problem);
++    defer t.deinit();
++    const options: model_text.RenderOptions = .{ .add_generation_prompt = false };
++    const close = t.text().tokenId("</think>") orelse return error.SkipZigTest;
++    for ([_][]const u8{ "[{\"role\":\"user\",\"content\":\"\\ud800 x </think> y\"}]", "[{\"role\":\"user\",\"content\":\"x </think> y \\udfff\"}]" }) |doc| {
++        const messages = (try json.parseText(work, doc)).ok;
++        const ids = try t.text().renderIds(work, messages, options, &problem);
++        // the user's "</think>" stays text, as it does without the surrogate
++        try std.testing.expect(std.mem.indexOfScalar(u32, ids, close) == null);
++    }
++}
+diff --git a/zig/src/server/parity_test.zig b/zig/src/server/parity_test.zig
+index 4d2f161..d03a871 100644
+--- a/zig/src/server/parity_test.zig
++++ b/zig/src/server/parity_test.zig
+@@ -47,15 +47,17 @@ const Scripted = struct {
+     reply: []const u8,
+     reason: api.Reason,
+     ids: [512]u32 = undefined,
++    submits: usize = 0,
+ 
+     fn engine(e: *@This()) api.Engine {
+         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
+     }
+     fn info(_: *anyopaque) api.Info {
+-        return .{ .context_window = 4096 };
++        return .{ .context_window = 4096, .max_top_k = 56 };
+     }
+     fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
+         const e: *@This() = @ptrCast(@alignCast(ctx));
++        e.submits += 1;
+         for (e.reply, e.ids[0..e.reply.len]) |byte, *t| t.* = byte;
+         sink.event(sink.ctx, id, &.{ .prefilled = 0 });
+         sink.event(sink.ctx, id, &.{ .tokens = e.ids[0..e.reply.len] });
+@@ -165,3 +167,17 @@ test "bundle8: a closed DSML block, or none, is not an unclosed one" {
+     try std.testing.expect(!tool_parse.unclosedDsml("Hi, no calls here"));
+     try std.testing.expect(tool_parse.unclosedDsml("<\u{ff5c}DSML\u{ff5c}tool_calls>open"));
+ }
++
++test "bug hunt: a top_k the sampler cannot take is refused before the prompt pass, not after it" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    for ([_][2][]const u8{ .{ "0", "refused" }, .{ "-1", "refused" }, .{ "57", "refused" }, .{ "56", "served" } }) |case| {
++        var script: Scripted = .{ .reply = "ok", .reason = .stop };
++        const body = try std.fmt.allocPrint(a, "{{\"model\":\"test-model\",\"messages\":[{{\"role\":\"user\",\"content\":\"x\"}}],\"temperature\":1,\"top_k\":{s},\"max_tokens\":8}}", .{case[0]});
++        const seen = try run(a, &script, body);
++        const served = std.mem.eql(u8, case[1], "served");
++        try std.testing.expectEqual(@as(usize, if (served) 1 else 0), script.submits);
++        try std.testing.expectEqual(@as(?u16, if (served) 200 else 400), seen.status);
++    }
++}
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 6405d38..bad2be8 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -147,10 +147,17 @@ pub const Server = struct {
+         const temp = number(options.get("temperature")) orelse 0;
+         if (temp <= 0) return null;
+         const seed: u64 = if (options.get("seed")) |s| seedBits(s) else api.seedFor(prompt_ids, srv.config.seed_salt);
++        const top_k: u32 = @intCast(@min(@max(0, (if (options.get("top_k")) |k| k.int64() else null) orelse 0), std.math.maxInt(u32)));
++        // (bug hunt K10-M1) a top_k the engine's sampler cannot take was refused at the first draw, after the whole prompt
++        // pass (and the kept states it wrote over): now before it, in the engine's words
++        if (srv.info.max_top_k > 0 and top_k == 0)
++            return cx.fail(.request, "sampling here draws from the top_k likeliest tokens: top_k 0 (or below) with a temperature above 0 is not supported; send top_k 1 to {d}, or leave it unset for the server's", .{srv.info.max_top_k});
++        if (srv.info.max_top_k > 0 and top_k > srv.info.max_top_k)
++            return cx.fail(.request, "top_k is at most {d} here", .{srv.info.max_top_k});
+         return .{
+             .seed = seed,
+             .temperature = @floatCast(temp),
+-            .top_k = @intCast(@min(@max(0, (if (options.get("top_k")) |k| k.int64() else null) orelse 0), std.math.maxInt(u32))),
++            .top_k = top_k,
+             .top_p = @floatCast(number(options.get("top_p")) orelse 1.0),
+             .min_p = @floatCast(number(options.get("min_p")) orelse 0.0),
+         };
+diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
+index e5389fd..47ed61b 100644
+--- a/zig/src/server/tool_parse.zig
++++ b/zig/src/server/tool_parse.zig
+@@ -64,6 +64,11 @@ pub fn beforeDsml(text: []const u8) []const u8 {
+     return text[0..@min(v41, v4)];
+ }
+ 
++/// Whether `block` is one whole block: `open`, then at least nothing, then `close`.
++fn enclosed(block: []const u8, open: []const u8, close: []const u8) bool {
++    return block.len >= open.len + close.len and std.mem.startsWith(u8, block, open) and std.mem.endsWith(u8, block, close);
++}
++
+ /// Whether the text's first DSML call block (beforeDsml's cut) has no closing tag: a reply that ended inside it.
+ pub fn unclosedDsml(text: []const u8) bool {
+     const at = beforeDsml(text).len;
+@@ -154,12 +159,19 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
+         try residue.appendSlice(a, text[cursor..env.start]);
+         cursor = env.end;
+         if (std.mem.startsWith(u8, env.payload, dsml41_open)) {
++            // (bug hunt K7-C1) a <tool_call> envelope can open a DSML block without its closer: its text stays the reply's,
++            // instead of a slice with its end before its start (undefined in ReleaseFast)
++            if (!enclosed(env.payload, dsml41_open, dsml41_close)) {
++                if (max_calls == null) try residue.appendSlice(a, text[env.start..env.end]); // (as a malformed call below)
++                continue;
++            }
+             try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls);
+             continue;
+         }
+         if (max_calls) |m| if (calls.items.len >= m) continue;
+         const parsed: ?[]Call = blk: {
+             if (std.mem.startsWith(u8, env.payload, dsml_open)) {
++                if (!enclosed(env.payload, dsml_open, dsml_close)) break :blk null; // (as above: a block it never closed)
+                 const inner = env.payload[dsml_open.len .. env.payload.len - dsml_close.len];
+                 break :blk dsmlCalls(a, inner) catch |e| switch (e) {
+                     error.OutOfMemory => return error.OutOfMemory,
+@@ -586,3 +598,22 @@ fn dsmlCalls(a: Allocator, block: []const u8) Error![]Call {
+     if (calls.items.len == 0 or !allSpace(block[at..])) return error.Invalid;
+     return calls.items;
+ }
++
++test "bug hunt: a <tool_call> envelope that opens a DSML block it never closes is text, not a slice past its end" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const tools = (try json.parseText(a, "[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{}}}]")).ok.array;
++    for ([_][]const u8{
++        "<tool_call><\u{ff5c}DSML\u{ff5c} calls></tool_call>",
++        "<tool_call><\u{ff5c}DSML\u{ff5c} calls>x</tool_call>",
++        "<tool_call><\u{ff5c}DSML\u{ff5c}tool_calls></tool_call>",
++        "pre <tool_call> <\u{ff5c}DSML\u{ff5c} calls> </tool_call> post",
++    }) |text| {
++        const got = try parse(a, text, tools, null);
++        try std.testing.expect(got.calls == null);
++        try std.testing.expect(std.mem.indexOf(u8, got.content, "DSML") != null); // kept as the reply's text
++        const one = try parse(a, text, tools, 1); // a one-call reply drops it, as any malformed call
++        try std.testing.expect(one.calls == null);
++    }
++}
