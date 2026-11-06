@@ -264,6 +264,12 @@ foreground() {
   w=0; wait "$watch" || w=$?
   code=$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 1)
   [[ "$w" != 1 || "$code" != 0 ]] || code=1         # the worker's rank failed, even if rank 0 then shut down cleanly
+  # rank 0 ended cleanly but nobody asked (./stop.sh leaves STOP_MARK; a systemd stop exits 130 through the trap above):
+  # a docker daemon restart, say. Exit 75 so that Restart=on-failure starts the pair again instead of leaving it down.
+  if [[ "$code" == 0 && ! -e "$STOP_MARK" ]]; then
+    warn "rank 0 ended with status 0 but no stop was asked for: exiting 75 for the supervisor to restart it"
+    code=75
+  fi
   worker 1 "docker stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME'" >/dev/null 2>&1 || true
   exit "$code"
 }
@@ -330,6 +336,7 @@ rank_nccl_args 0
 here+=("${NCCL_ARGS[@]}" "$IMAGE" "${SERVE[@]}")
 if (( DRY )); then printf '[dry-run] rank 0 here:\n  %s\n' "$(printf '%q ' "${here[@]}")"; exit 0; fi
 log "Rank 0 here: ${SERVE[*]}"
+rm -f "$STOP_MARK"                                   # (a stop from here on leaves it again: foreground() reads it)
 "${here[@]}" >/dev/null
 [[ "${FOREGROUND:-0}" != 1 ]] || foreground
 

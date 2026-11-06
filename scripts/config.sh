@@ -244,6 +244,7 @@ if [[ "$ABLIT" == 1 && "$WORKER_CACHE_DIR" != *"-ablit-${ABLIT_REVISION:0:8}" ]]
   WORKER_CACHE_DIR+="-ablit-${ABLIT_REVISION:0:8}"
 fi
 STATE_DIR="${STATE_DIR:-$HOME/.local/state/dsv41-tensorfold}"   # locks and the prepared marker
+STOP_MARK="$STATE_DIR/stop-requested"   # ./stop.sh leaves it; start.sh removes it before rank 0 starts
 LOG_DIR="${LOG_DIR:-$HOME/.cache/dsv41-tensorfold/logs}"
 LOG_KEEP="${LOG_KEEP:-10}"
 # Each rank's container log (docker's json-file driver) rotates once it reaches LOG_MAX_SIZE, keeping LOG_MAX_FILE files: the

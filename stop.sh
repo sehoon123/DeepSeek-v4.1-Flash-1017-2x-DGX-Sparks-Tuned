@@ -13,6 +13,8 @@ set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
 source ./scripts/nodes.sh
+# a stop asked for: start.sh's foreground mode then exits 0 for it, not 75 (an unasked clean end restarts)
+(( ${DRY_RUN:-0} == 1 )) || { mkdir -p "$STATE_DIR"; touch "$STOP_MARK"; }
 
 # Where the containers are: here (rank 0) and on the workers (rank i on worker i)
 here=0; docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME" && here=1
