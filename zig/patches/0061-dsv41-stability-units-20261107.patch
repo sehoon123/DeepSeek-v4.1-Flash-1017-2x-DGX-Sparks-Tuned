@@ -1,0 +1,345 @@
+Subject: [PATCH] stability and speed units of 2026-11-06/07 on 2 x DGX Spark (both ranks)
+
+On top of 0060 (the bundle-10 tree), bundle 11: a stream whose first round copies from its prompt asks the drafter for no
+first drafts when the copy holds (the copy probe at admission, as later rounds since 0060); the Pillow child's exchange
+has a 110 s deadline (a hung child held every later non-PNG picture; it is killed, restarted and that picture refused),
+and a failed retry always restarts it; /metrics counts every reply's status without API keys too (key="unauthenticated").
+CPU-tested with red copies, source-reviewed, and A/B-checked on the pair: 92/92 replies exact against bundle 10
+(research/LOCAL-STACK-20261106.md, "Bundle 11"). Generated with `git diff --binary` in a checkout of the 0060 tree;
+`git apply` of it gives the served source file for file (1286 files, sha256-compared).
+
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 6486dc8..bffb361 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -110,25 +110,28 @@ pub const Engine = struct {
+             const first = try e.readFeed(feed);
+             feed = .{ .value = try e.correctCall(s, first) };
+         }
+-        var asked: ?u32 = null;
+-        if (e.cfg.family_mtp and s.drafts) {
++        const drafting = e.cfg.family_mtp and s.drafts;
++        // (bundle 11) the depth by the room before the first token lands, as before; the copy probe reads the context after it
++        const by_room: i64 = if (!drafting or (s.gate != null and s.force.items.len > 0)) 0 else try e.rule.depth(win.who(s));
++        if (!drafting and e.cfg.pipelined) try e.queueNext(s, feed);
++        const value = try e.readFeed(feed);
++        _ = try s.commit(e.gpa, &.{value});
++        s.pending = value;
++        if (drafting) {
++            // then Rule.headDepth as every later round asks it: none for a copy ahead that holds (the first plan's window,
++            // which drops held drafts)
++            const w = win.who(s);
++            const d: u32 = @intCast(try e.rule.headDepth(&w, by_room, win.probe(e)));
+             // the head reads the prompt's last row and the first token, and drafts the one after it
+-            const d: u32 = if (s.gate != null and s.force.items.len > 0) 0 else @intCast(try e.rule.depth(win.who(s)));
+-            asked = d;
+             try e.backend.draft(&.{.{ .stream = s, .follow = &.{}, .first = feed, .rows = null, .start = s.prompt_len, .position = position + 1, .depth = d }});
+             s.dropHeld(e.gpa);
+             s.next = .{ .count = d };
+-        } else if (e.cfg.pipelined) {
+-            try e.queueNext(s, feed);
++            try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position + 1)), f("follow", .{ .u32s = &.{value} }), f("rows", .null) });
+         }
+-        const value = try e.readFeed(feed);
+-        if (asked) |d| try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position + 1)), f("follow", .{ .u32s = &.{value} }), f("rows", .null) });
+         if (e.log != null) {
+             const first = if (feed == .handle) value else try e.backend.read(drawn);
+             try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(first)), f("token", int(value)) });
+         }
+-        _ = try s.commit(e.gpa, &.{value});
+-        s.pending = value;
+         try trail.resolve(e);
+         if (s.finished) {
+             try trail.finish(e, s);
+diff --git a/zig/src/core/lanes/engine_test.zig b/zig/src/core/lanes/engine_test.zig
+index 264e7e8..14f61b4 100644
+--- a/zig/src/core/lanes/engine_test.zig
++++ b/zig/src/core/lanes/engine_test.zig
+@@ -224,3 +224,55 @@ test "bundle4c: a required call's gate leaves a held stream's tokens as drawn, t
+         try std.testing.expectEqualSlices(u32, plain, gated);
+     }
+ }
++
++/// (bundle 11) X, y, a filler, then X again, where y is the fake's first token after it: round 1 copies from the prompt.
++fn copiedPrompt(sampling: ?Sampling) ![23]u32 {
++    var p = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 0, 40, 41, 42, 43, 44, 45, 1, 2, 3, 4, 5, 6, 7, 8 };
++    for (0..fake.vocab) |y| {
++        p[8] = @intCast(y);
++        if (fake.next(&p, sampling, p.len) == y) return p;
++    }
++    return error.NoFirstTokenCopies;
++}
++
++test "bundle11: a stream whose first round copies from its prompt asks the head for no first drafts, and its tokens stay the target's" {
++    const sampled: Sampling = .{ .seed = 5, .temperature = 0.7, .top_k = 0, .top_p = 0.95 };
++    for ([_][]const ?Sampling{ &.{null}, &.{sampled}, &.{ null, sampled } }) |samplings| {
++        var cfg = try model();
++        defer cfg.deinit(gpa);
++        var target: fake.Fake = .{ .gpa = gpa };
++        defer target.deinit();
++        var clock: fake.FixedClock = .{};
++        var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++        defer engine.deinit();
++        var prompts: [2][23]u32 = undefined;
++        var proposers: [2]SuffixLookup = undefined;
++        var streams: [2]sm.Stream = undefined;
++        var made: usize = 0;
++        defer for (streams[0..made], proposers[0..made]) |*s, *p| {
++            s.deinit(gpa);
++            p.deinit();
++        };
++        const n = samplings.len;
++        for (samplings, prompts[0..n], proposers[0..n], streams[0..n]) |sampling, *prompt, *p, *s| {
++            prompt.* = try copiedPrompt(sampling);
++            p.* = try SuffixLookup.init(gpa, .{ .min_match = 4 });
++            s.* = try sm.Stream.init(gpa, .{ .id = "copied", .prompt = prompt, .max_new = 40, .sampling = sampling, .proposer = p.proposer() });
++            made += 1;
++        }
++        for (streams[0..n]) |*s| try engine.addStream(s);
++        while (engine.activeCount() > 0) try engine.step();
++        try std.testing.expect(target.host_windows > 0); // copy windows ran, round 1's among them
++        try std.testing.expectEqual(@as(usize, 0), target.held_dropped);
++        for (samplings, prompts[0..n], streams[0..n]) |sampling, prompt, *s| {
++            var history: std.ArrayList(u32) = .empty;
++            defer history.deinit(gpa);
++            try history.appendSlice(gpa, &prompt);
++            for (s.emitted()) |t| {
++                try std.testing.expectEqual(fake.next(history.items, sampling, history.items.len), t);
++                try history.append(gpa, t);
++            }
++            try std.testing.expectEqual(@as(usize, 40), s.emitted().len);
++        }
++    }
++}
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index 6c83493..d50e044 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -99,4 +99,5 @@ test {
+     refAll(lanes);
+     refAll(pool);
+     refAll(display);
++    refAll(pil); // (bundle 11) its tests, under a --test-filter too
+ }
+diff --git a/zig/src/families/dsv41/pil.zig b/zig/src/families/dsv41/pil.zig
+index b86645b..72779da 100644
+--- a/zig/src/families/dsv41/pil.zig
++++ b/zig/src/families/dsv41/pil.zig
+@@ -7,6 +7,13 @@
+ const std = @import("std");
+ const picture = @import("picture.zig");
+ const Allocator = std.mem.Allocator;
++const posix = std.posix;
++
++/// (bundle 11) One picture's exchange at most. Pillow's largest picture here: 134,217,728 pixels (picture.max_pixels,
++/// 384 MiB of RGB through the pipe): about 27 s at 5 Mpx/s, an estimate (not measured for the slowest codecs). 110 s
++/// keeps four times that and stays under the proxy's 120 s wait for a non-streamed reply; a child past it is taken as
++/// hung, which would hold every later picture behind the mutex.
++pub const deadline_ms: i32 = 110_000;
+ 
+ /// The child: a request is the image's length (u64 LE) and bytes; the answer a status byte (0: pixels, 1: Pillow's
+ /// DecompressionBombError, 2: another error), width, height and the length of what follows (u64 LE each), then the
+@@ -45,27 +52,30 @@ pub const Pil = struct {
+     io: std.Io,
+     child: std.process.Child,
+     mutex: std.Io.Mutex = .init,
+-    reader: std.Io.File.Reader,
+-    buf: [64 << 10]u8 = undefined,
++    program: []const u8 = script, // (bundle 11) the child's script and deadline (another in tests)
++    deadline_ms: i32 = deadline_ms,
+     /// Pillow's version, as the child reports it on start.
+     version: [13]u8 = undefined,
+ 
+     /// The child started and its Pillow named; error when there is no python3 or no Pillow.
+     pub fn start(gpa: Allocator, io: std.Io) !*Pil {
++        return startWith(gpa, io, script, deadline_ms);
++    }
++
++    fn startWith(gpa: Allocator, io: std.Io, program: []const u8, deadline: i32) !*Pil {
+         const p = try gpa.create(Pil);
+         errdefer gpa.destroy(p);
+-        p.* = .{ .gpa = gpa, .io = io, .child = undefined, .reader = undefined };
++        p.* = .{ .gpa = gpa, .io = io, .child = undefined, .program = program, .deadline_ms = deadline };
+         try p.spawn();
+         return p;
+     }
+ 
+-    /// The child, its reader, and Pillow's greeting.
++    /// The child and Pillow's greeting.
+     fn spawn(p: *Pil) !void {
+-        p.child = try std.process.spawn(p.io, .{ .argv = &.{ "python3", "-I", "-c", script }, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit });
++        p.child = try std.process.spawn(p.io, .{ .argv = &.{ "python3", "-I", "-c", p.program }, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit });
+         errdefer p.child.kill(p.io);
+-        p.reader = p.child.stdout.?.readerStreaming(p.io, &p.buf);
+         var hello: [16]u8 = undefined;
+-        p.reader.interface.readSliceAll(&hello) catch return error.NoPillow;
++        p.take(&hello, p.due()) catch return error.NoPillow;
+         if (!std.mem.eql(u8, hello[0..3], "PIL")) return error.NoPillow;
+         @memcpy(&p.version, hello[3..16]);
+     }
+@@ -100,33 +110,63 @@ pub const Pil = struct {
+                 p.fresh();
+                 return err;
+             },
++            error.PillowTimeout => return p.givenUp(a),
+             else => {
+                 std.log.warn("Pillow's child failed ({s}): starting it again", .{@errorName(err)});
+                 p.child.kill(p.io);
+                 try p.spawn();
+                 return p.exchange(a, data) catch |e| {
+-                    if (e == error.OutOfMemory or e == error.BadPillowReply) p.fresh();
++                    if (e == error.PillowTimeout) return p.givenUp(a);
++                    p.fresh(); // (review a187807b: a retry that failed any way leaves no child half way through a reply)
+                     return e;
+                 };
+             },
+         };
+     }
+ 
++    /// (bundle 11) A child past the deadline: killed, another started, and the picture refused.
++    fn givenUp(p: *Pil, a: Allocator) !Decoded {
++        std.log.warn("Pillow's child took over {d} ms on a picture: starting it again", .{p.deadline_ms});
++        p.fresh();
++        return .{ .refused = try std.fmt.allocPrint(a, "image input: the image decoder did not finish this picture in {d} s; send a smaller image, or a PNG", .{@divTrunc(p.deadline_ms, 1000)}) };
++    }
++
++    /// The deadline of an exchange starting now (Clock.awake ns).
++    fn due(p: *const Pil) i96 {
++        return std.Io.Clock.awake.now(p.io).toNanoseconds() + @as(i96, p.deadline_ms) * std.time.ns_per_ms;
++    }
++
++    /// (bundle 11) `dest` whole from the child, as the tree times reads (http_conn.zig): poll, then read what is there.
++    fn take(p: *Pil, dest: []u8, deadline: i96) !void {
++        const fd = p.child.stdout.?.handle;
++        var got: usize = 0;
++        while (got < dest.len) {
++            const left = deadline - std.Io.Clock.awake.now(p.io).toNanoseconds();
++            if (left <= 0) return error.PillowTimeout;
++            var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
++            if (try posix.poll(&fds, @intCast(@divTrunc(left + std.time.ns_per_ms - 1, std.time.ns_per_ms))) == 0) return error.PillowTimeout;
++            const n = try posix.read(fd, dest[got..]);
++            if (n == 0) return error.EndOfStream;
++            got += n;
++        }
++    }
++
+     fn exchange(p: *Pil, a: Allocator, data: []const u8) !Decoded {
++        const deadline = p.due();
+         var len: [8]u8 = undefined;
+         std.mem.writeInt(u64, &len, data.len, .little);
+         const in = p.child.stdin orelse return error.NoPillow;
+         try in.writeStreamingAll(p.io, &len);
+         try in.writeStreamingAll(p.io, data);
+         var head: [25]u8 = undefined;
+-        try p.reader.interface.readSliceAll(&head);
++        try p.take(&head, deadline);
+         const w: usize = @intCast(std.mem.readInt(u64, head[1..9], .little));
+         const h: usize = @intCast(std.mem.readInt(u64, head[9..17], .little));
+         const n: usize = @intCast(std.mem.readInt(u64, head[17..25], .little));
+         if (head[0] == 0 and n != w * h * 3) return error.BadPillowReply;
+         const body = try a.alloc(u8, n);
+         errdefer a.free(body);
+-        try p.reader.interface.readSliceAll(body);
++        try p.take(body, deadline);
+         return switch (head[0]) {
+             0 => .{ .rgb = .{ .w = w, .h = h, .px = body } },
+             1 => .{ .refused = body },
+@@ -134,3 +174,42 @@ pub const Pil = struct {
+         };
+     }
+ };
++
++/// (bundle 11) A child without Pillow: each picture is 1 x 1, the RGB of its first three bytes ("hang": after 10 s).
++const slow_script =
++    \\import struct, sys, time
++    \\inp, out = sys.stdin.buffer, sys.stdout.buffer
++    \\out.write(b"PIL" + b"slow".ljust(13))
++    \\out.flush()
++    \\while True:
++    \\    n = inp.read(8)
++    \\    if len(n) < 8:
++    \\        sys.exit(0)
++    \\    data = inp.read(struct.unpack("<Q", n)[0])
++    \\    if data == b"hang":
++    \\        time.sleep(10)
++    \\    out.write(struct.pack("<BQQQ", 0, 1, 1, 3) + data[:3])
++    \\    out.flush()
++;
++
++test "bundle11: a picture past the deadline is refused in time, and the next one decodes" {
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    const p = Pil.startWith(gpa, io, slow_script, 2000) catch |e| {
++        std.debug.print("no python3 here ({s})\n", .{@errorName(e)});
++        return error.SkipZigTest;
++    };
++    defer p.stop(gpa);
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const started = std.Io.Clock.awake.now(io).toNanoseconds();
++    const hung = try p.decode(a, "hang");
++    const took = std.Io.Clock.awake.now(io).toNanoseconds() - started;
++    try std.testing.expect(hung == .refused);
++    try std.testing.expect(std.mem.startsWith(u8, hung.refused, "image input: the image decoder did not finish"));
++    try std.testing.expect(took >= 2000 * std.time.ns_per_ms and took < 6000 * std.time.ns_per_ms);
++    const next = try p.decode(a, "rgb");
++    try std.testing.expect(next == .rgb);
++    try std.testing.expectEqualSlices(u8, "rgb", next.rgb.px);
++}
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index bad2be8..93194d4 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -284,7 +284,7 @@ pub const Server = struct {
+         defer conn.deinit();
+         conn.timeouts = srv.config.timeouts;
+         conn.auth_enabled = srv.keys != null and srv.keys.?.enabled();
+-        if (conn.auth_enabled) conn.hook = .{ .ctx = srv, .call = countReply };
++        conn.hook = .{ .ctx = srv, .call = countReply }; // (bundle 11) keys or none: "unauthenticated" without them
+         var arena: std.heap.ArenaAllocator = .init(srv.gpa);
+         defer arena.deinit();
+         while (true) {
+@@ -370,3 +370,42 @@ fn lateSystem(a: Allocator, text: model_text.Text) ![]const u8 {
+ fn needsUserAfterTool(source: []const u8) bool {
+     return std.mem.indexOf(u8, source, "No user query found") != null;
+ }
++
++const Idle = struct {
++    fn info(_: *anyopaque) api.Info {
++        return .{};
++    }
++    fn submit(_: *anyopaque, _: api.Id, _: *const api.Request, _: api.Sink) api.SubmitError!void {
++        unreachable;
++    }
++    fn cancel(_: *anyopaque, _: api.Id) void {}
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++};
++
++test "bundle11: /metrics counts every reply's status, under key \"unauthenticated\" when keys are off" {
++    const gpa = std.testing.allocator;
++    var idle: u8 = 0;
++    const engine: api.Engine = .{ .ctx = &idle, .vtable = &.{ .info = Idle.info, .submit = Idle.submit, .cancel = Idle.cancel, .status = Idle.status, .memory = Idle.memory } };
++    var srv: Server = .{ .gpa = gpa, .io = std.testing.io, .engine = engine, .info = .{}, .text = undefined, .config = .{ .served_name = "t", .model_ids = &.{"t"} }, .keys = null, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa) };
++    defer {
++        for (srv.metrics.requests.items) |r| gpa.free(r.key);
++        srv.metrics.requests.deinit(gpa);
++        srv.store.deinit();
++        srv.arena.deinit();
++    }
++    var pair: [2]std.c.fd_t = undefined;
++    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair));
++    defer _ = std.c.close(pair[0]);
++    const asked: []const u8 = "GET /nowhere HTTP/1.1\r\nHost: t\r\n\r\nGET /nowhere HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
++    try std.testing.expectEqual(@as(isize, @intCast(asked.len)), std.c.write(pair[0], asked.ptr, asked.len));
++    srv.connection(.{ .fd = pair[1], .peer = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } } }); // (it closes pair[1])
++    var out: std.Io.Writer.Allocating = .init(gpa);
++    defer out.deinit();
++    try srv.metrics.render(srv.io, &out.writer, srv.engine, 4096);
++    try std.testing.expect(std.mem.indexOf(u8, out.written(), "requests_total{key=\"unauthenticated\",status=\"404\"} 2\n") != null);
++}

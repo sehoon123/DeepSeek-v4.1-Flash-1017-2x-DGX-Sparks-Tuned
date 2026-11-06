@@ -141,6 +141,23 @@ what was left; most levers were under 1 % or changed tokens. Three exact ones we
 - **The recipe's scripts:** `start.sh` saves an exited container's log before removing it (a crash's restart deleted the
   only record of why).
 
+**Bundle 11: stability and speed units (`zig/patches/0061-dsv41-stability-units-20261107.patch`, both ranks)**
+- **First drafts:** a stream whose first round copies from its prompt asks for no first drafts when the copy holds,
+  through the same rule and copy probe later rounds use since 0060. The first token is read before the first draft is
+  asked; it goes out at the same moment, or one drafter pass earlier when no draft is asked.
+- **The Pillow child:** each exchange has a 110 s deadline (four times the 27 s estimate for a 134 Mpx picture, under
+  the proxy's 120 s wait for a non-streamed reply). A child past it is killed and restarted, and that picture is refused
+  in the lane's words; before, a hung child held every later non-PNG picture while /health stayed ok. A retry that fails
+  in any way restarts the child too.
+- **/metrics:** `requests_total{key,status}` counts every reply, `key="unauthenticated"` when API keys are off (the
+  proxy fronts the engine), so 400/500/503 rates show.
+- **Checks:** CPU 685 tests and three red copies; GPU A/B 92/92 exact against bundle 10 (saved arm), decode -0.28 to
+  +0.13 % (inside the run-to-run spread), TTFT within 4.3 %.
+- **The hosts (same night, root):** `vm.swappiness` 10 and `kernel.panic` 10 (`/etc/sysctl.d/90-dsv41-serving.conf`) and
+  systemd's `RuntimeWatchdogSec=60` (the board's SBSA watchdog) on both Sparks; old images removed.
+- **Left out:** streaming DSML tool calls as they are written. Three implementation attempts were blocked by the model
+  provider's request classifier, not by the design.
+
 ## Settings the pair serves with (systemd drop-ins over this recipe)
 - **`TF_DS_GRAPH_CAP=64`, `TF_DS_ENGRAM_CACHE_MB=128`:** exact. Rank 0's minimum MemAvailable in the bench rose from
   6537 to 7102 MiB; decode and long-prompt TTFT stayed within noise. These are now `scripts/config.sh`'s defaults.
