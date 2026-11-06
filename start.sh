@@ -200,6 +200,9 @@ if docker image inspect "$IMAGE" >/dev/null 2>&1; then
 fi
 if (( ! DRY )); then
   if running_here || running_worker 1; then ./stop.sh; fi
+  # a container that exited by itself (a crash, exit 75 or 70) is removed below: its log first, the only record of why
+  save_log "$LOG_DIR" 0 "$CONTAINER_NAME" "$LOG_KEEP" >/dev/null || warn "could not save rank 0's log to $LOG_DIR"
+  worker_save_log 1 >/dev/null || warn "could not save rank 1's log on $(worker_host 1)"
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   worker 1 "docker rm -f '$CONTAINER_NAME' >/dev/null 2>&1; true"
   if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then die "port $PORT is already in use: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2)"; fi
