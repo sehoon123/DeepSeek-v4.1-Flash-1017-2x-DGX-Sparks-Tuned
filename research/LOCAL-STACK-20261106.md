@@ -225,8 +225,10 @@ what was left; most levers were under 1 % or changed tokens. Three exact ones we
 - **GB10 downloads through a pinned bounce:** with driver 580.178.04, a synchronous device-to-host copy straight into
   pageable memory can report success while some pages keep their old bytes (TensorFold upstream a3962b45 measured 10 of
   60 runs). GB10 reports itself integrated on both nodes, so every such copy (the drafter's two each pass, the vision
-  tower's span, calibration, profiling, tools) now lands in a 4 MiB pinned buffer per thread and is copied on. Decode in
-  the window: -0.3 to -0.6 % (inside the 5 % gate; the run-to-run spread was not measured, so no cost is claimed).
+  tower's span, calibration, profiling, tools) now lands in a 4 MiB pinned buffer per thread and is copied on. Decode:
+  -0.32 to -0.59 % against the previous day's bundle 14 run, -0.35 to +0.05 % against bundle 14 measured the same night;
+  the same binary moved -0.16 to -0.42 % across the day and six timed repeats spread about 0.4-0.5 %, so a cost of up to
+  about 0.3 % from the staged copies cannot be excluded.
 - **A failed graph capture no longer poisons the next:** a stretch that failed inside its capture left two join flags
   set, so every later capture waited on the dead capture's event and failed (901) until a restart while /health stayed
   ok (MiaAI-Lab pull request #119 by ldenaeyer). It now joins, ends and clears; a failed round also waits out its Engram
@@ -235,7 +237,10 @@ what was left; most levers were under 1 % or changed tokens. Three exact ones we
   batch's buffers.
 - **MiaAI-Lab 0050, the per-stream draft calibration, compiled in and off** (`TF_DS_T25_DRAFT_CAL`, rank 0 only; their
   greedy prose 79.7 to 85.4 tok/s, code unchanged). Ported with one change from the source review: a head granted no
-  drafts moves back toward no correction instead of staying undrafted. Its on/off A/B at this recipe's sampling is next.
+  drafts moves back toward no correction instead of staying undrafted. On/off A/B on the pair, same image: replies
+  identical (92/92, and 34/34 at T 1.0 / top_k 56 with fixed seeds); at this recipe's sampling, paired per request,
+  prose -0.8 % (one stream) and +0.3 % (four), code -1.7 % and -2.0 % (standard errors 0.3-0.8 points); greedy prose
+  +0.9 %. Left off: the rule set before the run (both prose cells at least +1 %, none below -1 %) was not met.
 - **Checks:** CPU 757 test executions and twelve red copies; two source reviews PASS (nonblockers taken: the lock-in,
   the Engram drain, comment order). The first GPU window stopped before any request on a harness defect (stale binary
   hashes; production returned, 92/92 identical, and reopened); the second passed: 92/92 exact, decode -0.3 to -0.6 %,
