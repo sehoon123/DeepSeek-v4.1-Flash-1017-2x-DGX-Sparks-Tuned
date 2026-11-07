@@ -3,7 +3,8 @@
 # ssh (255) or one "not running" reading leaves rank 0 alone; two "not running" readings in a row stop it (exit 1).
 # Usage: watch_rank1_test.sh RECIPE_DIR
 set -u
-R=$1
+R=$(cd "$1" && pwd)
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT; cd "$T"   # the stubs' scratch files (seq, i, here, stops)
 loop=$(awk '/\( exec 8>&-/{f=1} f{print} /done \) &/{if(f) exit}' "$R/start.sh" | sed '1s/^ *( exec 8>&-.*$/(/; $s/done ) &/done )/')
 [[ -n "$loop" ]] || { echo "FAIL: loop not found"; exit 1; }
 source "$R/scripts/nodes.sh"
