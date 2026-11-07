@@ -322,6 +322,9 @@ if [[ "$API_KEY" == 1 ]]; then
   else api_key_ensure; AUTH=(-H "@$(api_header_file)"); fi
 fi
 step 3 "Launch: container $CONTAINER_NAME, rank 1 on the worker, then rank 0 here"
+# (review a8060ced) under systemd, a stop from here on stops both ranks, as foreground()'s own trap does once it runs:
+# before, a stop during the launch left the containers running with no service around them
+if [[ "${FOREGROUND:-0}" == 1 ]] && (( ! DRY )); then trap './stop.sh; exit 130' INT TERM; fi
 cmd="tf-dsv41-lanes $MODEL_ARG /rank-cache 1 2 ${LINK_HEAD_ADDR[1]:-$MASTER_ADDR} $MASTER_PORT $KIT --engram /engram --token-map $DATA/dsv41_token_map.json $FOLLOW"
 [[ "$RDMA" == 0 ]] || cmd+=" --rdma ${NODE_HCAS[1]}"   # this node's RoCE devices
 remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro $(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[1]}") $(rank_nccl_env 1) $IMAGE $cmd"
