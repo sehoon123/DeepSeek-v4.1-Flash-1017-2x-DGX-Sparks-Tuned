@@ -6,8 +6,8 @@ for JPEG, MPO and PNG, 26 for other formats (measured at the decode's peak: 22.4
 plus the lane's RGB copy). Pillow's own size check of a picture it is about to decode, an embedded one too (ICO, ICNS,
 BLP, GIF frames, TIFF tiles), passes the same room check. The child frees a picture's objects after replying. The
 served PNG decoder takes IHDR first and once only; any other PNG is Pillow's, sized and checked there. Pictures decode
-one at a time. Before, formats other than PNG and JPEG counted as 24 Mpx, so a 134 Mpx JPEG 2000 took about 2.9 GiB for
-about 15 s, and a PNG's later IHDR decoded at a size nobody checked. CPU-tested with four red copies and a differential
+one at a time. Before, formats other than PNG and JPEG counted as 24 Mpx, so a 134 Mpx JPEG 2000 would take about
+2.9 GiB for about 15 s (x4 from 33.5 Mpx), and a PNG's later IHDR decoded at a size nobody checked. CPU-tested with four red copies and a differential
 of the child before and after on 14 inputs (byte-identical), source-reviewed twice, and A/B-checked on the pair: 92/92
 exact against 0062; a 134 Mpx GIF is refused in 3 ms without a dip (research/LOCAL-STACK-20261106.md, "Bundle 13").
 Generated with `git diff --binary` in a checkout of the 0062 tree; `git apply` of it gives the served source file for

@@ -172,15 +172,21 @@ what was left; most levers were under 1 % or changed tokens. Three exact ones we
   bundle 11 (saved arm, and bundle 11 again in the first window). Decode: +0.23 to +0.84 % in three cells across both
   windows; 4-stream prose +0.38 % and -0.87 % (inside the run-to-run spread). The first window failed the 5 % TTFT gate:
   one group of four requests started 48 ms late, and the pooled median of a 4-stream cell sits between two arrival
-  clusters. Groups that start 30-80 ms late appear in runs of bundles 5-11 too. The second window read TTFT by
-  arrival rank (each rank within 5 %, declared before it ran) and passed: +1.1 to +1.7 % (4-stream prose).
+  clusters. The second window read TTFT by arrival rank (each rank within 5 %, declared before it ran) and passed:
+  +1.1 to +1.7 % (4-stream prose). Its pooled median was +9.4 %, so the old gate would have rejected it too: the
+  promotion rests on the per-rank gate, which does not see up to two late groups of six.
+- **The late groups:** a group of four starts 44-50 ms late outside the prompt pass in about one run in two, in every
+  build since bundle 6 at least (and a code group's first prompt pass sometimes takes 31-35 ms longer). The length is
+  fixed, which a CPU throttle of the bench would not give; the cause is not known and is likely the server's.
 
 **Bundle 13: pictures' decode memory (`zig/patches/0063-dsv41-picture-memory-20261107.patch`, rank 0)**
 - **Measured first** (served image, one CPU): Pillow's child at its peak needs 14.7 (JPEG), 16.3 (AVIF), 19.2 (JPEG 2000)
   and 22.4 (WebP lossless) bytes a pixel, plus the lane's 3 for the RGB it receives; the served PNG decoder 11.5 (8-bit
   RGB) to 18.2 (16-bit RGBA). The slowest decode at the lane's largest picture (134 Mpx) is JPEG 2000, about 15 s, so the
-  110 s deadline has a 7x margin. The lane's check counted formats other than PNG and JPEG as 24 Mpx: a 134 Mpx JPEG 2000
-  passed it and took about 2.9 GiB for about 15 s, longer below memguard's line than its 4 s hold.
+  110 s deadline has about a 7x margin (the JPEG 2000 figure is x4 from 3.7 s at 33.5 Mpx, on blocky noise). The lane's
+  check counted formats other than PNG and JPEG as 24 Mpx: a 134 Mpx JPEG 2000 passed it and would take about 2.9 GiB
+  for about 15 s (x4 from 644 MiB at 33.5 Mpx, plus the lane's RGB), far longer under memguard's 4.25 GiB line than the
+  pair's 2 s hold (MEMGUARD_HOLD_S=2, hard floor 2.5 GiB).
 - **The child** checks every picture at the size its header declares before its decode, on the lane's line (4.25 GiB
   plus 1 GiB): 16 bytes a pixel for JPEG, MPO and PNG, 26 for other formats. Pillow's own size check of a picture it is
   about to decode, an embedded one too (ICO, ICNS, BLP, GIF frames, TIFF tiles), passes the same check. A refusal uses
@@ -191,7 +197,9 @@ what was left; most levers were under 1 % or changed tokens. Three exact ones we
 - **Checks:** CPU 695 tests; red copies without the check, skipping JPEG, IHDR anywhere and without the wrapper each
   fail; the child before and after gives byte-identical answers on 14 inputs; two source reviews PASS. GPU A/B 92/92
   exact against bundle 12. On the candidate: a JPEG, a small GIF and a two-IHDR PNG decode; a 134 Mpx GIF (100 KB) is
-  refused in 3 ms and rank 0's MemAvailable does not move.
+  refused in 3 ms and rank 0's MemAvailable does not move. The lock, the wrapper and slow codecs were tested on CPU
+  only. Not explained: the first picture's TTFT in the bench was 2.05 s against 1.72 s (both arms open the tower cold;
+  the second picture was unchanged).
 
 ## Settings the pair serves with (systemd drop-ins over this recipe)
 - **`TF_DS_GRAPH_CAP=64`, `TF_DS_ENGRAM_CACHE_MB=128`:** exact. Rank 0's minimum MemAvailable in the bench rose from
