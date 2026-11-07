@@ -251,10 +251,14 @@ foreground() {
   # with Bash's interruptible builtin, so systemd SIGTERM always reaches ./stop.sh and both real rank containers.
   trap 'trap - INT TERM; kill "${watch:-}" "${logs:-}" 2>/dev/null || true; ./stop.sh; exit 130' INT TERM
   ( exec 8>&-                                        # not holding start.sh's lock once start.sh has exited
+    gone=0
     while sleep 30; do
       running_here || exit 0
-      worker 1 true 2>/dev/null || continue         # a worker out of reach for a moment says nothing about its rank
-      running_worker 1 && continue
+      case $(rank_state 1) in
+        running) gone=0; continue ;;
+        unknown) continue ;;                          # ssh failed: that says nothing about rank 1
+      esac
+      (( ++gone >= 2 )) || continue                   # two readings 30 s apart: one failed ssh or docker answer once
       warn "rank 1 on $(worker_host 1) exited: stopping rank 0"
       docker stop -t "${STOP_TIMEOUT:-30}" "$CONTAINER_NAME" >/dev/null 2>&1
       exit 1
@@ -273,7 +277,9 @@ foreground() {
     warn "rank 0 ended with status 0 but no stop was asked for: exiting 75 for the supervisor to restart it"
     code=75
   fi
-  worker 1 "docker stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME'" >/dev/null 2>&1 || true
+  # rank 0 has ended: rank 1 holds nothing to keep, and as its container's process 1 without a SIGTERM handler it would
+  # sit out docker stop's 30 s before the kill (review a8060ced); its log stays with the container for the next start
+  worker 1 "docker kill '$CONTAINER_NAME'" >/dev/null 2>&1 || true
   exit "$code"
 }
 # This recipe: on an overlay checkpoint whose stock shards are gone, scripts/prepare.sh leaves the drafter's confidence head

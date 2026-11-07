@@ -27,6 +27,14 @@ worker() {
   ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 "$(worker_host "$i")" "$@"
 }
 
+# rank_state <i>: rank i's container on its worker: running, stopped (docker answered: not running, or no such container)
+# or unknown (ssh itself failed, status 255: a worker out of reach for a moment says nothing about its rank).
+rank_state() {
+  local s r
+  s=$(worker "$1" docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null); r=$?
+  if (( r == 255 )); then echo unknown; elif [[ "$s" == true ]]; then echo running; else echo stopped; fi
+}
+
 # save_log <dir> <rank> <container> <keep>: the container's log (stdout and stderr, with timestamps) gzipped into
 # <dir>/<date>-<time>-rank<N>.log.gz before the container is removed (docker rm deletes it), keeping the newest <keep>
 # of that rank; prints the file. Runs on the worker too (its definition is sent over ssh): no config.sh there.
