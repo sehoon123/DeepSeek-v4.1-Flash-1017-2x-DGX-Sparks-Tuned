@@ -1,0 +1,279 @@
+Subject: [PATCH] pictures' decode memory on rank 0: every picture checked at its size before its decode (2 x DGX Spark)
+
+On top of 0062 (the bundle-12 tree), bundle 13. Pillow's child checks every picture at the size its header declares
+before decoding it, against the same line as the lane's own check (memguard's 4.25 GiB plus 1 GiB): 16 bytes a pixel
+for JPEG, MPO and PNG, 26 for other formats (measured at the decode's peak: 22.4 for WebP lossless, 19.2 for JPEG 2000,
+plus the lane's RGB copy). Pillow's own size check of a picture it is about to decode, an embedded one too (ICO, ICNS,
+BLP, GIF frames, TIFF tiles), passes the same room check. The child frees a picture's objects after replying. The
+served PNG decoder takes IHDR first and once only; any other PNG is Pillow's, sized and checked there. Pictures decode
+one at a time. Before, formats other than PNG and JPEG counted as 24 Mpx, so a 134 Mpx JPEG 2000 took about 2.9 GiB for
+about 15 s, and a PNG's later IHDR decoded at a size nobody checked. CPU-tested with four red copies and a differential
+of the child before and after on 14 inputs (byte-identical), source-reviewed twice, and A/B-checked on the pair: 92/92
+exact against 0062; a 134 Mpx GIF is refused in 3 ms without a dip (research/LOCAL-STACK-20261106.md, "Bundle 13").
+Generated with `git diff --binary` in a checkout of the 0062 tree; `git apply` of it gives the served source file for
+file (1286 files, sha256-compared).
+
+diff --git a/zig/src/families/dsv41/picture.zig b/zig/src/families/dsv41/picture.zig
+index f91d41c..bbbf435 100644
+--- a/zig/src/families/dsv41/picture.zig
++++ b/zig/src/families/dsv41/picture.zig
+@@ -149,9 +149,9 @@ fn be32(b: []const u8) u32 {
+ /// Image.MAX_IMAGE_PIXELS: 134,217,728 in the served lane, its probes 2026-10-09).
+ pub const max_pixels: usize = 134217728;
+ 
+-/// The pixels an image's header declares (PNG's IHDR), or null.
++/// The pixels an image's header declares (PNG's IHDR, its first chunk), or null.
+ pub fn pixels(data: []const u8) ?usize {
+-    if (data.len < 24 or !std.mem.eql(u8, data[0..8], "\x89PNG\r\n\x1a\n")) return null;
++    if (data.len < 24 or !std.mem.eql(u8, data[0..8], "\x89PNG\r\n\x1a\n") or !std.mem.eql(u8, data[12..16], "IHDR")) return null;
+     return @as(usize, std.mem.readInt(u32, data[16..20], .big)) * std.mem.readInt(u32, data[20..24], .big);
+ }
+ 
+@@ -193,6 +193,9 @@ pub fn decodePng(a: Allocator, data: []const u8) Error!Rgb {
+         hc.update(kind);
+         hc.update(body);
+         if (hc.final() != crc) return error.BadPng;
++        // (bundle 13, review ab4acaf8) IHDR first and once: vision.zig checks the room for the first chunk's size, and
++        // a later IHDR decoded at a size nobody checked; such a PNG is Pillow's (its last IHDR before IDAT, checked there)
++        if ((at == 8) != std.mem.eql(u8, kind, "IHDR")) return error.BadPng;
+         at += 12 + len;
+         if (std.mem.eql(u8, kind, "IHDR")) {
+             if (len != 13) return error.BadPng;
+@@ -650,6 +653,46 @@ test "a span's token types" {
+     try std.testing.expectEqualSlices(Type, &.{ .start, .image, .image, .image, .newline, .image, .image, .image, .newline, .end }, &t);
+ }
+ 
++fn testChunk(out: *std.ArrayList(u8), a: Allocator, kind: *const [4]u8, body: []const u8) !void {
++    var len: [4]u8 = undefined;
++    std.mem.writeInt(u32, &len, @intCast(body.len), .big);
++    try out.appendSlice(a, &len);
++    try out.appendSlice(a, kind);
++    try out.appendSlice(a, body);
++    var hc = std.hash.Crc32.init();
++    hc.update(kind);
++    hc.update(body);
++    var crc: [4]u8 = undefined;
++    std.mem.writeInt(u32, &crc, hc.final(), .big);
++    try out.appendSlice(a, &crc);
++}
++
++test "bundle13: a PNG's IHDR comes first and once, else the PNG is Pillow's" {
++    const a = std.testing.allocator;
++    // 1 x 1 8-bit RGB, one black pixel: IHDR, IDAT (zlib of filter 0 and three zeros), IEND
++    const one = [13]u8{ 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0 };
++    const idat = [_]u8{ 0x78, 0x9c, 0x63, 0x60, 0x60, 0x60, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01 };
++    for ([_][]const []const u8{ &.{ "IHDR", "IDAT", "IEND" }, &.{ "IHDR", "IHDR", "IDAT", "IEND" }, &.{ "tEXt", "IHDR", "IDAT", "IEND" }, &.{ "IHDR", "IDAT", "IHDR", "IEND" } }, 0..) |kinds, case| {
++        var png: std.ArrayList(u8) = .empty;
++        defer png.deinit(a);
++        try png.appendSlice(a, signature);
++        // (a second IHDR of the same size: the rule, not the size, is what is under test)
++        for (kinds) |kind| {
++            const body: []const u8 = if (std.mem.eql(u8, kind, "IHDR")) &one else if (std.mem.eql(u8, kind, "IDAT")) &idat else if (std.mem.eql(u8, kind, "tEXt")) "k\x00v" else "";
++            try testChunk(&png, a, kind[0..4], body);
++        }
++        if (case == 0) {
++            var rgb = try decodePng(a, png.items);
++            defer rgb.deinit(a);
++            try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, rgb.px);
++            try std.testing.expectEqual(@as(?usize, 1), pixels(png.items));
++        } else {
++            try std.testing.expectError(error.BadPng, decodePng(a, png.items));
++            if (case == 2) try std.testing.expectEqual(@as(?usize, null), pixels(png.items));
++        }
++    }
++}
++
+ test "bug hunt: a picture's rows are inflated to the size its header names, never past it" {
+     // a 1x1 RGB PNG whose IDAT inflates to 1 MiB of zeros (a decompression bomb in small: the size check is the header's)
+     const b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAED0lEQVR42u3BMQEAAADCoPVPbQhfoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPgMA8AABnV31vQAAAABJRU5ErkJggg==";
+diff --git a/zig/src/families/dsv41/pil.zig b/zig/src/families/dsv41/pil.zig
+index 72779da..7c39df4 100644
+--- a/zig/src/families/dsv41/pil.zig
++++ b/zig/src/families/dsv41/pil.zig
+@@ -18,26 +18,60 @@ pub const deadline_ms: i32 = 110_000;
+ /// The child: a request is the image's length (u64 LE) and bytes; the answer a status byte (0: pixels, 1: Pillow's
+ /// DecompressionBombError, 2: another error), width, height and the length of what follows (u64 LE each), then the
+ /// RGB rows or the error's text. The lane refuses past 134,217,728 pixels: twice Image.MAX_IMAGE_PIXELS.
++/// (bundle 13) Every picture is checked here at the size its header declares, before its decode, above memguard's line
++/// (4.25 GiB) and a 1 GiB margin as vision.zig's roomToDecode checks: 16 bytes a pixel for JPEG, MPO and PNG (that
++/// check's figure), 26 for every other format (this child measured 22.4 for a WebP lossless and 19.2 for a JPEG 2000
++/// at 33.5 Mpx, plus the lane's 3 for the RGB it receives). Before, vision.zig counted a format it reads no header of
++/// as 24 Mpx, and a 134 Mpx JPEG 2000 took 2.9 GiB for about 15 s. Pillow's own size check of every picture it is
++/// about to decode, an embedded one too (ICO while it opens, ICNS, BLP, GIF frames, TIFF tiles), passes the same room
++/// check at 16 bytes a pixel (review a1e38979: an embedded picture of up to 134 Mpx decoded after a check at the
++/// declared size). The picture's objects go before the child waits for the next one (review ab4acaf8: they held up to
++/// 1.5 GB idle).
+ pub const script =
+     \\import io, struct, sys, warnings
+     \\from PIL import Image
+     \\warnings.simplefilter("ignore")
+     \\Image.MAX_IMAGE_PIXELS = 67108864
++    \\RESERVE = 5637144576
++    \\SHORT = b"the server is short of memory for this picture right now; retry in a minute, or send a smaller image"
+     \\inp, out = sys.stdin.buffer, sys.stdout.buffer
++    \\class Short(Exception):
++    \\    pass
+     \\def take(n):
+     \\    b = inp.read(n)
+     \\    if len(b) < n:
+     \\        sys.exit(0)
+     \\    return b
++    \\def room(need):
++    \\    try:
++    \\        with open("/proc/meminfo", "rb") as f:
++    \\            for line in f:
++    \\                if line.startswith(b"MemAvailable:"):
++    \\                    return int(line.split()[1]) * 1024 >= need
++    \\    except OSError:
++    \\        pass
++    \\    return True
++    \\bomb_check = Image._decompression_bomb_check
++    \\def guarded(size):
++    \\    bomb_check(size)
++    \\    if not room(size[0] * size[1] * 16 + RESERVE):
++    \\        raise Short
++    \\Image._decompression_bomb_check = guarded
+     \\out.write(b"PIL" + Image.__version__.encode().ljust(13))
+     \\out.flush()
+     \\while True:
+     \\    data = take(struct.unpack("<Q", take(8))[0])
+     \\    try:
+     \\        with Image.open(io.BytesIO(data)) as source:
++    \\            per = 16 if source.format in ("JPEG", "MPO", "PNG") else 26
++    \\            if not room(source.width * source.height * per + RESERVE):
++    \\                raise Short
+     \\            image = source.convert("RGB")
+     \\        px = image.tobytes()
+-    \\        out.write(struct.pack("<BQQQ", 0, image.width, image.height, len(px)) + px)
++    \\        out.write(struct.pack("<BQQQ", 0, image.width, image.height, len(px)))
++    \\        out.write(px)
++    \\    except Short:
++    \\        out.write(struct.pack("<BQQQ", 2, 0, 0, len(SHORT)) + SHORT)
+     \\    except Image.DecompressionBombError as e:
+     \\        m = str(e).encode()
+     \\        out.write(struct.pack("<BQQQ", 1, 0, 0, len(m)) + m)
+@@ -45,6 +79,7 @@ pub const script =
+     \\        m = str(e).encode()
+     \\        out.write(struct.pack("<BQQQ", 2, 0, 0, len(m)) + m)
+     \\    out.flush()
++    \\    data = source = image = px = None
+ ;
+ 
+ pub const Pil = struct {
+@@ -192,6 +227,47 @@ const slow_script =
+     \\    out.flush()
+ ;
+ 
++/// A 1 x 1 GIF (GIF89a, one white pixel) and a 1 x 1 JPEG (white, Pillow 12.3's quality 95).
++const gif_1x1 = "GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
++const jpeg_1x1_b64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUEBAMEBgUGBgYFBgYGBwkIBgcJBwYGCAsICQoKCgoKBggLDAsKDAkKCgr/2wBDAQICAgICAgUDAwUKBwYHCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgr/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD9/KKKKAP/2Q==";
++
++test "bundle13: every picture is checked at its declared size before its decode" {
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const jpeg = try a.alloc(u8, try std.base64.standard.Decoder.calcSizeForSlice(jpeg_1x1_b64));
++    try std.base64.standard.Decoder.decode(jpeg, jpeg_1x1_b64);
++    // no reserve (whatever this machine has free): both decode
++    const fed = try std.mem.replaceOwned(u8, a, script, "RESERVE = 5637144576", "RESERVE = 0");
++    try std.testing.expect(!std.mem.eql(u8, fed, script));
++    const p = Pil.startWith(gpa, io, fed, deadline_ms) catch |e| {
++        std.debug.print("no python3 with Pillow here ({s})\n", .{@errorName(e)});
++        return error.SkipZigTest;
++    };
++    defer p.stop(gpa);
++    for ([_][]const u8{ gif_1x1, jpeg }) |pic| switch (try p.decode(a, pic)) {
++        .rgb => |rgb| try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255 }, rgb.px),
++        .refused => |why| {
++            std.debug.print("refused: {s}\n", .{why});
++            return error.TestUnexpectedResult;
++        },
++    };
++    // a reserve no machine has: both are refused, in the words vision.zig refuses with, and the child goes on (the wrapper
++    // of Pillow's own size checks made to pass, so each refusal is the check before the decode; fixtures/wrapper_check.py
++    // tests the wrapper)
++    const hungry_all = try std.mem.replaceOwned(u8, a, script, "RESERVE = 5637144576", "RESERVE = 1 << 62");
++    const hungry = try std.mem.replaceOwned(u8, a, hungry_all, "size[1] * 16 + RESERVE", "size[1] * 0");
++    try std.testing.expect(!std.mem.eql(u8, hungry, hungry_all));
++    const q = try Pil.startWith(gpa, io, hungry, deadline_ms);
++    defer q.stop(gpa);
++    for ([_][]const u8{ gif_1x1, jpeg, gif_1x1 }) |pic| switch (try q.decode(a, pic)) {
++        .rgb => return error.TestUnexpectedResult,
++        .refused => |why| try std.testing.expectEqualStrings("image input: the server is short of memory for this picture right now; retry in a minute, or send a smaller image", why),
++    };
++}
++
+ test "bundle11: a picture past the deadline is refused in time, and the next one decodes" {
+     const gpa = std.testing.allocator;
+     const io = std.testing.io;
+diff --git a/zig/src/families/dsv41/vision.zig b/zig/src/families/dsv41/vision.zig
+index 38634e5..28f3656 100644
+--- a/zig/src/families/dsv41/vision.zig
++++ b/zig/src/families/dsv41/vision.zig
+@@ -37,6 +37,7 @@ pub const Vision = struct {
+     loaded: ?Open = null, // the tower while pictures come (null: none yet, or given back after idle_ns)
+     last_used: i96 = 0, // the awake clock at the last picture's rows
+     pil: ?*pil.Pil = null, // the formats picture.zig does not decode (null: no python3 with Pillow here)
++    decoding: std.Io.Mutex = .init, // (bundle 13) one picture's decode at a time: each passes roomToDecode alone
+ 
+     /// The tower on `m`'s stream (its exact kernels and cuBLAS handle, as the tower gate ran them), its weights from
+     /// the checkpoint, its workspace for the largest picture, and the span rows' buffers.
+@@ -125,13 +126,18 @@ pub const Vision = struct {
+ 
+     fn prepareFn(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!lanes.stream.Vision.Prepared {
+         const v: *Vision = @ptrCast(@alignCast(ctx));
++        // (bundle 13) the check and the decode under one lock, so two large pictures cannot pass the check together
++        // shortcut: a picture waits behind a slow one (Pillow's deadline, 110 s, twice on a retry; the proxy waits
++        // 120 s): bound this wait if pictures are seen queueing
++        v.decoding.lockUncancelable(v.io);
++        defer v.decoding.unlock(v.io);
+         // (bug hunt K7-C2, K9-H2) a picture's decode needs about decode_bytes_per_pixel of its pixels at once: refused
+         // while that would take rank 0 near memguard's line, instead of memguard ending the rank
+         // a picture past the decoders' own limit is theirs to refuse, in their words (review be23f0a3)
+         const px = picture.pixels(bytes) orelse jpegPixels(bytes);
+         const oversized = if (px) |n| n > picture.max_pixels else false;
+         if (!oversized and !roomToDecode(availableBytes(v.io), px)) {
+-            problem.* = "image input: the server is short of memory for this picture right now; retry in a minute, or send a smaller image";
++            problem.* = short_of_memory;
+             return error.BadImage;
+         }
+         // its scratch apart from the request's arena (which keeps all it is given until the reply ends): only the payload
+@@ -240,13 +246,14 @@ fn roomToOpen(available: u64) bool {
+ /// and the patches (an estimate above review be23f0a3's 12 to 15 for an 8-bit PNG and its compressed copy).
+ const decode_bytes_per_pixel: u64 = 16;
+ 
+-/// A picture whose size its header does not say here (not a PNG or a JPEG: Pillow's) counts as a large photo.
+-/// shortcut: Pillow opens up to 2 x 89.5 MP of such formats; read their headers too if they come in that large.
++/// A picture whose size its header does not say here (not a PNG or a JPEG: Pillow's) counts as a large photo here;
++/// (bundle 13) Pillow's child checks it again at its real size before decoding it (pil.zig's script).
+ const unknown_pixels: u64 = 24_000_000;
+ 
+-/// Room for one picture's decode above memguard's line (4.25 GiB) and a 1 GiB margin.
+-/// shortcut: each request checks alone, so two large pictures at once can pass together; count the decodes in flight
+-/// if that is seen.
++/// A picture refused for the room to decode it, here and in Pillow's child (pil.zig: "image input: " and its words).
++const short_of_memory = "image input: the server is short of memory for this picture right now; retry in a minute, or send a smaller image";
++
++/// Room for one picture's decode above memguard's line (4.25 GiB) and a 1 GiB margin (one decode at a time: `decoding`).
+ fn roomToDecode(available: u64, pixels: ?usize) bool {
+     const px: u64 = pixels orelse unknown_pixels;
+     const need = std.math.mul(u64, px, decode_bytes_per_pixel) catch return false;
+@@ -286,6 +293,16 @@ fn idleLong(last_used: i96, now: i96) bool {
+     return now - last_used >= idle_ns;
+ }
+ 
++test "bundle13: Pillow's child refuses on this file's line, at its bytes a pixel, in its words" {
++    const line = std.fmt.comptimePrint("RESERVE = {d}\n", .{(17 << 28) + open_margin});
++    try std.testing.expect(std.mem.indexOf(u8, pil.script, line) != null);
++    const per = std.fmt.comptimePrint("per = {d} if", .{decode_bytes_per_pixel});
++    try std.testing.expect(std.mem.indexOf(u8, pil.script, per) != null);
++    const guard = std.fmt.comptimePrint("size[1] * {d} + RESERVE", .{decode_bytes_per_pixel});
++    try std.testing.expect(std.mem.indexOf(u8, pil.script, guard) != null);
++    try std.testing.expect(std.mem.indexOf(u8, pil.script, short_of_memory["image input: ".len..]) != null);
++}
++
+ test "bundle6: the tower opens only with room above memguard's line, and closes after its idle time" {
+     try std.testing.expectEqual(@as(?u64, 7 << 30), memAvailable("MemTotal:       127533340 kB\nMemFree: 1 kB\nMemAvailable:    7340032 kB\n"));
+     try std.testing.expectEqual(@as(?u64, null), memAvailable("MemTotal: 1 kB\n"));

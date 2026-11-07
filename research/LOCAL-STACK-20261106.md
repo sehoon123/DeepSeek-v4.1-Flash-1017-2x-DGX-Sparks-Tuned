@@ -175,6 +175,24 @@ what was left; most levers were under 1 % or changed tokens. Three exact ones we
   clusters. Groups that start 30-80 ms late appear in runs of bundles 5-11 too. The second window read TTFT by
   arrival rank (each rank within 5 %, declared before it ran) and passed: +1.1 to +1.7 % (4-stream prose).
 
+**Bundle 13: pictures' decode memory (`zig/patches/0063-dsv41-picture-memory-20261107.patch`, rank 0)**
+- **Measured first** (served image, one CPU): Pillow's child at its peak needs 14.7 (JPEG), 16.3 (AVIF), 19.2 (JPEG 2000)
+  and 22.4 (WebP lossless) bytes a pixel, plus the lane's 3 for the RGB it receives; the served PNG decoder 11.5 (8-bit
+  RGB) to 18.2 (16-bit RGBA). The slowest decode at the lane's largest picture (134 Mpx) is JPEG 2000, about 15 s, so the
+  110 s deadline has a 7x margin. The lane's check counted formats other than PNG and JPEG as 24 Mpx: a 134 Mpx JPEG 2000
+  passed it and took about 2.9 GiB for about 15 s, longer below memguard's line than its 4 s hold.
+- **The child** checks every picture at the size its header declares before its decode, on the lane's line (4.25 GiB
+  plus 1 GiB): 16 bytes a pixel for JPEG, MPO and PNG, 26 for other formats. Pillow's own size check of a picture it is
+  about to decode, an embedded one too (ICO, ICNS, BLP, GIF frames, TIFF tiles), passes the same check. A refusal uses
+  the lane's words. The child frees each picture after replying (it held up to 1.5 GB until the next one).
+- **The PNG decoder** takes IHDR first and once only. Before, the check read the first chunk's size and the decoder the
+  last IHDR's, so a 1 MB request could decode 134 Mpx unchecked. Any other PNG is Pillow's, which is the reference's.
+- **One decode at a time:** two large pictures cannot pass the check together. A picture can wait behind a slow one.
+- **Checks:** CPU 695 tests; red copies without the check, skipping JPEG, IHDR anywhere and without the wrapper each
+  fail; the child before and after gives byte-identical answers on 14 inputs; two source reviews PASS. GPU A/B 92/92
+  exact against bundle 12. On the candidate: a JPEG, a small GIF and a two-IHDR PNG decode; a 134 Mpx GIF (100 KB) is
+  refused in 3 ms and rank 0's MemAvailable does not move.
+
 ## Settings the pair serves with (systemd drop-ins over this recipe)
 - **`TF_DS_GRAPH_CAP=64`, `TF_DS_ENGRAM_CACHE_MB=128`:** exact. Rank 0's minimum MemAvailable in the bench rose from
   6537 to 7102 MiB; decode and long-prompt TTFT stayed within noise. These are now `scripts/config.sh`'s defaults.
