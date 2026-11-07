@@ -1,0 +1,660 @@
+Subject: [PATCH] decode kernel path: acceptance beside the absorb, per-rank top-64 records (2 x DGX Spark, both ranks)
+
+On top of 0061 (the bundle-11 tree), bundle 12. Rank 0 copies a round's candidates and records to the host and records
+an event before the absorb; the host waits on that event, not on the absorb, so the drafts' acceptance runs while the
+absorb does. Each rank's head reduces its vocabulary half to top-64 records (528 bytes a row) and the ranks gather those
+instead of the full logits; the host merges the halves with the kernel's own order key (ties to rank 0, NaN flagged as
+before). The verify frame carries the record count (kind 12), so a rank on 0061 and a rank on 0062 refuse each other's
+frames: deploy both ranks together. CPU-tested with four red copies, source-reviewed, and A/B-checked on the pair twice:
+92/92 replies exact against 0061 (research/LOCAL-STACK-20261106.md, "Bundle 12"). Generated with `git diff --binary` in a
+checkout of the 0061 tree; `git apply` of it gives the served source file for file (1286 files, sha256-compared).
+
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 3cacc0b..ab9c9c6 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -56,8 +56,9 @@ pub const image_piece = 32 << 10;
+ /// A gate's diagnostic (the tools' --logits-sha 1): each prompt's logits' sha256 on stderr.
+ pub var logits_sha = false;
+ 
+-/// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
+-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_pair = 10, fill_resume = 11 };
++/// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian). verify is 12 since its
++/// frame carries the round's candidates count (bundle 12; was 3): a follower of an older build refuses it.
++pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 12, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_pair = 10, fill_resume = 11 };
+ 
+ /// A frame being written.
+ pub const Wire = struct {
+@@ -358,8 +359,8 @@ fn faulted(s: *lanes.Stream, position: u64) u32 {
+     return 0;
+ }
+ 
+-/// draw's token for round row `row` from its device candidates (Model.roundCandidates' records, `count` of them a
+-/// row); error.NanLogits if the row holds a NaN.
++/// draw's token for round row `row` from its device candidates (Model.verify's records, `count` of them a row);
++/// error.NanLogits if the row holds a NaN.
+ fn drawCandidates(m: anytype, recs: []const u32, count: usize, row: usize, position: u64, s: ?lanes.Sampling) !u32 {
+     const W = ops_mod.cand_max;
+     const rec = recs[row * ops_mod.cand_rec ..][0..ops_mod.cand_rec];
+@@ -1024,23 +1025,6 @@ pub const Lanes = struct {
+             for (w.tokens, 0..) |t, j| ids[k][1 + w.held + j] = @intCast(t);
+             wins[k] = .{ .slot = l.slot, .base = l.base, .end = l.end, .start = start, .absorb = m.drafting() and w.stream.drafts, .ids = ids[k][0..rows] };
+         }
+-        const t0 = m.now();
+-        if (try self.begin(.verify)) {
+-            try self.wire.int(gpa, u32, @intCast(windows.len));
+-            for (wins[0..windows.len]) |w| {
+-                try self.wire.int(gpa, u32, @intCast(w.slot));
+-                try self.wire.int(gpa, u64, w.base);
+-                try self.wire.int(gpa, u64, w.end);
+-                try self.wire.int(gpa, u64, w.start);
+-                try self.wire.int(gpa, u8, @intFromBool(w.absorb));
+-                try self.wire.ids(gpa, w.ids);
+-            }
+-            try self.flush();
+-        }
+-        const t1 = m.now();
+-        const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
+-        try m.verify(rows, self.built.absorb[0..windows.len]);
+-        const t2 = m.now();
+         // every row greedy: each row's first candidate (the argmax: the largest value, ties to the lower id), whose NaN
+         // flag faults the stream as a sampled round's does (bug hunt K2/K10: the argmax kernel has no flag, and an
+         // all-greedy round drew token 0 from NaN rows to max_tokens); else the logits for the host's draws
+@@ -1061,7 +1045,25 @@ pub const Lanes = struct {
+             if (sm.top_k == 0 or sm.top_k + sampling.margin > ops_mod.cand_max) whole = true;
+             count = @max(count, @min(V, sm.top_k + sampling.margin));
+         };
+-        const recs: []const u32 = if (whole) &.{} else try m.roundCandidates(rows.ids.len, count);
++        const t0 = m.now();
++        const cands: usize = if (whole) 0 else count;
++        if (try self.begin(.verify)) {
++            try self.wire.int(gpa, u32, @intCast(windows.len));
++            try self.wire.int(gpa, u32, @intCast(cands));
++            for (wins[0..windows.len]) |w| {
++                try self.wire.int(gpa, u32, @intCast(w.slot));
++                try self.wire.int(gpa, u64, w.base);
++                try self.wire.int(gpa, u64, w.end);
++                try self.wire.int(gpa, u64, w.start);
++                try self.wire.int(gpa, u8, @intFromBool(w.absorb));
++                try self.wire.ids(gpa, w.ids);
++            }
++            try self.flush();
++        }
++        const t1 = m.now();
++        const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
++        const recs = try m.verify(rows, self.built.absorb[0..windows.len], cands);
++        const t2 = m.now();
+         const logits: []const f32 = if (!whole) &.{} else try m.roundLogits(rows.ids.len);
+         const t3 = m.now();
+         defer if (self.prof) |*p| {
+@@ -1514,7 +1516,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+         const kind: Kind = switch (try r.int(u8)) {
+             1 => .fill_begin,
+             2 => .fill_chunk,
+-            3 => .verify,
++            12 => .verify,
+             4 => .pass,
+             5 => .snap_save,
+             6 => .snap_restore,
+@@ -1570,6 +1572,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+             .verify => {
+                 const nw = try r.int(u32);
+                 if (nw == 0 or nw > max_streams) return error.BadFrame;
++                const cands = try r.int(u32);
++                if (cands > ops_mod.cand_max) return error.BadFrame;
+                 var wins: [max_streams]Win = undefined;
+                 for (0..nw) |k| {
+                     const s: usize = try r.int(u32);
+@@ -1581,7 +1585,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                     wins[k] = .{ .slot = s, .base = base, .end = end, .start = start, .absorb = absorb, .ids = win_ids[k].items };
+                 }
+                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
+-                m.verify(rows, built.absorb[0..nw]) catch |err| refused(m, err);
++                if (m.verify(rows, built.absorb[0..nw], cands)) |_| {} else |err| refused(m, err);
+                 if (m.prof) {
+                     follow_prof.rounds += 1;
+                     follow_prof.enqueue += m.t_enqueue;
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index f4d096d..3d14122 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -124,12 +124,9 @@ pub const Model = struct {
+     vocab: usize,
+     logits: []f32, // round.max_rows rows of logits on the host
+     logits_pin: ?cuda.HostBuffer = null, // their pinned memory: a round's copy comes back by DMA, not staged by the driver
+-    amax: u64, // u32 [round.max_rows]: a round's greedy tokens on the device (roundArgmax)
+-    amax_host: [round.max_rows]u32 = undefined,
+-    cands: u64 = 0, // a round's sampling candidates on the device (roundCandidates): ops_mod.cand_rec words a row
+-    cand_keys: u64 = 0, // their phase 1 scratch: u64 [round.max_rows, ops_mod.cand_slices, ops_mod.cand_max]
+-    cand_nans: u64 = 0, // and i32 [round.max_rows, ops_mod.cand_slices]
+-    cand_pin: ?cuda.HostBuffer = null, // the records' pinned copy on the host
++    cand_pin: ?cuda.HostBuffer = null, // a round's sampling candidates' records (every rank's, TP2) pinned on the host
++    cand_out: []u32, // TP2: their halves merged, ops_mod.cand_rec words a row (round.max_rows rows)
++    head_ev: ?cuda.Event = null, // a round's forward and its records' copy done: verify waits on it, not the absorb (bundle 12)
+     // the stream a fill is running: its slot and its view of the caches (its extent from base)
+     fill_slot: usize = 0,
+     // the prompt a fill's chunks come from (the caller's, set for the fill) and the thread reading the next chunk's
+@@ -192,6 +189,7 @@ pub const Model = struct {
+         m.img_buf = null;
+         m.logits_pin = null;
+         m.cand_pin = null;
++        m.head_ev = null;
+         m.host = std.heap.ArenaAllocator.init(gpa);
+         errdefer m.host.deinit();
+         const a = m.host.allocator();
+@@ -370,10 +368,6 @@ pub const Model = struct {
+             try d.check(d.api.cuMemsetD8Async(r.*, 0, m.streams * m.eng.ringBytes(), m.stream.handle), "cuMemsetD8Async");
+         }
+         m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
+-        m.amax = try m.arena.take(round.max_rows * 4);
+-        m.cands = try m.arena.take(round.max_rows * ops_mod.cand_rec * 4);
+-        m.cand_keys = try m.arena.take(round.max_rows * ops_mod.cand_slices * ops_mod.cand_max * 8);
+-        m.cand_nans = try m.arena.take(round.max_rows * ops_mod.cand_slices * 4);
+         if (o.graphs) m.graphs = round.Graphs.init(gpa);
+         if (o.side) try m.rd.useSide(&m.eng);
+         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
+@@ -455,7 +449,9 @@ pub const Model = struct {
+         // pinned: a copy to pageable memory goes through the driver's staging buffer (a round's sampled rows: ~3 MB)
+         m.logits_pin = try cuda.HostBuffer.alloc(ctx.d, round.max_rows * m.vocab * @sizeOf(f32));
+         m.logits = m.logits_pin.?.slice(f32)[0 .. round.max_rows * m.vocab];
+-        m.cand_pin = try cuda.HostBuffer.alloc(ctx.d, round.max_rows * ops_mod.cand_rec * 4);
++        m.cand_pin = try cuda.HostBuffer.alloc(ctx.d, o.world * round.max_rows * ops_mod.cand_rec * 4);
++        m.cand_out = try a.alloc(u32, round.max_rows * ops_mod.cand_rec);
++        m.head_ev = try cuda.Event.init(ctx.d, false);
+         return m;
+     }
+ 
+@@ -465,6 +461,7 @@ pub const Model = struct {
+         if (m.img_buf) |*b| b.free();
+         if (m.logits_pin) |*b| b.free();
+         if (m.cand_pin) |*b| b.free();
++        if (m.head_ev) |*ev| ev.deinit();
+         m.spans.deinit(m.gpa);
+         if (m.graphs) |*g| g.deinit();
+         if (m.pgraphs) |*g| g.deinit();
+@@ -1061,16 +1058,21 @@ pub const Model = struct {
+         return m.ch.head_g;
+     }
+ 
+-    /// One round over every stream's window (rows.windows, each with its stream's slot and extent), then each window
+-    /// whose stream drafts has its rows' taps absorbed into its slot's drafter rings at its positions (the served
+-    /// eager absorb: rows past the ones the round keeps sit where the drafter never reads, and the next window
+-    /// overwrites them). absorb[i]: window i's stream drafts.
+-    pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool) !void {
++    /// One round over every stream's window (rows.windows, each with its stream's slot and extent), then with count > 0
++    /// each row's sampling candidates (ops.candidates: its first `count` in sampling.topCandidates' order, or its NaN
++    /// flag) on rank 0's host, and each window whose stream drafts has its rows' taps absorbed into its slot's drafter
++    /// rings at its positions (the served eager absorb: rows past the ones the round keeps sit where the drafter never
++    /// reads, and the next window overwrites them). absorb[i]: window i's stream drafts. Every rank gets the same count
++    /// (the head's gather depends on it; 0: the logits, roundLogits). Returns rank 0's records, R rows of
++    /// ops_mod.cand_rec words (none with count 0 or on another rank), once the forward and their copy are done.
++    pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool, count: usize) ![]const u32 {
+         m.joinAhead(); // a prompt chunk's Engram read-ahead shares the host buffers a round's Engram reads use
+         const e = &m.eng;
+         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
+         const t0 = m.now();
+-        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.pool_cap, null, if (m.graphs) |*g| g else null);
++        var r = rows;
++        r.cands = count;
++        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, r, m.pool_cap, null, if (m.graphs) |*g| g else null);
+         if (m.prof) {
+             m.t_enqueue = m.now() - t0;
+             try m.stream.synchronize();
+@@ -1089,7 +1091,25 @@ pub const Model = struct {
+                 m.clk_rounds += 1;
+             }
+         }
+-        const t1 = m.now();
++        return m.land(r, absorb);
++    }
++
++    /// verify past its forward: rank 0's records and their copy, an event, then the absorb behind them. The host waits
++    /// on the event, not the stream (bundle 12): the absorb writes only the drafter's scratch and rings, which the next
++    /// pass reads behind it on this stream, so the host's draws and the pass's launch overlap it.
++    fn land(m: *Model, rows: round.Rows, absorb: []const bool) ![]const u32 {
++        const e = &m.eng;
++        const R = rows.ids.len;
++        const W = ops_mod.cand_rec;
++        const count = if (m.rank == 0) rows.cands else 0;
++        const halves = m.rd.has_recs; // every rank's records of its own columns, gathered (round.head)
++        const pin = m.cand_pin.?.slice(u32)[0 .. (if (halves) e.world else 1) * R * W];
++        if (count > 0) {
++            if (!halves) try m.ops.candidates(m.stream, m.rd.logits, m.vocab, m.vocab, R, count, m.rd.ckeys, m.rd.cnans, m.rd.crec);
++            try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(pin.ptr, if (halves) m.rd.crec_g else m.rd.crec, pin.len * 4, m.stream.handle), "cuMemcpyDtoHAsync");
++        }
++        try m.head_ev.?.record(m.stream);
++        const t1 = if (m.prof) m.now() else 0;
+         if (m.dr) |*dr| {
+             const wins = rows.windows orelse return error.BadRound;
+             var items: [max_streams]draft.Item = undefined;
+@@ -1101,8 +1121,16 @@ pub const Model = struct {
+             }
+             if (n > 0) try dr.absorbMany(e, &m.ch, &m.dpool.?, items[0..n]);
+         }
+-        try m.eng.synchronize();
+-        if (m.prof) m.t_absorb = m.now() - t1;
++        try e.waitFor(m.head_ev.?);
++        if (m.prof) {
++            try e.synchronize();
++            m.t_absorb = m.now() - t1;
++        }
++        if (count == 0) return &.{};
++        if (!halves) return pin;
++        const first: u32 = @intCast(m.vocab / e.world); // rank 1's first id
++        for (0..R) |i| ops_mod.mergeHalves(pin[i * W ..][0..W], pin[(R + i) * W ..][0..W], first, count, m.cand_out[i * W ..][0..W]);
++        return m.cand_out[0 .. R * W];
+     }
+ 
+     /// The rounds' GPU clocks (a profile): the forward's start and each stretch's ends, for its gaps.
+@@ -1132,16 +1160,7 @@ pub const Model = struct {
+         return @intCast(std.Io.Timestamp.now(m.io, .awake).nanoseconds);
+     }
+ 
+-    /// The round's logits, R rows of the vocabulary, on the host (after verify).
+-    /// The round's greedy tokens, R rows (the device's argmax of the round's logits, as sampling.argmax), on the host.
+-    pub fn roundArgmax(m: *Model, R: usize) ![]const u32 {
+-        const d = m.ctx.d;
+-        try m.ops.argmaxRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, m.amax);
+-        try m.eng.synchronize();
+-        try d.check(d.api.cuMemcpyDtoH_v2(&m.amax_host, m.amax, R * 4), "cuMemcpyDtoH");
+-        return m.amax_host[0..R];
+-    }
+-
++    /// The round's logits, R rows of the vocabulary, on the host (after a verify with count 0, which gathers them).
+     pub fn roundLogits(m: *Model, R: usize) ![]const f32 {
+         const d = m.ctx.d;
+         try m.eng.synchronize();
+@@ -1149,25 +1168,6 @@ pub const Model = struct {
+         return m.logits[0 .. R * m.vocab];
+     }
+ 
+-    /// The round's sampling candidates, R rows of their records (ops.candidates: each row's first `count` in
+-    /// sampling.topCandidates' order, or its NaN flag), on the host (after verify).
+-    pub fn roundCandidates(m: *Model, R: usize, count: usize) ![]const u32 {
+-        const d = m.ctx.d;
+-        try m.ops.candidates(m.stream, m.rd.logits, m.vocab, m.vocab, R, count, m.cand_keys, m.cand_nans, m.cands);
+-        const pin = m.cand_pin.?.slice(u32);
+-        try d.check(d.api.cuMemcpyDtoHAsync_v2(pin.ptr, m.cands, R * ops_mod.cand_rec * 4, m.stream.handle), "cuMemcpyDtoHAsync");
+-        try m.eng.synchronize();
+-        return pin[0 .. R * ops_mod.cand_rec];
+-    }
+-
+-    /// Row r of the round's logits on the host (a row the candidates flag).
+-    pub fn roundLogitsRow(m: *Model, r: usize) ![]const f32 {
+-        const d = m.ctx.d;
+-        try m.eng.synchronize();
+-        try d.check(d.api.cuMemcpyDtoH_v2(m.logits.ptr, m.rd.logits + r * m.vocab * 4, m.vocab * 4), "cuMemcpyDtoH");
+-        return m.logits[0..m.vocab];
+-    }
+-
+     /// The prompt's logits on the host (after a fill's last chunk).
+     pub fn promptLogitsHost(m: *Model) ![]const f32 {
+         const d = m.ctx.d;
+@@ -1186,3 +1186,131 @@ pub const Model = struct {
+         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
+     }
+ };
++
++test "bundle12: verify's records land before the absorb, which the host does not wait for" {
++    // verify's tail (land) on CPU fakes of the driver calls it makes, logged in order; no CUDA library is opened
++    const Fake = struct {
++        const Call = enum { launch, dtoh, record, wait_event, wait_stream };
++        var log: [8]Call = undefined;
++        var n: usize = 0;
++        var bytes: usize = 0;
++        var device: []const u32 = &.{}; // what the records' copy brings back
++        var recorded: cuda.abi.Event = null;
++        var waited: cuda.abi.Event = null;
++        var refuse: cuda.abi.Function = null; // the absorb's first launch, refused (NOT_READY) so it stops there
++        fn put(c: Call) void {
++            log[n] = c;
++            n += 1;
++        }
++        fn launch(f: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
++            put(.launch);
++            return if (refuse != null and f == refuse) cuda.abi.error_not_ready else cuda.abi.success;
++        }
++        fn dtoh(dst: ?*anyopaque, _: cuda.abi.DevicePtr, len: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
++            put(.dtoh);
++            bytes = len;
++            const out: [*]u8 = @ptrCast(dst.?);
++            @memcpy(out[0..len], std.mem.sliceAsBytes(device)[0..len]);
++            return cuda.abi.success;
++        }
++        fn record(ev: cuda.abi.Event, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
++            put(.record);
++            recorded = ev;
++            return cuda.abi.success;
++        }
++        fn waitEvent(ev: cuda.abi.Event) callconv(.c) cuda.abi.Result {
++            put(.wait_event);
++            waited = ev;
++            return cuda.abi.success;
++        }
++        fn waitStream(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
++            put(.wait_stream);
++            return cuda.abi.success;
++        }
++    };
++    const W = ops_mod.cand_rec;
++    const C = ops_mod.cand_max;
++    var driver: cuda.Driver = undefined;
++    driver.api.cuLaunchKernel = Fake.launch;
++    driver.api.cuMemcpyDtoHAsync_v2 = Fake.dtoh;
++    driver.api.cuEventRecord = Fake.record;
++    driver.api.cuEventSynchronize = Fake.waitEvent;
++    driver.api.cuStreamSynchronize = Fake.waitStream;
++    var m: Model = undefined;
++    m.rank = 0;
++    m.prof = false;
++    m.stream = .{ .d = &driver, .handle = null };
++    m.eng.d = &driver;
++    m.eng.s = m.stream;
++    m.eng.ring = null;
++    m.eng.two = null;
++    m.eng.world = 2;
++    m.eng.ops = &m.ops;
++    m.ops.cands_slices = .{ .d = &driver, .handle = @ptrFromInt(0x10) };
++    m.ops.cands_merge = .{ .d = &driver, .handle = @ptrFromInt(0x20) };
++    m.ops.copy16 = .{ .d = &driver, .handle = @ptrFromInt(0x30) };
++    m.ops.strided = .{ .d = &driver, .handle = @ptrFromInt(0x40) };
++    m.vocab = 1024;
++    m.rd.logits = 1 << 20;
++    m.rd.taps = 2 << 20;
++    m.rd.crec = 3 << 20;
++    m.rd.crec_g = 4 << 20;
++    m.rd.ckeys = 5 << 20;
++    m.rd.cnans = 6 << 20;
++    var pinned: [2 * 2 * W * 4]u8 align(16) = undefined;
++    m.cand_pin = .{ .d = &driver, .bytes = &pinned };
++    var merged: [2 * W]u32 = undefined;
++    m.cand_out = &merged;
++    m.head_ev = .{ .d = &driver, .handle = @ptrFromInt(0x50) };
++    m.dr = null;
++    // the gathered records [rank, row]: row 0 ties 5.0 across the halves, row 1 has a NaN in rank 1's half
++    var dev: [2 * 2 * W]u32 = @splat(0);
++    for ([_]f32{ 5, 2, 2 }, [_]u32{ 7, 1, 9 }, 0..) |x, id, j| {
++        dev[j] = @bitCast(x);
++        dev[C + j] = id;
++    }
++    for ([_]f32{ 5, 4, 2 }, [_]u32{ 0, 3, 2 }, 0..) |x, id, j| {
++        dev[2 * W + j] = @bitCast(x);
++        dev[2 * W + C + j] = id;
++    }
++    dev[3 * W + 2 * C] = 1;
++    Fake.device = &dev;
++    const wins = [_]round.Window{.{ .row = 0, .n = 2, .seq = &.{} }};
++    const rows: round.Rows = .{ .ids = &[_]i64{ 5, 6 }, .pos = &[_]i64{ 7, 8 }, .slots = &[_]i64{ 1, 1 }, .windows = &wins, .cands = 3 };
++    // TP2, rank 0: every rank's records copied, the event; the host waits on that event alone, then merges the halves
++    m.rd.has_recs = true;
++    Fake.n = 0;
++    const recs = try m.land(rows, &.{true});
++    try std.testing.expectEqualSlices(Fake.Call, &.{ .dtoh, .record, .wait_event }, Fake.log[0..Fake.n]);
++    try std.testing.expectEqual(@as(usize, 2 * 2 * W * 4), Fake.bytes);
++    try std.testing.expect(Fake.recorded == m.head_ev.?.handle);
++    try std.testing.expect(Fake.waited == Fake.recorded);
++    try std.testing.expectEqual(@as(usize, 2 * W), recs.len);
++    try std.testing.expectEqualSlices(u32, &.{ 7, 512, 515 }, recs[C..][0..3]);
++    for ([_]f32{ 5, 5, 4 }, recs[0..3]) |x, bits| try std.testing.expectEqual(@as(u32, @bitCast(x)), bits);
++    try std.testing.expectEqual(@as(u32, 0), recs[2 * C]);
++    try std.testing.expectEqual(@as(u32, 1), recs[W + 2 * C]);
++    // the follower: no records, the same wait
++    m.rank = 1;
++    Fake.n = 0;
++    try std.testing.expectEqual(@as(usize, 0), (try m.land(rows, &.{true})).len);
++    try std.testing.expectEqualSlices(Fake.Call, &.{ .record, .wait_event }, Fake.log[0..Fake.n]);
++    // the 2D split's rank 0 (the logits gathered): the candidates over them first, then the same copy and wait
++    m.rank = 0;
++    m.rd.has_recs = false;
++    Fake.n = 0;
++    try std.testing.expectEqual(@as(usize, 2 * W), (try m.land(rows, &.{true})).len);
++    try std.testing.expectEqualSlices(Fake.Call, &.{ .launch, .launch, .dtoh, .record, .wait_event }, Fake.log[0..Fake.n]);
++    try std.testing.expectEqual(@as(usize, 2 * W * 4), Fake.bytes);
++    // a drafting window: its absorb's first launch comes after the event (refused here, so it stops there)
++    var dr: draft.Drafter = undefined;
++    dr.taps_w = 8;
++    dr.at = 7 << 20;
++    m.dr = dr;
++    m.dpool = .{ .stages = 0, .slots = 4, .ring = 176, .hd = 8 };
++    m.rd.has_recs = true;
++    Fake.refuse = m.ops.copy16.handle;
++    Fake.n = 0;
++    try std.testing.expectError(error.NotReady, m.land(rows, &.{true}));
++    try std.testing.expectEqualSlices(Fake.Call, &.{ .dtoh, .record, .launch }, Fake.log[0..Fake.n]);
++}
+diff --git a/zig/src/families/dsv41/ops.zig b/zig/src/families/dsv41/ops.zig
+index 10e73c2..0c8f795 100644
+--- a/zig/src/families/dsv41/ops.zig
++++ b/zig/src/families/dsv41/ops.zig
+@@ -35,6 +35,40 @@ pub const cand_max = 64;
+ pub const cand_rec = 2 * cand_max + 4;
+ pub const cand_slices = 32;
+ 
++/// A row's record of the whole vocabulary from its two halves' records (bundle 12: each rank's Ops.candidates over its own
++/// columns; the second half's ids start at `first`): the first `count` of their union in the records' order (the larger
++/// value, -0.0 as +0.0, then the lower id, so the first half wins a tie) and the NaN flag of either half (a flagged row is
++/// never drawn from, so its values are left). The union holds the row's first `count`: one of them has fewer than `count`
++/// elements before it in its own half.
++/// The candidates kernel's value order (dsv41_ops.cu tf_cand_key): -0 as +0, then an integer that orders as the values
++/// do, whatever the CPU's float mode (review a19b2e98: a float compare under flush-to-zero ties a denormal with 0, which
++/// the kernel does not).
++fn orderKey(bits: u32) u32 {
++    const b = if (bits & 0x7fff_ffff == 0) 0 else bits;
++    return if (b & 0x8000_0000 != 0) ~b else b | 0x8000_0000;
++}
++
++pub fn mergeHalves(lo: []const u32, hi: []const u32, first: u32, count: usize, out: []u32) void {
++    const W = cand_max;
++    out[2 * W] = lo[2 * W] | hi[2 * W];
++    if (out[2 * W] != 0) return;
++    var i: usize = 0;
++    var j: usize = 0;
++    for (0..count) |k| {
++        const a = orderKey(lo[i]);
++        const b = orderKey(hi[j]);
++        if (b > a) {
++            out[k] = hi[j];
++            out[W + k] = hi[W + j] + first;
++            j += 1;
++        } else {
++            out[k] = lo[i];
++            out[W + k] = lo[W + i];
++            i += 1;
++        }
++    }
++}
++
+ pub const Ops = struct {
+     pointwise: cuda.Module,
+     movement: cuda.Module,
+@@ -415,3 +449,61 @@ test "launch geometry of the development launchers" {
+     try std.testing.expectEqual(@as(u32, 2), blocks(257, 256));
+     try std.testing.expectEqual(@as(u32, 65535), blocks(1 << 40, 256));
+ }
++
++test "bundle12: two halves' records merge into the whole row's first candidates: ties across halves, -0/+0, infinities, NaN" {
++    const sampling = @import("sampling.zig");
++    const Half = struct {
++        // the device's record of a half (Ops.candidates, checked against topCandidates in 0035): its first `count`
++        // with the half's own ids, and its NaN flag
++        fn record(half: []const f32, count: usize, out: *[cand_rec]u32) void {
++            var v: [cand_max]f32 = undefined;
++            var ids: [cand_max]i64 = undefined;
++            const n = sampling.topCandidates(half, count, &v, &ids);
++            for (0..n) |j| {
++                out[j] = @bitCast(v[j]);
++                out[cand_max + j] = @intCast(ids[j]);
++            }
++            var nan = false;
++            for (half) |x| nan = nan or std.math.isNan(x);
++            out[2 * cand_max] = @intFromBool(nan);
++        }
++    };
++    var prng = std.Random.DefaultPrng.init(20261107);
++    const rnd = prng.random();
++    var row: [2 * 777]f32 = undefined;
++    var lo: [cand_rec]u32 = undefined;
++    var hi: [cand_rec]u32 = undefined;
++    var got: [cand_rec]u32 = undefined;
++    var v: [cand_max]f32 = undefined;
++    var ids: [cand_max]i64 = undefined;
++    for (0..600) |q| {
++        const H: usize = if (q % 4 == 0) cand_max + rnd.uintLessThan(usize, 40) else 777;
++        const p = [2]f32{ rnd.float(f32), rnd.float(f32) }; // each half's share of the tied values
++        for (row[0 .. 2 * H], 0..) |*x, i| {
++            const tied = rnd.float(f32) < p[i / H];
++            x.* = switch (q % 5) {
++                0 => if (tied) (if (rnd.boolean()) -0.0 else 0.0) else -1.0 - rnd.float(f32),
++                1 => @round(rnd.floatNorm(f32) * 2.0) / 2.0,
++                2 => if (tied) std.math.inf(f32) else rnd.floatNorm(f32),
++                3 => if (tied) -std.math.inf(f32) else -1.0e30,
++                else => rnd.floatNorm(f32),
++            };
++        }
++        if (q % 6 == 5) @memcpy(row[H .. 2 * H], row[0..H]); // every value tied across the halves
++        if (q % 7 == 3) row[rnd.uintLessThan(usize, 2 * H)] = std.math.nan(f32);
++        var nan = false;
++        for (row[0 .. 2 * H]) |x| nan = nan or std.math.isNan(x);
++        for ([_]usize{ 1, 2, 8, 28, 57, 64 }) |count| {
++            Half.record(row[0..H], count, &lo);
++            Half.record(row[H .. 2 * H], count, &hi);
++            mergeHalves(&lo, &hi, @intCast(H), count, &got);
++            try std.testing.expectEqual(@as(u32, @intFromBool(nan)), got[2 * cand_max]);
++            if (nan) continue;
++            try std.testing.expectEqual(count, sampling.topCandidates(row[0 .. 2 * H], count, &v, &ids));
++            for (0..count) |j| {
++                try std.testing.expectEqual(@as(u32, @intCast(ids[j])), got[cand_max + j]);
++                try std.testing.expectEqual(@as(u32, @bitCast(v[j])), got[j]);
++            }
++        }
++    }
++}
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index cc021d4..ce7e6c0 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -140,6 +140,16 @@ pub const Engine = struct {
+     /// Graph replay bypasses gather's host check; drain before refusing any result from a failed ring.
+     pub fn synchronize(e: *const Engine) !void {
+         try e.s.synchronize();
++        try e.ringsOk();
++    }
++
++    /// synchronize up to `ev`, an event recorded on the stream: the work queued after it may still run (bundle 12).
++    pub fn waitFor(e: *const Engine, ev: cuda.Event) !void {
++        try ev.synchronize();
++        try e.ringsOk();
++    }
++
++    fn ringsOk(e: *const Engine) !void {
+         // Read only the atomic flag: the proxy may still be publishing its diagnostic text.
+         if (e.ring) |r| if (r.failed.load(.acquire)) return error.RdmaFailed;
+         if (e.two) |t| if (t.rings) |rs| {
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index fe97d28..ac3d7c6 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -119,6 +119,7 @@ pub const Rows = struct {
+     bases: ?[]const i64 = null,
+     ends: ?[]const i64 = null,
+     windows: ?[]const Window = null,
++    cands: usize = 0, // > 0 (TP2): each rank's columns' first `cands` candidates gathered, not the logits (head; bundle 12)
+ 
+     fn slotOf(r: Rows, i: usize) i64 {
+         return if (r.slots) |v| v[i] else 0;
+@@ -218,6 +219,13 @@ pub const Round = struct {
+     hl: u64, // fp32 [R, columns]
+     hg: u64, // fp32 [world, R, columns]
+     logits: u64, // fp32 [R, world * columns]: the rows' logits, the ranks' columns in rank order
++    // the rows' sampling candidates (ops.candidates; Rows.cands): this rank's records of its columns (2D: rank 0's of
++    // the logits), every rank's gathered, the kernel's scratch, and whether the last round gathered them (bundle 12)
++    crec: u64, // u32 [R, ops_mod.cand_rec]
++    crec_g: u64, // u32 [world, R, ops_mod.cand_rec]
++    ckeys: u64, // u64 [R, ops_mod.cand_slices, ops_mod.cand_max]
++    cnans: u64, // i32 [R, ops_mod.cand_slices]
++    has_recs: bool,
+     taps: u64, // bf16 [R, taps * D]
+     // wo_a's suh concatenated a layer (wo_a_rot: torch.cat of the slices' suh, cached on the layer)
+     wo_suh: []u64,
+@@ -352,6 +360,11 @@ pub const Round = struct {
+         rd.hl = try a.take(R * w.head.n * 4);
+         rd.hg = try a.take(e.world * R * hh * 4);
+         rd.logits = try a.take(R * e.world * hh * 4);
++        rd.crec = try a.take(R * ops_mod.cand_rec * 4);
++        rd.crec_g = try a.take(e.world * R * ops_mod.cand_rec * 4);
++        rd.ckeys = try a.take(R * ops_mod.cand_slices * ops_mod.cand_max * 8);
++        rd.cnans = try a.take(R * ops_mod.cand_slices * 4);
++        rd.has_recs = false;
+         rd.taps = try a.take(R * @max(c.dspark_taps.slice().len, 1) * d * 2);
+         // wo_a_rot's suh: the slices' suh one after another (torch.cat's bytes)
+         rd.wo_suh = try gpa.alloc(u64, w.layers.len);
+@@ -1006,10 +1019,11 @@ pub const Graphs = struct {
+     }
+ };
+ 
+-/// A round of these rows through every layer and the head: rd.logits [R, vocab] and rd.taps. The caches (ring, the
+-/// compressed rows, the positional store) are the prompt's, extended by the rows; eh: the Engram host (the rows' n-grams
+-/// hashed from `seq`, the whole sequence's ids through the rows'). With `graphs` each stretch runs as its graph and a
+-/// probe sees only the round's end (its logits and taps).
++/// A round of these rows through every layer and the head: rd.logits [R, vocab] (with rows.cands on TP2 the candidates'
++/// records rd.crec_g instead: head) and rd.taps. The caches (ring, the compressed rows, the positional store) are the
++/// prompt's, extended by the rows; eh: the Engram host (the rows' n-grams hashed from `seq`, the whole sequence's ids
++/// through the rows'). With `graphs` each stretch runs as its graph and a probe sees only the round's end (its head's
++/// gather, logits and taps).
+ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []const i32, rows: Rows, pool_cap: usize, probe: ?Probe, graphs: ?*Graphs) !void {
+     const w = e.w;
+     const R = rows.ids.len;
+@@ -1053,10 +1067,30 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
+         ahead = true;
+         li = end;
+     }
+-    if (graphs != null) {
+-        try Probe.check(probe, .logits, w.layers.len, rd.logits);
+-        if (cy.ntap > 0) try Probe.check(probe, .taps, w.layers.len, rd.taps);
++    try head(e, rd, R, rows.cands, probe);
++    if (cy.ntap > 0) try Probe.check(probe, .taps, w.layers.len, rd.taps);
++}
++
++/// The head's columns to every rank, after the last stretch (eager, so a round's `cands` is no graph's key): with cands
++/// on TP2 each rank's first `cands` sampling candidates of its own columns (ops.candidates, its own ids) gathered into
++/// rd.crec_g (bundle 12: 528 bytes a row, not its 64,640 logits), else the logits into rd.logits, the ranks' columns in
++/// rank order (g.permute(1, 0, 2)).
++fn head(e: *const Engine, rd: *Round, R: usize, cands: usize, probe: ?Probe) !void {
++    const w = e.w;
++    const hn: usize = w.head.n;
++    rd.has_recs = cands > 0 and e.two == null and e.world == 2;
++    if (rd.has_recs) {
++        try e.ops.candidates(e.s, rd.hl, hn, hn, R, cands, rd.ckeys, rd.cnans, rd.crec);
++        try e.gatherF32(rd.crec, rd.crec_g, R * ops_mod.cand_rec);
++        try rd.mark(e, .head);
++        return;
+     }
++    const hh = if (e.two) |tw| tw.hw[0] + tw.hw[1] else hn; // a rank's vocabulary half (2D: both pairs' quarters)
++    if (e.two) |tw| try tw.quarters(e, rd.hl, rd.hg, R, tw.hw, 4) else try e.gatherF32(rd.hl, rd.hg, R * hn);
++    try Probe.check(probe, .head_gather, w.layers.len, rd.hg);
++    for (0..e.world) |k| try e.ops.copyRows(e.s, rd.hg + k * R * hh * 4, hh * 4, rd.logits + k * hh * 4, e.world * hh * 4, hh * 4, R);
++    try rd.mark(e, .head);
++    try Probe.check(probe, .logits, w.layers.len, rd.logits);
+ }
+ 
+ /// Layers li .. end of a round (the first stretch starts with the rows' streams, the last ends with the head), from
+@@ -1133,18 +1167,11 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
+     try rd.mark(e, .post);
+     cy.* = .{ .h = h, .spare = spare, .pre = pre, .pre_f = pre_f, .ntap = ntap, .sh = sh, .kk = rd.kk, .has_cand = rd.has_cand, .has_cblk = rd.has_cblk };
+     if (end < w.layers.len) return;
+-    // the head on every row: the logits, the ranks' columns in rank order (g.permute(1, 0, 2))
++    // the head on every row: this rank's columns (head gathers them)
+     try tri_basic.collapseNorm(t, h, pre, w.norm, rd.xc, c.eps, R, d);
+     const hn: usize = w.head.n;
+     try prompt.grouped(e, ch, R, &.{w.head}, &.{rd.xc}, &.{d}, &.{rd.hl}, &.{hn}, &.{.f32});
+     try Probe.check(probe, .head_cols, w.layers.len, rd.hl);
+-    const hh = if (e.two) |tw| tw.hw[0] + tw.hw[1] else hn; // a rank's vocabulary half (2D: both pairs' quarters)
+-    if (e.two) |tw| try tw.quarters(e, rd.hl, rd.hg, R, tw.hw, 4) else try e.gatherF32(rd.hl, rd.hg, R * hn);
+-    try Probe.check(probe, .head_gather, w.layers.len, rd.hg);
+-    for (0..e.world) |k| try e.ops.copyRows(e.s, rd.hg + k * R * hh * 4, hh * 4, rd.logits + k * hh * 4, e.world * hh * 4, hh * 4, R);
+-    try rd.mark(e, .head);
+-    try Probe.check(probe, .logits, w.layers.len, rd.logits);
+-    if (ntap > 0) try Probe.check(probe, .taps, w.layers.len, rd.taps);
+ }
+ 
+ /// rounds.py pre_mix: hc_pre2 of the streams h with the pending gathered partials posted in (into the spare buffer,

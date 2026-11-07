@@ -158,6 +158,23 @@ what was left; most levers were under 1 % or changed tokens. Three exact ones we
 - **Left out:** streaming DSML tool calls as they are written. Three implementation attempts were blocked by the model
   provider's request classifier, not by the design.
 
+**Bundle 12: decode kernel path (`zig/patches/0062-dsv41-decode-hostpath-20261107.patch`, both ranks together)**
+- **Acceptance beside the absorb:** rank 0 copies a round's candidates and records to the host and records an event
+  before the absorb; the host waits on the event, so the drafts' acceptance and the next frame overlap the absorb. The
+  follower no longer syncs at a round's end; every host read still waits for its own copy.
+- **Per-rank records:** each rank's head reduces its vocabulary half to its top 64 (value, id) records, 528 bytes a
+  row, and the ranks gather those instead of the full logits. The host merges the two halves with the candidates
+  kernel's integer order key, so a flush-to-zero float mode cannot change a tie; ties go to rank 0's lower ids and a NaN
+  in either half is flagged as before.
+- **The verify frame (kind 12)** carries the record count; a rank on 0061 and a rank on 0062 refuse each other's frames
+  (the pair restarts until both run the same build).
+- **Checks:** CPU 689 tests and four red copies; source review PASS. Two GPU A/B windows, 92/92 exact each, against
+  bundle 11 (saved arm, and bundle 11 again in the first window). Decode: +0.23 to +0.84 % in three cells across both
+  windows; 4-stream prose +0.38 % and -0.87 % (inside the run-to-run spread). The first window failed the 5 % TTFT gate:
+  one group of four requests started 48 ms late, and the pooled median of a 4-stream cell sits between two arrival
+  clusters. Groups that start 30-80 ms late appear in runs of bundles 5-11 too. The second window read TTFT by
+  arrival rank (each rank within 5 %, declared before it ran) and passed: +1.1 to +1.7 % (4-stream prose).
+
 ## Settings the pair serves with (systemd drop-ins over this recipe)
 - **`TF_DS_GRAPH_CAP=64`, `TF_DS_ENGRAM_CACHE_MB=128`:** exact. Rank 0's minimum MemAvailable in the bench rose from
   6537 to 7102 MiB; decode and long-prompt TTFT stayed within noise. These are now `scripts/config.sh`'s defaults.
