@@ -1,0 +1,1166 @@
+Subject: [PATCH] GB10 downloads, failed captures, Engram ids, opt-in draft calibration on 2 x DGX Spark (both ranks)
+
+On top of 0064 (the bundle-14 tree), bundle 16, carrying fixes others found for this hardware and engine family.
+On an integrated GPU (GB10 reports CU_DEVICE_ATTRIBUTE_INTEGRATED = 1) every synchronous device-to-host copy lands in a
+per-thread 4 MiB pinned bounce first, because with driver 580.178.04 a cuMemcpyDtoH straight into pageable memory can
+return success with pages left as they were (TensorFold upstream, ashhart/TensorFold a3962b45, 194115d2, e9ee7383,
+Apache-2.0); the drafter's two reads every pass go this way. A stretch that fails inside its CUDA graph capture joins
+what it forked, ends the capture and clears its flags, so the next capture does not wait on the dead one's event and
+fail with 901 until a restart (ldenaeyer, MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks pull request #119,
+Apache-2.0); a round that fails also waits out the Engram reads it submitted. Engram row ids are checked before a read
+batch allocates (Blackwellboy, bertholomus/TensorFold 12132870, Apache-2.0). MiaAI-Lab's 0050 per-stream draft-survival
+calibration (Apache-2.0) is ported, off unless TF_DS_T25_DRAFT_CAL is set, with one change: a calibrated head granted
+no drafts moves back toward no correction, so it is measured again. Tokens are unchanged with the calibration unset.
+CPU-tested with twelve red copies (757 test executions), source-reviewed twice, and A/B-checked on the pair: 92/92 exact
+against 0064 (research/LOCAL-STACK-20261106.md, "Bundle 16"). Generated with `git diff --binary` in a checkout of the
+0064 tree; `git apply` of it gives the served source file for file (1287 files, sha256-compared).
+
+diff --git a/zig/src/core/lanes/calibration_test.zig b/zig/src/core/lanes/calibration_test.zig
+new file mode 100644
+index 0000000..400e7b5
+--- /dev/null
++++ b/zig/src/core/lanes/calibration_test.zig
+@@ -0,0 +1,320 @@
++//! The draft-survival calibration: a stream's realised over predicted drafts scales the chances its window is allocated by.
++const std = @import("std");
++const Config = @import("config.zig").Config;
++const Cost = @import("config.zig").Cost;
++const Engine = @import("engine.zig").Engine;
++const Stream = @import("stream.zig").Stream;
++const fake = @import("fake.zig");
++const be = @import("backend.zig");
++const win = @import("windows.zig");
++
++const gpa = std.testing.allocator;
++
++const chain = [_]f64{ 0.9, 0.81, 0.729, 0.6561 };
++
++fn chances(_: *anyopaque, _: *Stream, out: []f64) anyerror!bool {
++    @memcpy(out, chain[0..out.len]);
++    return true;
++}
++
++fn startNow(_: *anyopaque) void {}
++
++fn elapsed(_: *anyopaque, _: be.Mark) f64 {
++    return 0.0;
++}
++
++/// Each stream's granted drafts and predicted landings after one allocation of 4 held drafts apiece.
++fn grants(weight: f64, cals: []const f64, granted: []u32, predicted: []f64) !void {
++    var costs: [16]Cost = undefined;
++    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 2.0 * @as(f64, @floatFromInt(w)) };
++    var cfg = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .draft_probabilities = true, .draft_cal = weight }, 16, 15);
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var vtable = target.backend().vtable.*;
++    vtable.probabilities = chances;
++    var token: u8 = 0;
++    var engine = Engine.init(gpa, &cfg, .{ .ptr = &target, .vtable = &vtable }, .{ .ptr = &token, .vtable = &.{ .start = startNow, .elapsed_ms = elapsed } });
++    defer engine.deinit();
++    var streams: [2]Stream = undefined;
++    var plans: [2]win.Plan = undefined;
++    for (cals, 0..) |cal, i| {
++        streams[i] = try Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 8 });
++        streams[i].cal = cal;
++        plans[i] = .{ .stream = &streams[i], .position = 0, .kind = .head, .held = 4 };
++    }
++    defer for (streams[0..cals.len]) |*s| s.deinit(gpa);
++    try win.allocate(&engine, plans[0..cals.len]);
++    for (streams[0..cals.len], granted, predicted) |s, *g, *p| {
++        g.* = s.granted.?;
++        p.* = s.predicted();
++    }
++}
++
++test "bundle16: off, the chances and the grant are the uncalibrated ones whatever the stream's cal" {
++    var g: [1]u32 = undefined;
++    var p: [1]f64 = undefined;
++    try grants(0.0, &.{0.3}, &g, &p);
++    try std.testing.expectEqual(@as(u32, 4), g[0]);
++    try std.testing.expectEqual(@as(f64, 0.0), p[0]);
++}
++
++test "bundle16: a cold stream is uncalibrated and predicts the drafts it was granted" {
++    var g: [1]u32 = undefined;
++    var p: [1]f64 = undefined;
++    try grants(0.5, &.{1.0}, &g, &p);
++    try std.testing.expectEqual(@as(u32, 4), g[0]);
++    try std.testing.expectApproxEqAbs(@as(f64, 0.9 + 0.81 + 0.729 + 0.6561), p[0], 1e-12);
++}
++
++test "bundle16: a stream that realises half its drafts is granted fewer, and predicts from the uncalibrated chances" {
++    var g: [1]u32 = undefined;
++    var p: [1]f64 = undefined;
++    try grants(0.5, &.{0.5}, &g, &p);
++    try std.testing.expectEqual(@as(u32, 2), g[0]);
++    try std.testing.expectApproxEqAbs(@as(f64, 0.9 + 0.81), p[0], 1e-12);
++}
++
++test "bundle16: the floor keeps a collapsed stream drafting" {
++    var g: [1]u32 = undefined;
++    var p: [1]f64 = undefined;
++    try grants(0.5, &.{0.05}, &g, &p);
++    try std.testing.expectEqual(@as(u32, 1), g[0]);
++    var at_floor: [1]u32 = undefined;
++    try grants(0.5, &.{0.2}, &at_floor, &p);
++    try std.testing.expectEqual(g[0], at_floor[0]);
++}
++
++test "bundle16: a shared round gives each stream its own calibration" {
++    var g: [2]u32 = undefined;
++    var p: [2]f64 = undefined;
++    try grants(0.5, &.{ 1.0, 0.2 }, &g, &p);
++    try std.testing.expectEqual(@as(u32, 4), g[0]);
++    try std.testing.expectEqual(@as(u32, 0), g[1]);
++}
++
++test "bundle16: the survival solves the chances landed for the kept drafts" {
++    const p = [_]f64{ 0.97, 0.94, 0.91, 0.88 };
++    const c = Stream.survival(&p, 2.55);
++    try std.testing.expect(c > 0.84 and c < 0.87);
++    try std.testing.expectEqual(@as(f64, 1.0), Stream.survival(&p, 4.0));
++    try std.testing.expectEqual(@as(f64, 1.0), Stream.survival(&p, 3.7));
++    try std.testing.expectEqual(@as(f64, 0.2), Stream.survival(&p, 0.0));
++    try std.testing.expectApproxEqAbs(@as(f64, 0.5), Stream.survival(&.{0.9}, 0.45), 1e-6);
++    try std.testing.expectEqual(@as(f64, 1.0), Stream.survival(&p, 40.0));
++}
++
++test "bundle16: the average moves by the weight toward the round's kept and expected drafts" {
++    var s = try Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 8 });
++    defer s.deinit(gpa);
++    s.observeCal(0.5, 3.0);
++    try std.testing.expectEqual(@as(f64, 1.0), s.cal);
++    s.predict(&.{0.9});
++    s.observeCal(0.5, 0.0);
++    try std.testing.expectEqual(@as(f64, 0.2), s.cal);
++    s.predict(&.{0.9});
++    s.observeCal(0.5, 1.0);
++    try std.testing.expectApproxEqAbs(@as(f64, 0.5 / 0.9), s.cal, 1e-6);
++    s.cal = 0.0;
++    try std.testing.expectEqual(@as(f64, 0.2), s.calScale());
++}
++
++/// The cal after 20 rounds of 4 drafts whose true per-draft survival is `factor` (its expected kept drafts).
++fn converged(factor: f64) f64 {
++    var s = Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 8 }) catch unreachable;
++    defer s.deinit(gpa);
++    const raw = [_]f64{ 0.97, 0.94, 0.91, 0.88 };
++    var kept: f64 = 0.0;
++    var f: f64 = 1.0;
++    for (raw) |p| {
++        f *= factor;
++        kept += f * p;
++    }
++    for (0..20) |_| {
++        s.predict(&raw);
++        s.observeCal(0.3, kept);
++    }
++    return s.cal;
++}
++
++test "bundle16: prose-like and code-like streams settle near their per-draft survival" {
++    try std.testing.expectApproxEqAbs(@as(f64, 0.85), converged(0.85), 0.01);
++    try std.testing.expectApproxEqAbs(@as(f64, 0.99), converged(0.99), 0.01);
++}
++
++/// The mean scale over many rounds of a chain whose drafts survive at `factor` times the predicted rate, drawn at random.
++fn meanScale(factor: f64) f64 {
++    var s = Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 8 }) catch unreachable;
++    defer s.deinit(gpa);
++    var prng = std.Random.DefaultPrng.init(7);
++    const rng = prng.random();
++    const q = 0.85;
++    var raw: [4]f64 = undefined;
++    var reach: f64 = 1.0;
++    for (&raw) |*p| {
++        reach *= q;
++        p.* = reach;
++    }
++    var total: f64 = 0.0;
++    const rounds = 4000;
++    for (0..rounds) |_| {
++        var kept: f64 = 0.0;
++        for (0..raw.len) |_| {
++            if (rng.float(f64) >= factor * q) break;
++            kept += 1.0;
++        }
++        s.predict(&raw);
++        s.observeCal(0.2, kept);
++        total += s.calScale();
++    }
++    return total / rounds;
++}
++
++test "bundle16: noise does not drag a well calibrated stream's scale down, and a short one still shows" {
++    try std.testing.expect(meanScale(1.0) > 0.95);
++    const low = meanScale(0.8);
++    try std.testing.expect(low > 0.72 and low < 0.88);
++}
++
++test "bundle16: the probe counts every calibrated verify, logged on its period or not" {
++    var s = try Stream.init(gpa, .{ .id = "probe", .prompt = &.{1}, .max_new = 8 });
++    defer s.deinit(gpa);
++    s.predict(&.{ 0.9, 0.81 });
++    s.observeCal(0.2, 1.0);
++    s.logCal(1, 3, 1, 2);
++    s.logCal(0, 3, 1, 2);
++    s.cal_n = 0;
++    s.logCal(1, 1, 0, 1);
++    try std.testing.expectEqual(@as(u64, 3), s.cal_rounds);
++}
++
++test "bundle16: the weight must lie in 0..1" {
++    for ([_]f64{ -0.1, 1.5, std.math.nan(f64), std.math.inf(f64) }) |bad| {
++        try std.testing.expectError(error.BadDraftCal, Config.init(gpa, .{ .draft_cal = bad }, 16, 15));
++    }
++    var ok = try Config.init(gpa, .{ .draft_cal = 1.0 }, 16, 15);
++    ok.deinit(gpa);
++}
++
++/// A head that claims every draft lands (0.99 each), where fake.zig's head guesses about one draft in five wrong.
++fn overconfident(_: *anyopaque, _: *Stream, out: []f64) anyerror!bool {
++    var reach: f64 = 1.0;
++    for (out) |*o| {
++        reach *= 0.99;
++        o.* = reach;
++    }
++    return true;
++}
++
++const Decoded = struct { reply: []u32, drafted: u64, rounds: u64 };
++
++/// A drafted stream decoded to its end on the fake target with the overconfident head (gpa owns the reply).
++fn decode(weight: f64) !Decoded {
++    var costs: [16]Cost = undefined;
++    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 2.0 * @as(f64, @floatFromInt(w)) };
++    var cfg = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .draft_probabilities = true, .draft_cal = weight }, 16, 15);
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var vtable = target.backend().vtable.*;
++    vtable.probabilities = overconfident;
++    var clock: fake.FixedClock = .{};
++    var engine = Engine.init(gpa, &cfg, .{ .ptr = &target, .vtable = &vtable }, clock.clock());
++    defer engine.deinit();
++    var s = try Stream.init(gpa, .{ .id = "s", .prompt = &.{ 3, 1, 4, 1, 5 }, .max_new = 120, .eos = &.{96} });
++    defer s.deinit(gpa);
++    try engine.addStream(&s);
++    while (engine.activeCount() > 0) try engine.step();
++    return .{ .reply = try gpa.dupe(u32, s.emitted()), .drafted = s.drafted, .rounds = s.cal_rounds };
++}
++
++test "bundle16: on, an overconfident head's stream verifies fewer drafts for the same reply" {
++    const off = try decode(0.0);
++    defer gpa.free(off.reply);
++    const on = try decode(0.5);
++    defer gpa.free(on.reply);
++    try std.testing.expectEqualSlices(u32, off.reply, on.reply);
++    try std.testing.expectEqual(@as(u64, 0), off.rounds);
++    try std.testing.expect(on.rounds > 0 and on.drafted < off.drafted);
++}
++
++fn sharedChances(_: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
++    const held: []const f64 = switch (s.id[0]) {
++        'h' => &.{ 0.9, 0.81, 0.729, 0.6561 },
++        'l' => &.{ 0.6, 0.3, 0.12, 0.05 },
++        else => return false, // the depth rule's chances: the class prior's
++    };
++    @memcpy(out, held[0..out.len]);
++    return true;
++}
++
++test "bundle16: unset, a shared round's windows and grants are the pre-port allocator's whatever each stream's cal" {
++    var costs: [16]Cost = undefined;
++    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 2.0 * @as(f64, @floatFromInt(w)) };
++    var cfg = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .draft_probabilities = true }, 16, 15);
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var vtable = target.backend().vtable.*;
++    vtable.probabilities = sharedChances;
++    var token: u8 = 0;
++    var engine = Engine.init(gpa, &cfg, .{ .ptr = &target, .vtable = &vtable }, .{ .ptr = &token, .vtable = &.{ .start = startNow, .elapsed_ms = elapsed } });
++    defer engine.deinit();
++    const ids = [_][]const u8{ "forced", "copy", "high", "low", "rule" };
++    var streams: [ids.len]Stream = undefined;
++    for (&streams, ids) |*s, id| s.* = try Stream.init(gpa, .{ .id = id, .prompt = &.{ 1, 2, 3 }, .max_new = 64 });
++    defer for (&streams) |*s| s.deinit(gpa);
++    for (&streams) |*s| s.cal = 0.3;
++    var plans = [_]win.Plan{
++        .{ .stream = &streams[0], .position = 3, .kind = .forced, .forced = &.{ 5, 6 }, .tokens = &.{ 5, 6 } },
++        .{ .stream = &streams[1], .position = 3, .kind = .copy, .tokens = &.{ 7, 8, 9, 10, 11, 12 } },
++        .{ .stream = &streams[2], .position = 3, .kind = .head, .held = 4 },
++        .{ .stream = &streams[3], .position = 3, .kind = .head, .held = 4 },
++        .{ .stream = &streams[4], .position = 3, .kind = .head, .held = 3 },
++    };
++    try win.allocate(&engine, &plans);
++    const Got = struct { kind: win.Kind, held: u32, tokens: []const u32, granted: ?u32 };
++    // the allocator's result on these plans before the calibration existed
++    const recorded = [_]Got{
++        .{ .kind = .forced, .held = 0, .tokens = &.{ 5, 6 }, .granted = null },
++        .{ .kind = .copy, .held = 0, .tokens = &.{ 7, 8, 9, 10, 11 }, .granted = null },
++        .{ .kind = .head, .held = 3, .tokens = &.{}, .granted = 3 },
++        .{ .kind = .none, .held = 0, .tokens = &.{}, .granted = 0 },
++        .{ .kind = .head, .held = 1, .tokens = &.{}, .granted = 1 },
++    };
++    var got: [recorded.len]Got = undefined;
++    for (&got, plans) |*g, p| g.* = .{ .kind = p.kind, .held = p.held, .tokens = p.tokens, .granted = p.stream.granted };
++    try std.testing.expectEqualDeep(recorded, got);
++    for (streams) |s| try std.testing.expectEqual(@as(usize, 0), s.cal_n);
++}
++
++test "bundle16: a stream granted no drafts in a shared round relaxes toward no correction and drafts again" {
++    var costs: [16]Cost = undefined;
++    for (&costs, 1..) |*c, w| c.* = .{ .width = @intCast(w), .ms = 5.0 + 2.0 * @as(f64, @floatFromInt(w)) };
++    var cfg = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 4, .window_costs = &costs, .mtp_step_ms = 0.5, .draft_probabilities = true, .draft_cal = 0.5 }, 16, 15);
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var vtable = target.backend().vtable.*;
++    vtable.probabilities = chances;
++    var token: u8 = 0;
++    var engine = Engine.init(gpa, &cfg, .{ .ptr = &target, .vtable = &vtable }, .{ .ptr = &token, .vtable = &.{ .start = startNow, .elapsed_ms = elapsed } });
++    defer engine.deinit();
++    var streams: [2]Stream = undefined;
++    for (&streams, [_]f64{ 1.0, 0.2 }) |*s, cal| {
++        s.* = try Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 8 });
++        s.cal = cal;
++    }
++    defer for (&streams) |*s| s.deinit(gpa);
++    var granted: [4]u32 = undefined;
++    for (&granted) |*g| {
++        var plans: [2]win.Plan = undefined;
++        for (&plans, &streams) |*p, *s| p.* = .{ .stream = s, .position = 0, .kind = .head, .held = 4 };
++        try win.allocate(&engine, &plans);
++        g.* = streams[1].granted.?;
++    }
++    // the shared round's first grant is none (as in the test above); each undrafted round moves cal 0.2 -> 0.6 -> 0.8
++    try std.testing.expectEqual(@as(u32, 0), granted[0]);
++    try std.testing.expect(std.mem.max(u32, &granted) > 0);
++    try std.testing.expectEqual(@as(f64, 1.0), streams[0].cal);
++}
+diff --git a/zig/src/core/lanes/config.zig b/zig/src/core/lanes/config.zig
+index 8f0e004..9b32b9e 100644
+--- a/zig/src/core/lanes/config.zig
++++ b/zig/src/core/lanes/config.zig
+@@ -37,6 +37,8 @@ pub const Model = struct {
+     copy_self_cap: u32 = 0, // a sampling stream's copy of its own reply at most this many tokens (0: no cap)
+     copy_multi: u32 = 0, // when every live stream copies, a copy of the prompt keeps its ramp, at most this many tokens (0: off)
+     enter_match: i64 = 8, // matching tokens a copy window needs
++    draft_cal: f64 = 0.0, // a round's weight in each stream's draft-survival calibration, 0 to 1 (0: off; Stream.observeCal)
++    cal_log: u32 = 0, // print every n-th calibrated verify of a stream to stderr (0: off)
+ };
+ 
+ pub const Config = struct {
+@@ -72,10 +74,13 @@ pub const Config = struct {
+     copy_batch_skips_head: bool = false, // Model.copy_batch_skips_head (requires copy_skips_head)
+     copy_self_cap: u32 = 0, // Model.copy_self_cap
+     copy_multi: u32 = 0, // Model.copy_multi
++    draft_cal: f64 = 0.0, // Model.draft_cal
++    cal_log: u32 = 0, // Model.cal_log
+     k: Constants = .{},
+ 
+     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
+         if (max_rows < 1) return error.BadMaxRows;
++        if (!std.math.isFinite(m.draft_cal) or m.draft_cal < 0.0 or m.draft_cal > 1.0) return error.BadDraftCal;
+         const width: u32 = @max(1, @min(@max(m.exact_width, 1), max_rows));
+         const max_copy = width - 1;
+         const first_rows: i64 = if (m.first_copy_rows != 0) m.first_copy_rows else width;
+@@ -130,6 +135,8 @@ pub const Config = struct {
+             .copy_self_cap = m.copy_self_cap,
+             .copy_multi = m.copy_multi,
+             .enter_match = m.enter_match,
++            .draft_cal = m.draft_cal,
++            .cal_log = m.cal_log,
+         };
+     }
+ 
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index b43b080..f205b5d 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -398,6 +398,11 @@ pub const Engine = struct {
+                         s.copy_width = if (kept == rows - 1) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
+                     }
+                 } else if (p.kind == .head) {
++                    if (e.cfg.draft_cal > 0.0) {
++                        s.observeCal(e.cfg.draft_cal, @floatFromInt(kept));
++                        s.logCal(e.cfg.cal_log, rows, kept, path.len);
++                        s.cal_n = 0;
++                    }
+                     if (p.lanes) |l| if (s.odds != null) observeLanes(s, l, path);
+                     const ds = try accept.depths(a, parents);
+                     const chain = if (p.branch_from > 0) ds[0..p.branch_from] else ds;
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index a430ef5..0ee0511 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -33,4 +33,5 @@ test {
+     _ = @import("engine_test.zig");
+     _ = @import("copy_batch_test.zig");
+     _ = @import("gpu_full_test.zig");
++    _ = @import("calibration_test.zig");
+ }
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index a439e55..cddd3a9 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -25,6 +25,9 @@ pub const Mode = enum { pipe, drain, verify, exit };
+ pub const loop_max_period: usize = 8;
+ pub const loop_min_run: usize = 256;
+ pub const loop_warm_in: usize = 64;
++pub const cal_floor: f64 = 0.2; // the lowest survival scale a stream's calibration applies
++pub const cal_max: usize = 32; // the granted drafts a round keeps for its calibration
++const cal_steps = 24; // bisections of a round's per-draft survival
+ 
+ /// Return the shortest exact cycle at the end of a combined token prefix.
+ fn cycleAt(head: []const u32, tail: []const u32, n: usize) ?u32 {
+@@ -223,6 +226,12 @@ pub const Stream = struct {
+     granted: ?u32 = null,
+     copy_width: ?u32 = null,
+     last_copy: bool = false, // its last round was a copy window (Config.copy_multi)
++    cal: f64 = 1.0, // the per-draft survival its verifies realised (Config.draft_cal; 1: none measured)
++    cal_raw: [cal_max]f64 = @splat(0.0), // the granted drafts' cumulative chances this round, before calibration
++    cal_n: usize = 0, // and how many (0: none)
++    cal_kept: f64 = 0.0, // moving averages of the drafts kept and of the drafts the chances expected, over verified rounds
++    cal_sum: f64 = 0.0, // (0: no round yet)
++    cal_rounds: u64 = 0, // calibrated verifies, for the log
+     gate: ?call_gate.Gate = null,
+ 
+     pub fn init(gpa: Allocator, spec: Spec) !Stream {
+@@ -270,6 +279,7 @@ pub const Stream = struct {
+         s.granted = null;
+         s.copy_width = null;
+         s.last_copy = false;
++        s.cal_n = 0;
+     }
+ 
+     pub fn dropHeld(s: *Stream, gpa: Allocator) void {
+@@ -339,6 +349,97 @@ pub const Stream = struct {
+         return std.mem.indexOfScalar(u32, s.eos, token) != null;
+     }
+ 
++    /// The survival scale the allocation uses: a cold or noisy stream cannot collapse its depth to nothing.
++    pub fn calScale(s: *const Stream) f64 {
++        return std.math.clamp(s.cal, cal_floor, 1.0);
++    }
++
++    /// Remember the granted drafts' raw cumulative chances for the round's verify.
++    pub fn predict(s: *Stream, chances: []const f64) void {
++        s.cal_n = @min(chances.len, cal_max);
++        @memcpy(s.cal_raw[0..s.cal_n], chances[0..s.cal_n]);
++    }
++
++    /// The drafts the allocation expected to land this round.
++    pub fn predicted(s: *const Stream) f64 {
++        var sum: f64 = 0.0;
++        for (s.cal_raw[0..s.cal_n]) |p| sum += p;
++        return sum;
++    }
++
++    /// A head granted no drafts verifies none, so no verify would move its calibration again (bundle 16 review: a
++    /// stream at the floor in a shared round stayed undrafted): each such round moves it a weight's step back toward
++    /// no correction, and its averages toward parity, until it is granted drafts and measured again.
++    pub fn relaxCal(s: *Stream, w: f64) void {
++        s.cal += w * (1.0 - s.cal);
++        if (s.cal_sum > 0.0) s.cal_kept += w * (s.cal_sum - s.cal_kept);
++    }
++
++    /// Fold the round into the averages of kept and expected drafts, weight `w`, and set `cal` to the per-draft
++    /// survival whose expected drafts are the average's share of this round's chances. A per-round ratio would bias
++    /// `cal` low: its noise is clipped at 1 on one side only.
++    pub fn observeCal(s: *Stream, w: f64, kept: f64) void {
++        const n = s.cal_n;
++        if (n == 0) return;
++        const expected = s.predicted();
++        if (!(expected > 0.0)) return;
++        const realised = std.math.clamp(kept, 0.0, @as(f64, @floatFromInt(n)));
++        if (s.cal_sum > 0.0) {
++            s.cal_kept = (1.0 - w) * s.cal_kept + w * realised;
++            s.cal_sum = (1.0 - w) * s.cal_sum + w * expected;
++        } else {
++            s.cal_kept = realised;
++            s.cal_sum = expected;
++        }
++        s.cal = survival(s.cal_raw[0..n], s.cal_kept / s.cal_sum * expected);
++    }
++
++    /// One line on stderr for the probe: the round, what it predicted, and what the next allocation will see.
++    pub fn logCal(s: *Stream, every: u32, rows: usize, kept: usize, tokens: usize) void {
++        s.cal_rounds += 1;
++        if (every == 0 or s.cal_rounds % every != 0) return;
++        var buf: [1024]u8 = undefined;
++        var at: usize = 0;
++        const n = s.cal_n;
++        at += (std.fmt.bufPrint(buf[at..], "tf-cal {{\"stream\": \"{s}\", \"rows\": {d}, \"granted\": {d}, \"kept\": {d}, \"pred_sum\": {d:.3}, \"chances\": [", .{ s.id, rows, n, kept, s.predicted() }) catch return).len;
++        for (s.cal_raw[0..n], 0..) |p, i| at += (std.fmt.bufPrint(buf[at..], "{s}{d:.3}", .{ if (i > 0) ", " else "", p }) catch return).len;
++        at += (std.fmt.bufPrint(buf[at..], "], \"cal\": {d:.3}, \"next\": [", .{s.cal}) catch return).len;
++        const scale = s.calScale();
++        var factor: f64 = 1.0;
++        for (s.cal_raw[0..n], 0..) |p, i| {
++            factor *= scale;
++            at += (std.fmt.bufPrint(buf[at..], "{s}{d:.3}", .{ if (i > 0) ", " else "", p * factor }) catch return).len;
++        }
++        at += (std.fmt.bufPrint(buf[at..], "], \"tokens\": {d}}}\n", .{tokens}) catch return).len;
++        std.debug.print("{s}", .{buf[0..at]});
++    }
++
++    /// The per-draft survival c in [cal_floor, 1] with sum_i c^i * chances[i-1] = kept (kept clamped to the drafts).
++    pub fn survival(chances: []const f64, kept: f64) f64 {
++        var total: f64 = 0.0;
++        for (chances) |p| total += p;
++        const want = std.math.clamp(kept, 0.0, @as(f64, @floatFromInt(chances.len)));
++        if (want >= total) return 1.0;
++        if (expectedKept(chances, cal_floor) >= want) return cal_floor;
++        var lo: f64 = cal_floor;
++        var hi: f64 = 1.0;
++        for (0..cal_steps) |_| {
++            const mid = 0.5 * (lo + hi);
++            if (expectedKept(chances, mid) < want) lo = mid else hi = mid;
++        }
++        return 0.5 * (lo + hi);
++    }
++
++    fn expectedKept(chances: []const f64, c: f64) f64 {
++        var sum: f64 = 0.0;
++        var factor: f64 = 1.0;
++        for (chances) |p| {
++            factor *= c;
++            sum += factor * p;
++        }
++        return sum;
++    }
++
+     /// Append tokens until the stream finishes; how many landed (a prefix of `tokens`).
+     pub fn commit(s: *Stream, gpa: Allocator, tokens: []const u32) !usize {
+         if (s.fault != null and !s.finished) {
+diff --git a/zig/src/core/lanes/windows.zig b/zig/src/core/lanes/windows.zig
+index 987b5ad..9b77528 100644
+--- a/zig/src/core/lanes/windows.zig
++++ b/zig/src/core/lanes/windows.zig
+@@ -178,7 +178,9 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
+     const a = e.arena.allocator();
+     const fixed = try a.alloc(u32, plans.len);
+     const probs = try a.alloc([]const f64, plans.len);
+-    for (plans, fixed, probs) |p, *fx, *pr| {
++    const raw = try a.alloc([]const f64, plans.len);
++    @memset(raw, &.{});
++    for (plans, fixed, probs, raw) |p, *fx, *pr, *rw| {
+         const n = p.count();
+         if (p.kind == .forced or n == 0) {
+             fx.* = 1 + @as(u32, @intCast(if (p.kind == .forced) n else 0));
+@@ -188,12 +190,15 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
+             pr.* = try alloc.chainProbabilities(a, &.{e.cfg.copy_rate}, n);
+         } else {
+             fx.* = 1;
+-            pr.* = try nodeChances(e, p.stream, n);
++            rw.* = try nodeChances(e, p.stream, n);
++            pr.* = if (e.cfg.draft_cal > 0.0) try calibrated(a, rw.*, p.stream.calScale()) else rw.*;
+         }
+     }
+     const counts = try alloc.allocate(a, fixed, probs, &e.cfg.shared_costs, e.rule.overheadMs(plans.len), @max(plans.len, e.cfg.batch_rows));
+-    for (plans, probs, counts) |*p, chances, c| {
++    for (plans, probs, counts, raw) |*p, chances, c, rw| {
+         if (p.kind == .head) p.stream.granted = c;
++        if (e.cfg.draft_cal > 0.0) p.stream.predict(if (p.kind == .head) rw[0..c] else &.{});
++        if (e.cfg.draft_cal > 0.0 and p.kind == .head and c == 0 and chances.len > 0) p.stream.relaxCal(e.cfg.draft_cal);
+         if (chances.len == 0 or c == chances.len) continue;
+         if (c == 0) {
+             p.kind = .none;
+@@ -230,6 +235,17 @@ pub fn nodeChances(e: *Engine, s: *Stream, n: usize) ![]const f64 {
+     return alloc.chainProbabilities(a, try e.rule.rates(who(s)), n);
+ }
+ 
++/// Cumulative chances scaled by a survival: the i-th (1-based) lands only if i drafts each survive.
++pub fn calibrated(a: std.mem.Allocator, chances: []const f64, scale: f64) ![]const f64 {
++    const out = try a.alloc(f64, chances.len);
++    var factor: f64 = 1.0;
++    for (out, chances) |*o, c| {
++        factor *= scale;
++        o.* = c * factor;
++    }
++    return out;
++}
++
+ /// The window's rows, parents and keyed positions, ready for the backend.
+ pub fn build(e: *Engine, p: Plan, early: bool) !be.Window {
+     const a = e.arena.allocator();
+diff --git a/zig/src/cuda/abi.zig b/zig/src/cuda/abi.zig
+index 2894a9e..cfae572 100644
+--- a/zig/src/cuda/abi.zig
++++ b/zig/src/cuda/abi.zig
+@@ -175,6 +175,7 @@ pub const Api = struct {
+     cuDevicePrimaryCtxRelease_v2: *const fn (Device) callconv(.c) R,
+     cuCtxSetCurrent: *const fn (Context) callconv(.c) R,
+     cuCtxGetCurrent: *const fn (*Context) callconv(.c) R,
++    cuCtxGetDevice: *const fn (*Device) callconv(.c) R,
+     cuCtxSynchronize: *const fn () callconv(.c) R,
+     cuMemGetInfo_v2: *const fn (*usize, *usize) callconv(.c) R,
+     cuMemAlloc_v2: *const fn (*DevicePtr, usize) callconv(.c) R,
+diff --git a/zig/src/cuda/memory.zig b/zig/src/cuda/memory.zig
+index 6f2129e..4b8daaa 100644
+--- a/zig/src/cuda/memory.zig
++++ b/zig/src/cuda/memory.zig
+@@ -49,6 +49,29 @@ fn lockCounts() void {
+     while (!counts_mutex.tryLock()) std.Thread.yield() catch {};
+ }
+ 
++/// The most bytes one staged download copies at a time (DeviceBuffer.download).
++pub const bounce_bytes: usize = 4 << 20;
++/// This thread's pinned bounce for downloads from an integrated GPU, made on its first one and kept for the next.
++threadlocal var bounce: ?HostBuffer = null;
++/// Whether this thread's current device under `d` is integrated, read on its first download.
++threadlocal var reading: ?struct { d: *const Driver, integrated: bool } = null;
++
++/// Device bytes at `src` into `out`, copied as DeviceBuffer.download copies them, for a span no DeviceBuffer owns.
++pub fn download(d: *const Driver, src: abi.DevicePtr, out: []u8) Error!void {
++    const view: DeviceBuffer = .{ .d = d, .ptr = src, .len = out.len };
++    try view.download(0, out);
++}
++
++fn integrated(d: *const Driver) Error!bool {
++    if (reading) |r| if (r.d == d) return r.integrated;
++    var dev: abi.Device = 0;
++    try d.check(d.api.cuCtxGetDevice(&dev), "cuCtxGetDevice");
++    var v: c_int = 0;
++    try d.check(d.api.cuDeviceGetAttribute(&v, .integrated, dev), "cuDeviceGetAttribute");
++    reading = .{ .d = d, .integrated = v != 0 };
++    return v != 0;
++}
++
+ pub const DeviceBuffer = struct {
+     d: *const Driver,
+     ptr: abi.DevicePtr,
+@@ -93,10 +116,26 @@ pub const DeviceBuffer = struct {
+         try self.d.check(self.d.api.cuMemcpyHtoD_v2(dst, bytes.ptr, bytes.len), "cuMemcpyHtoD");
+     }
+ 
++    /// Returns once the bytes have landed. On GB10 (driver 580.178.04) a cuMemcpyDtoH straight into pageable memory
++    /// can return success with some pages left as they were and the bytes landed elsewhere in the process, so on an
++    /// integrated GPU the copy lands in this thread's pinned bounce, `bounce_bytes` at a time, and the CPU copies it on.
+     pub fn download(self: DeviceBuffer, offset: usize, out: []u8) Error!void {
+         const src = try self.span(offset, out.len);
+         if (out.len == 0) return;
+-        try self.d.check(self.d.api.cuMemcpyDtoH_v2(out.ptr, src, out.len), "cuMemcpyDtoH");
++        if (!try integrated(self.d)) return self.d.check(self.d.api.cuMemcpyDtoH_v2(out.ptr, src, out.len), "cuMemcpyDtoH");
++        if (bounce) |*b| if (b.d != self.d) {
++            b.free();
++            bounce = null;
++        };
++        if (bounce == null) bounce = try HostBuffer.alloc(self.d, bounce_bytes);
++        const pin = bounce.?.bytes;
++        var done: usize = 0;
++        while (done < out.len) {
++            const n = @min(out.len - done, pin.len);
++            try self.d.check(self.d.api.cuMemcpyDtoH_v2(pin.ptr, src + done, n), "cuMemcpyDtoH");
++            @memcpy(out[done..][0..n], pin[0..n]);
++            done += n;
++        }
+     }
+ 
+     /// Asynchronous only when `bytes` is pinned (HostBuffer); pageable memory makes the driver stage it.
+@@ -239,3 +278,94 @@ test "peak reset preserves an allocation between its read and store" {
+     try std.testing.expectEqual(before.device + 100, after.device);
+     try std.testing.expectEqual(before.device + 400, after.peak);
+ }
++
++/// A driver whose synchronous downloads on an integrated GPU write only into its own pinned bytes, as GB10's fault
++/// leaves pageable memory: the copy reports success and those bytes keep what they held.
++const FakeDownloads = struct {
++    var pinned: [bounce_bytes]u8 align(16) = undefined;
++    var integrated_flag: c_int = 1;
++    var allocations: usize = 0;
++    var copies: usize = 0;
++    var last_dst: usize = 0;
++
++    fn driver(integrated_device: bool) Driver {
++        integrated_flag = @intFromBool(integrated_device);
++        allocations = 0;
++        copies = 0;
++        var d: Driver = undefined;
++        d.api.cuCtxGetDevice = ctxDevice;
++        d.api.cuDeviceGetAttribute = attribute;
++        d.api.cuMemHostAlloc = hostAlloc;
++        d.api.cuMemFreeHost = hostFree;
++        d.api.cuMemcpyDtoH_v2 = copy;
++        return d;
++    }
++
++    /// This thread's bounce freed and its device reading forgotten: the next test's driver may sit at the same address.
++    fn forget() void {
++        if (bounce) |*b| b.free();
++        bounce = null;
++        reading = null;
++    }
++
++    fn byte(at: u64) u8 {
++        return @truncate(at ^ (at >> 21));
++    }
++
++    fn ctxDevice(dev: *abi.Device) callconv(.c) abi.Result {
++        dev.* = 0;
++        return abi.success;
++    }
++
++    fn attribute(v: *c_int, a: abi.DeviceAttribute, _: abi.Device) callconv(.c) abi.Result {
++        v.* = if (a == .integrated) integrated_flag else 0;
++        return abi.success;
++    }
++
++    fn hostAlloc(p: *?*anyopaque, len: usize, _: c_uint) callconv(.c) abi.Result {
++        std.debug.assert(len <= pinned.len);
++        allocations += 1;
++        p.* = &pinned;
++        return abi.success;
++    }
++
++    fn hostFree(_: ?*anyopaque) callconv(.c) abi.Result {
++        return abi.success;
++    }
++
++    fn copy(dst: ?*anyopaque, src: abi.DevicePtr, len: usize) callconv(.c) abi.Result {
++        copies += 1;
++        last_dst = @intFromPtr(dst.?);
++        const in_pinned = last_dst >= @intFromPtr(&pinned) and last_dst + len <= @intFromPtr(&pinned) + pinned.len;
++        if (integrated_flag == 0 or in_pinned) for (@as([*]u8, @ptrCast(dst.?))[0..len], 0..) |*b, i| {
++            b.* = byte(src + i);
++        };
++        return abi.success;
++    }
++};
++
++test "bundle16: an integrated GPU's download lands in this thread's pinned bounce, in pieces, and the caller gets the device's bytes" {
++    var d = FakeDownloads.driver(true);
++    defer FakeDownloads.forget();
++    const n = bounce_bytes + 257;
++    const host = try std.testing.allocator.alloc(u8, n + 32);
++    defer std.testing.allocator.free(host);
++    @memset(host, 0xaa);
++    const buf: DeviceBuffer = .{ .d = &d, .ptr = 0x1000, .len = 0x3b + n };
++    try buf.download(0x3b, host[16..][0..n]);
++    for (host[16..][0..n], 0..) |b, i| try std.testing.expectEqual(FakeDownloads.byte(0x103b + i), b);
++    try std.testing.expect(std.mem.allEqual(u8, host[0..16], 0xaa) and std.mem.allEqual(u8, host[16 + n ..], 0xaa));
++    try std.testing.expectEqual(@as(usize, 2), FakeDownloads.copies);
++    try std.testing.expectEqual(@intFromPtr(&FakeDownloads.pinned), FakeDownloads.last_dst);
++    try std.testing.expectEqual(@as(usize, 1), FakeDownloads.allocations);
++}
++
++test "bundle16: a discrete GPU's download copies straight into the caller's memory" {
++    var d = FakeDownloads.driver(false);
++    defer FakeDownloads.forget();
++    var out: [64]u8 = @splat(0xaa);
++    try download(&d, 0x2000, &out);
++    for (out, 0..) |b, i| try std.testing.expectEqual(FakeDownloads.byte(0x2000 + i), b);
++    try std.testing.expectEqual(@intFromPtr(&out), FakeDownloads.last_dst);
++    try std.testing.expectEqual(@as(usize, 0), FakeDownloads.allocations);
++}
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index dc1cf52..2706909 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -6,6 +6,7 @@ pub const Error = @import("driver.zig").Error;
+ pub const Context = @import("context.zig").Context;
+ pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
+ pub const HostBuffer = @import("memory.zig").HostBuffer;
++pub const download = @import("memory.zig").download;
+ pub const usage = @import("memory.zig").usage;
+ pub const Usage = @import("memory.zig").Usage;
+ pub const Stream = @import("stream.zig").Stream;
+diff --git a/zig/src/families/dsv41/display.zig b/zig/src/families/dsv41/display.zig
+index bbcb19c..f524f9e 100644
+--- a/zig/src/families/dsv41/display.zig
++++ b/zig/src/families/dsv41/display.zig
+@@ -176,8 +176,8 @@ fn sameBytes(d: *const cuda.Driver, a: abi.DevicePtr, b: abi.DevicePtr, len: usi
+     var at: usize = 0;
+     while (at < len) : (at += piece) {
+         const n = @min(piece, len - at);
+-        try d.check(d.api.cuMemcpyDtoH_v2(x.ptr, a + at, n), "cuMemcpyDtoH (the display reservation's table)");
+-        try d.check(d.api.cuMemcpyDtoH_v2(y.ptr, b + at, n), "cuMemcpyDtoH (the table)");
++        try cuda.download(d, a + at, x[0..n]);
++        try cuda.download(d, b + at, y[0..n]);
+         if (!std.mem.eql(u8, x[0..n], y[0..n])) {
+             std.log.err("display reservation: the table's copy differs within bytes {d}..{d}", .{ at, at + n });
+             return error.DisplayCopyMismatch;
+diff --git a/zig/src/families/dsv41/draft.zig b/zig/src/families/dsv41/draft.zig
+index 5be9950..4e2f236 100644
+--- a/zig/src/families/dsv41/draft.zig
++++ b/zig/src/families/dsv41/draft.zig
+@@ -486,8 +486,8 @@ pub const Drafter = struct {
+         // one host read: the drafts and the confidences
+         try e.synchronize();
+         var hc: [max_streams * max_block]f32 = undefined;
+-        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&ho, dr.out, N * ts * 8), "cuMemcpyDtoH");
+-        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&hc, dr.conf, N * steps * 4), "cuMemcpyDtoH");
++        try cuda.download(e.d, dr.out, std.mem.sliceAsBytes(ho[0 .. N * ts]));
++        try cuda.download(e.d, dr.conf, std.mem.sliceAsBytes(hc[0 .. N * steps]));
+         for (0..N) |i| for (0..steps) |j| {
+             dr.drafts[i][j] = ho[i * ts + 1 + j];
+             dr.confs[i][j] = hc[i * steps + j];
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index d50e044..5170319 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -101,3 +101,12 @@ test {
+     refAll(display);
+     refAll(pil); // (bundle 11) its tests, under a --test-filter too
+ }
++
++test "bundle16: the family's synchronous device-to-host copies go through cuda.download, but those into the pinned logits" {
++    // GB10 can miss pages of a cuMemcpyDtoH straight into pageable memory (cuda/memory.zig: DeviceBuffer.download)
++    const files = .{ "model.zig", "draft.zig", "vision.zig", "display.zig", "lanes.zig", "vit_main.zig", "layer_main.zig", "load_main.zig" };
++    var direct: [files.len]usize = undefined;
++    inline for (files, 0..) |f, i| direct[i] = @import("std").mem.count(u8, @embedFile(f), "cuMemcpyDtoH_v2(");
++    // model.zig's two read the logits into Model.logits, a HostBuffer
++    try @import("std").testing.expectEqualSlices(usize, &.{ 2, 0, 0, 0, 0, 0, 0, 0 }, &direct);
++}
+diff --git a/zig/src/families/dsv41/engram_aio.zig b/zig/src/families/dsv41/engram_aio.zig
+index 9b8edc4..78b40bb 100644
+--- a/zig/src/families/dsv41/engram_aio.zig
++++ b/zig/src/families/dsv41/engram_aio.zig
+@@ -333,8 +333,7 @@ pub const Aio = struct {
+             const i: usize = if (sel) |q| q[j >> 1] else j >> 1;
+             const sc = j & 1 == 1;
+             const rb = if (sc) t.row_s else t.row_w;
+-            const row: u64 = @intCast(ids[i]);
+-            if (row >= t.rows) return error.RowOutOfRange;
++            const row: u64 = @intCast(ids[i]); // start and touch checked every id
+             const off = (if (sc) t.base_s else t.base_w) + row * rb;
+             const lo = std.mem.alignBackward(u64, off, block);
+             b.skew[j] = @intCast(off - lo);
+@@ -381,6 +380,7 @@ pub const Aio = struct {
+     /// complete (keep both alive until `wait` returns). Returns the batch id.
+     pub fn start(a: *Aio, t: engram_io.Table, ids: []const i64, out_w: []u8, out_s: []u8) !u64 {
+         if (out_w.len < ids.len * t.row_w or out_s.len < ids.len * t.row_s) return error.BadSize;
++        try checkIds(t, ids);
+         a.mutex.lockUncancelable(a.io);
+         defer a.mutex.unlock(a.io);
+         const c = row_cache orelse return a.submitLocked(t, ids, out_w, out_s);
+@@ -399,11 +399,17 @@ pub const Aio = struct {
+     /// A touch of rows `ids`: their reads submitted, nothing copied, nobody waits (the lane hands these to a thread of
+     /// their own so a slow submit never holds the round's thread; callers that want that run it on one).
+     pub fn touch(a: *Aio, t: engram_io.Table, ids: []const i64) !void {
++        try checkIds(t, ids);
+         a.mutex.lockUncancelable(a.io);
+         defer a.mutex.unlock(a.io);
+         _ = try a.submitLocked(t, ids, null, null);
+     }
+ 
++    /// Every id a row of `t`, checked before the row cache casts them or a batch allocates.
++    fn checkIds(t: engram_io.Table, ids: []const i64) !void {
++        for (ids) |x| if (x < 0 or @as(u64, @intCast(x)) >= t.rows) return error.RowOutOfRange;
++    }
++
+     /// Reap (polling) until batch `id`'s rows are all in; error.ReadFailed when one failed. A batch is waited for once.
+     pub fn wait(a: *Aio, id: u64) !void {
+         while (true) {
+@@ -530,3 +536,61 @@ test "bug hunt: the row cache's index is rebuilt as rows come and go, and every
+     }
+     try std.testing.expect(c.map.get(.{ .fd = 3, .base = 0, .row = 935 }) == null);
+ }
++
++test "bundle16: a refused row id is refused before the batch allocates, with or without the row cache, and the ring still reads" {
++    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
++    const a = std.testing.allocator;
++    const io = std.testing.io;
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    const rows = 40;
++    var json_buf: [256]u8 = undefined;
++    const json = try std.fmt.bufPrint(&json_buf, "{{\"layers.1.engram.embed.weight\":{{\"dtype\":\"U8\",\"shape\":[{d},100],\"data_offsets\":[0,{d}]}},\"layers.1.engram.embed.scale\":{{\"dtype\":\"U8\",\"shape\":[{d},3],\"data_offsets\":[{d},{d}]}}}}", .{ rows, rows * 100, rows, rows * 100, rows * 103 });
++    var file: std.ArrayList(u8) = .empty;
++    defer file.deinit(a);
++    var len: [8]u8 = undefined;
++    std.mem.writeInt(u64, &len, json.len, .little);
++    try file.appendSlice(a, &len);
++    try file.appendSlice(a, json);
++    for (0..rows * 103) |i| try file.append(a, @intCast((i * 7 + 3) % 251));
++    try tmp.dir.writeFile(io, .{ .sub_path = "engram.safetensors", .data = file.items });
++    const dir = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
++    defer a.free(dir);
++    var t = try engram_io.Tables.open(a, io, dir);
++    defer t.close();
++    const tab = t.layers.get(1).?;
++    // the ring's allocations counted: a refused id leaves them as they were
++    var counted = std.testing.FailingAllocator.init(a, .{});
++    const aio = Aio.init(counted.allocator(), io, 16) catch |e| switch (e) {
++        error.AioUnavailable => return error.SkipZigTest,
++        else => return e,
++    };
++    defer aio.deinit();
++    const held = counted.allocations - counted.deallocations;
++    var w: [2 * 100]u8 = undefined;
++    var sc: [2 * 3]u8 = undefined;
++    try std.testing.expectError(error.RowOutOfRange, aio.start(tab, &.{ 3, rows }, &w, &sc));
++    try std.testing.expectEqual(held, counted.allocations - counted.deallocations);
++    try std.testing.expectError(error.RowOutOfRange, aio.start(tab, &.{-1}, w[0..100], sc[0..3]));
++    try std.testing.expectError(error.RowOutOfRange, aio.touch(tab, &.{rows}));
++    try std.testing.expectEqual(held, counted.allocations - counted.deallocations);
++    // the served path looks the ids up in the row cache first, which casts them to rows
++    const c = try RowCache.createRows(a, 8);
++    row_cache = c;
++    cache_io = io;
++    defer {
++        row_cache = null;
++        c.destroy();
++    }
++    try std.testing.expectError(error.RowOutOfRange, aio.start(tab, &.{ 5, -1 }, &w, &sc));
++    try std.testing.expectEqual(held, counted.allocations - counted.deallocations);
++    const pool = try engram_io.Pool.init(a, io, 2);
++    defer pool.deinit(a);
++    var want_w: [2 * 100]u8 = undefined;
++    var want_s: [2 * 3]u8 = undefined;
++    try pool.gather(tab, &.{ 3, rows - 1 }, &want_w, &want_s);
++    const id = try aio.start(tab, &.{ 3, rows - 1 }, &w, &sc);
++    try aio.wait(id);
++    try std.testing.expectEqualSlices(u8, &want_w, &w);
++    try std.testing.expectEqualSlices(u8, &want_s, &sc);
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 91cca61..f66913c 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -519,6 +519,8 @@ pub const Lanes = struct {
+     copy_rows: usize = window_rows, // TF_DS_COPY_ROWS: a lone stream's widest copy window (6: the stock width, off)
+     copy_skip: bool = false, // TF_DS_COPY_SKIP=1: no drafter pass after a lone stream's fully accepted copy window
+     copy_batch_skip: bool = false, // TF_DS_COPY_BATCH_SKIP=1: the same rule for shared copy windows (opt-in)
++    draft_cal: f64 = 0, // TF_DS_T25_DRAFT_CAL=w (0 to 1, Config.init checks; unset: 0, off): a round's weight in each stream's draft-survival calibration
++    cal_log: u32 = 0, // TF_DS_T25_CAL_LOG=n: every n-th calibrated verify of a stream on stderr (unset: 0, off)
+     platt: [draft.max_block][2]f64 = undefined, // (identity until Lanes.init) TF_DS_CALIB_PLATT: each draft position's (scale, shift) of the confidence logit
+     platt_on: bool = false,
+     calib_out: ?*CFile = null, // TF_DS_CALIB_FILE: each draft's confidence-head features and fate, for an offline refit of the head
+@@ -601,6 +603,8 @@ pub const Lanes = struct {
+         }
+         if (envVar("TF_DS_COPY_SKIP")) |t| self.copy_skip = std.mem.eql(u8, t, "1");
+         if (envVar("TF_DS_COPY_BATCH_SKIP")) |t| self.copy_batch_skip = std.mem.eql(u8, t, "1");
++        if (envVar("TF_DS_T25_DRAFT_CAL")) |t| self.draft_cal = std.fmt.parseFloat(f64, t) catch return error.BadDraftCal;
++        if (envVar("TF_DS_T25_CAL_LOG")) |t| self.cal_log = std.fmt.parseInt(u32, t, 10) catch return error.BadCalLog;
+         if (envVar("TF_DS_COPY_ENTER")) |t| {
+             self.enter_match = std.fmt.parseInt(i64, t, 10) catch return error.BadCopyRows;
+             if (self.enter_match < 2 or self.enter_match > 64) return error.BadCopyRows;
+@@ -727,6 +731,8 @@ pub const Lanes = struct {
+             .copy_self_cap = copySelfCap(),
+             .copy_multi = copyMulti(),
+             .enter_match = self.enter_match,
++            .draft_cal = self.draft_cal,
++            .cal_log = self.cal_log,
+             .gpu_tokens = false,
+             .mtp = drafting,
+             .speculate = drafting,
+@@ -1225,7 +1231,7 @@ pub const Lanes = struct {
+         if (self.calib_out != null) {
+             const w = m.cfg.hidden + m.cfg.markov_rank;
+             const rows = n * d.steps;
+-            try m.eng.d.check(m.eng.d.api.cuMemcpyDtoH_v2(self.calib_stage.ptr, d.conf_in, rows * w * 4), "cuMemcpyDtoH");
++            try cuda.download(m.eng.d, d.conf_in, std.mem.sliceAsBytes(self.calib_stage[0 .. rows * w]));
+             for (asked[0..n], depths[0..n], 0..) |l, k, i| for (0..k) |j| {
+                 const src = self.calib_stage[(i * d.steps + j) * w ..][0..w];
+                 const dst = self.calib_feat[(l.slot * draft.max_block + j) * w ..][0..w];
+diff --git a/zig/src/families/dsv41/layer_main.zig b/zig/src/families/dsv41/layer_main.zig
+index d732814..19a659f 100644
+--- a/zig/src/families/dsv41/layer_main.zig
++++ b/zig/src/families/dsv41/layer_main.zig
+@@ -116,7 +116,7 @@ const Run = struct {
+         try r.s.synchronize();
+         const bytes = numel(pt.shape) * dtypeBytes(pt.dtype);
+         if (bytes > r.host.len) r.host = try r.a.alloc(u8, bytes); // the arena: no free
+-        try r.d.check(r.d.api.cuMemcpyDtoH_v2(r.host.ptr, dev, bytes), "cuMemcpyDtoH");
++        try cuda.download(r.d, dev, r.host[0..bytes]);
+         var h: [32]u8 = undefined;
+         std.crypto.hash.sha2.Sha256.hash(r.host[0..bytes], &h, .{});
+         var hex: [64]u8 = undefined;
+@@ -175,7 +175,7 @@ const Run = struct {
+         const bytes = numel(pt.shape) * dtypeBytes(pt.dtype);
+         const row_bytes = numel(pt.shape[1..]) * dtypeBytes(pt.dtype);
+         if (bytes > r.host.len) r.host = try r.a.alloc(u8, bytes); // the arena: no free
+-        try r.d.check(r.d.api.cuMemcpyDtoH_v2(r.host.ptr, dev, bytes), "cuMemcpyDtoH");
++        try cuda.download(r.d, dev, r.host[0..bytes]);
+         const want = try std.Io.Dir.cwd().readFileAlloc(r.io, try std.fs.path.join(r.a, &.{ r.fx.dir, "layers", name }), r.a, .limited(1 << 31));
+         defer r.a.free(want);
+         if (want.len != bytes) return error.SavedSizeDiffers;
+@@ -599,7 +599,7 @@ fn vocabOf(eng: *const prompt.Engine) usize {
+ fn argmax(run: *Run, dev: u64, n: usize) !usize {
+     try run.s.synchronize();
+     const host = try run.rowBuf(n);
+-    try run.d.check(run.d.api.cuMemcpyDtoH_v2(host.ptr, dev, n * 4), "cuMemcpyDtoH");
++    try cuda.download(run.d, dev, std.mem.sliceAsBytes(host));
+     var best: usize = 0;
+     for (host, 0..) |v, i| {
+         if (v > host[best]) best = i;
+@@ -653,7 +653,7 @@ fn sampleDev(run: *Run, dev: u64, n: usize, position: usize, s: sampling.Samplin
+     if (s.temperature <= 0) return @intCast(try argmax(run, dev, n));
+     try run.s.synchronize();
+     const host = try run.rowBuf(n);
+-    try run.d.check(run.d.api.cuMemcpyDtoH_v2(host.ptr, dev, n * 4), "cuMemcpyDtoH");
++    try cuda.download(run.d, dev, std.mem.sliceAsBytes(host));
+     return sampling.sampleRow(host, position, s);
+ }
+ 
+diff --git a/zig/src/families/dsv41/load_main.zig b/zig/src/families/dsv41/load_main.zig
+index 00bf3ff..10265bd 100644
+--- a/zig/src/families/dsv41/load_main.zig
++++ b/zig/src/families/dsv41/load_main.zig
+@@ -64,7 +64,7 @@ pub fn main(init: std.process.Init) !u8 {
+         defer host.deinit(init.gpa);
+         for (w.named.items) |n| {
+             try host.resize(init.gpa, n.len);
+-            try driver.check(driver.api.cuMemcpyDtoH_v2(host.items.ptr, n.ptr, n.len), "cuMemcpyDtoH");
++            try cuda.download(&driver, n.ptr, host.items);
+             var h: [32]u8 = undefined;
+             std.crypto.hash.sha2.Sha256.hash(host.items, &h, .{});
+             try fw.interface.print("{{\"name\": \"{s}\", \"bytes\": {d}, \"sha256\": \"{x}\"}}\n", .{ n.name, n.len, &h });
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 3d14122..c16efe7 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -1080,8 +1080,7 @@ pub const Model = struct {
+             if (m.timer) |t| try t.finish();
+             if (m.rd.clk != 0) {
+                 var h: [1 + 2 * round.Round.max_clocks]u64 = undefined;
+-                const d = m.ctx.d;
+-                try d.check(d.api.cuMemcpyDtoH_v2(&h, m.rd.clk, h.len * 8), "cuMemcpyDtoH");
++                try cuda.download(m.ctx.d, m.rd.clk, std.mem.sliceAsBytes(&h));
+                 const n = @min(h[0], round.Round.max_clocks);
+                 for (1..n) |i| {
+                     const tag = h[2 + 2 * i] & 0xff;
+diff --git a/zig/src/families/dsv41/round.zig b/zig/src/families/dsv41/round.zig
+index ac3d7c6..4d117d6 100644
+--- a/zig/src/families/dsv41/round.zig
++++ b/zig/src/families/dsv41/round.zig
+@@ -1000,10 +1000,17 @@ pub const Graphs = struct {
+         const start = cy.*;
+         try cuda.graph.beginCapture(e.s, .thread_local);
+         stretch(e, rd, ch, cs, rings, cy, li, end, null) catch |err| {
++            // (bundle 16) what it forked joined so the capture ends cleanly, then forgotten whatever those calls did: a
++            // flag left set makes the next capture's first mix wait on this dead capture's event, which CUDA refuses (901
++            // on every capture after it until a restart); a stretch starts with nothing forked, so all of it was this one's
++            rd.joinSide(e) catch {};
++            rd.joinPrefetch(e) catch {};
+             if (cuda.graph.endCapture(e.s)) |got| {
+                 var x = got;
+                 x.deinit();
+             } else |_| {}
++            rd.side_out = false;
++            rd.pf_out = false;
+             return err;
+         };
+         var graph = try cuda.graph.endCapture(e.s);
+@@ -1044,6 +1051,9 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
+     // the round's Engram reads, every layer's at once (AIO): hashed and submitted once the first stretch is issued
+     // (its GPU time covers the reads), landed on the host before each Engram layer's stretch
+     var ah: Ahead = .{};
++    // (bundle 16) a round that fails between its reads' submission and their landing waits them out: a later reap
++    // would copy a late one into the host rows the next round's reads land in (a waited batch, and id 0, return at once)
++    errdefer if (ah.aio) for (ah.ids) |id| eh.?.aio.?.wait(id) catch {};
+     var ahead = e.c.engram_layers.slice().len == 0;
+     // the stretches: cut before each Engram layer (TF_DS_ENGRAM_SPLIT on), its rows read on the host before it
+     var li: usize = 0;
+@@ -1339,3 +1349,80 @@ test "bundle2: decode indexer scratch: as before while every row fits, bounded p
+     // past the candidate source every row's pool keys [R, pk * cb] still fit
+     try std.testing.expect(R * pk * cb * 8 <= one.keys);
+ }
++
++test "bundle16: a stretch that fails inside its capture joins what it forked, ends the capture, and owes the next one no join" {
++    const abi = cuda.abi;
++    const Fake = struct {
++        const Call = enum { begin, record, wait, end, destroy };
++        var calls: [8]Call = undefined;
++        var n: usize = 0;
++        var refuse = false; // an invalidated capture: its waits and its end refused (NOT_READY, which logs nothing)
++        fn put(c: Call) void {
++            calls[n] = c;
++            n += 1;
++        }
++        fn begin(_: abi.Stream, _: abi.CaptureMode) callconv(.c) abi.Result {
++            put(.begin);
++            return abi.success;
++        }
++        fn record(_: abi.Event, _: abi.Stream) callconv(.c) abi.Result {
++            put(.record);
++            return abi.success;
++        }
++        fn wait(_: abi.Stream, _: abi.Event, _: c_uint) callconv(.c) abi.Result {
++            put(.wait);
++            return if (refuse) abi.error_not_ready else abi.success;
++        }
++        fn end(_: abi.Stream, g: *abi.Graph) callconv(.c) abi.Result {
++            put(.end);
++            if (refuse) return abi.error_not_ready;
++            g.* = @ptrFromInt(0x60);
++            return abi.success;
++        }
++        fn destroy(_: abi.Graph) callconv(.c) abi.Result {
++            put(.destroy);
++            return abi.success;
++        }
++    };
++    var driver: cuda.Driver = undefined;
++    driver.api.cuStreamBeginCapture_v2 = Fake.begin;
++    driver.api.cuEventRecord = Fake.record;
++    driver.api.cuStreamWaitEvent = Fake.wait;
++    driver.api.cuStreamEndCapture = Fake.end;
++    driver.api.cuGraphDestroy = Fake.destroy;
++    // the stretch's first mix forks its side work, then its launch fails (as on a missing Triton variant): launches go
++    // to a log that cannot grow
++    var log: tri.Log = .{ .gpa = std.testing.failing_allocator };
++    var cfg: @import("config.zig").Config = undefined;
++    cfg.hidden = 4096;
++    var layers = [_]weights.Layer{ .{ .idx = 0, .ratio = 0 }, .{ .idx = 1, .ratio = 0 } };
++    const w: weights.Weights = .{ .gpa = std.testing.allocator, .layers = &layers };
++    var e: Engine = undefined;
++    e.d = &driver;
++    e.s = .{ .d = &driver, .handle = null };
++    e.t = .{ .log = &log };
++    e.c = &cfg;
++    e.w = &w;
++    var rd: Round = undefined;
++    rd.r = 1;
++    rd.side = .{ .d = &driver, .handle = @ptrFromInt(0x10) };
++    rd.join = .{ .d = &driver, .handle = @ptrFromInt(0x20) };
++    rd.pf_join = .{ .d = &driver, .handle = @ptrFromInt(0x30) };
++    rd.sink = .{ .s = e.s, .fork = .{ .d = &driver, .handle = @ptrFromInt(0x40) } };
++    rd.side_out = false;
++    var g = Graphs.init(std.testing.allocator);
++    defer g.deinit();
++    var cy: Carry = .{ .h = 1 << 20, .spare = 2 << 20, .pre = 3 << 20, .pre_f = 4 << 20 };
++    // each capture's calls: no wait before its first mix's fork (no join owed to the dead capture before it); both joins
++    // before the end, which refused ones do not stop
++    const joined = [_]Fake.Call{ .begin, .record, .wait, .wait, .end, .destroy };
++    const refused = [_]Fake.Call{ .begin, .record, .wait, .wait, .end };
++    for ([_]bool{ false, true, false }, [_][]const Fake.Call{ &joined, &refused, &joined }) |refuse, want| {
++        Fake.refuse = refuse;
++        Fake.n = 0;
++        rd.pf_out = true; // a prefetch forked in this capture too
++        try std.testing.expectError(error.OutOfMemory, g.run(.{ .rows = 1, .bucket = 0, .stretch = 0 }, &e, &rd, undefined, undefined, &.{}, &cy, 1, 2));
++        try std.testing.expectEqualSlices(Fake.Call, want, Fake.calls[0..Fake.n]);
++        try std.testing.expect(!rd.side_out and !rd.pf_out);
++    }
++}
+diff --git a/zig/src/families/dsv41/vision.zig b/zig/src/families/dsv41/vision.zig
+index 28f3656..d08a427 100644
+--- a/zig/src/families/dsv41/vision.zig
++++ b/zig/src/families/dsv41/vision.zig
+@@ -210,8 +210,7 @@ pub const Vision = struct {
+         try o.tower.stream.synchronize();
+         const from = out.items.len;
+         try out.resize(gpa, from + bytes);
+-        const d = v.m.ctx.d;
+-        try d.check(d.api.cuMemcpyDtoH_v2(out.items[from..].ptr, o.span.ptr, bytes), "cuMemcpyDtoH");
++        try o.span.download(0, out.items[from..]);
+         return t;
+     }
+ };
+diff --git a/zig/src/families/dsv41/vit_main.zig b/zig/src/families/dsv41/vit_main.zig
+index 1d4ea4b..9206205 100644
+--- a/zig/src/families/dsv41/vit_main.zig
++++ b/zig/src/families/dsv41/vit_main.zig
+@@ -46,7 +46,7 @@ const Check = struct {
+     fn compare(c: *Check, what: []const u8, index: usize, ptr: u64, bytes: usize, want: []const u8) !void {
+         try c.stream.synchronize();
+         const d = c.stream.d;
+-        try d.check(d.api.cuMemcpyDtoH_v2(c.host.ptr, ptr, bytes), "cuMemcpyDtoH");
++        try cuda.download(d, ptr, c.host[0..bytes]);
+         const got = hex(c.host[0..bytes]);
+         if (std.mem.eql(u8, &got, want)) {
+             c.equal += 1;

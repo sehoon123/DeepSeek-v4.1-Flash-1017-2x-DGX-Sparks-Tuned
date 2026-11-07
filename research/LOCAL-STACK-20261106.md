@@ -221,6 +221,27 @@ what was left; most levers were under 1 % or changed tokens. Three exact ones we
 - **The bench** now records each reply's server timings and the bench cgroup's throttling, and gates the count of late
   groups of four. Late groups this time were server-side, inside the prompt pass.
 
+**Bundle 16: fixes from other recipes (`zig/patches/0065-dsv41-gb10-downloads-captures-calibration-20261108.patch`, both ranks)**
+- **GB10 downloads through a pinned bounce:** with driver 580.178.04, a synchronous device-to-host copy straight into
+  pageable memory can report success while some pages keep their old bytes (TensorFold upstream a3962b45 measured 10 of
+  60 runs). GB10 reports itself integrated on both nodes, so every such copy (the drafter's two each pass, the vision
+  tower's span, calibration, profiling, tools) now lands in a 4 MiB pinned buffer per thread and is copied on. Decode in
+  the window: -0.3 to -0.6 % (inside the 5 % gate; the run-to-run spread was not measured, so no cost is claimed).
+- **A failed graph capture no longer poisons the next:** a stretch that failed inside its capture left two join flags
+  set, so every later capture waited on the dead capture's event and failed (901) until a restart while /health stayed
+  ok (MiaAI-Lab pull request #119 by ldenaeyer). It now joins, ends and clears; a failed round also waits out its Engram
+  reads, since a late one would be copied into the rows the next round reads.
+- **Engram ids checked before a read batch allocates** (bertholomus/TensorFold 12132870): a refused id leaked the
+  batch's buffers.
+- **MiaAI-Lab 0050, the per-stream draft calibration, compiled in and off** (`TF_DS_T25_DRAFT_CAL`, rank 0 only; their
+  greedy prose 79.7 to 85.4 tok/s, code unchanged). Ported with one change from the source review: a head granted no
+  drafts moves back toward no correction instead of staying undrafted. Its on/off A/B at this recipe's sampling is next.
+- **Checks:** CPU 757 test executions and twelve red copies; two source reviews PASS (nonblockers taken: the lock-in,
+  the Engram drain, comment order). The first GPU window stopped before any request on a harness defect (stale binary
+  hashes; production returned, 92/92 identical, and reopened); the second passed: 92/92 exact, decode -0.3 to -0.6 %,
+  TTFT by arrival rank within the gate (prose c4 pooled +5.9 %, from bench-side delays: client minus server 45 ms in its
+  late group), long prompts +0.0 to +0.4 %, three late groups against two.
+
 ## Settings the pair serves with (systemd drop-ins over this recipe)
 - **`TF_DS_GRAPH_CAP=64`, `TF_DS_ENGRAM_CACHE_MB=128`:** exact. Rank 0's minimum MemAvailable in the bench rose from
   6537 to 7102 MiB; decode and long-prompt TTFT stayed within noise. These are now `scripts/config.sh`'s defaults.
