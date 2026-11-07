@@ -201,6 +201,26 @@ what was left; most levers were under 1 % or changed tokens. Three exact ones we
   only. Not explained: the first picture's TTFT in the bench was 2.05 s against 1.72 s (both arms open the tower cold;
   the second picture was unchanged).
 
+**Bundle 14: recovery and latency fixes (`zig/patches/0064-dsv41-recovery-latency-20261107.patch`, both ranks)**
+- **The first token before the first drafter pass:** the host now sends a stream's first token, and reports its prompt
+  pass, as soon as the token is committed; the stream's first drafter pass runs after. Its time used to sit inside every
+  drafting reply's time to first token. Measured in the second window: TTFT by arrival rank -0.1 to -3.5 % in every cell
+  but one (code c4 rank 1, +2.8 %). `prefill_seconds` now ends at the first token.
+- **A drafter pass on a failed ring ends the pair** (exit 75), as a round and a prompt pass did; before, recovery waited
+  for the 300 s stall exit.
+- **Writes that never block:** each send takes the room the socket has; a client that stops reading is given up after
+  write_ms without progress. Before, a write past that room waited with no timeout and held its thread and socket.
+- **A peer that sent a byte and closed is gone** (POLLRDHUP), so its reply stops instead of running to max_tokens.
+- **The recipe's start.sh** (with this bundle's windows): a failed ssh, or one "not running" reading, no longer restarts a
+  healthy pair (two readings 30 s apart); once rank 0 has ended, rank 1 is killed (its engine has no SIGTERM handler, so
+  docker stop waited 30 s). `tools/test_watch_rank1.sh` runs the watch loop's own text with stubs.
+- **Checks:** CPU 703 test executions and four red copies; two source reviews PASS. The first GPU window was exact but
+  failed the TTFT gate (code c4 rank 0 +10 %); the second, on the change above, passed: 92/92 exact. The first window's
+  slow replies were request s2 of the code cell (65 prompt tokens against 59) being served first in 3 of 6 groups, not
+  the drafter pass as first diagnosed; a 65-token prompt prefills about 35 ms slower than a 59-token one (not explained).
+- **The bench** now records each reply's server timings and the bench cgroup's throttling, and gates the count of late
+  groups of four. Late groups this time were server-side, inside the prompt pass.
+
 ## Settings the pair serves with (systemd drop-ins over this recipe)
 - **`TF_DS_GRAPH_CAP=64`, `TF_DS_ENGRAM_CACHE_MB=128`:** exact. Rank 0's minimum MemAvailable in the bench rose from
   6537 to 7102 MiB; decode and long-prompt TTFT stayed within noise. These are now `scripts/config.sh`'s defaults.

@@ -1,0 +1,312 @@
+Subject: [PATCH] recovery and latency fixes on 2 x DGX Spark (both ranks)
+
+On top of 0063 (the bundle-13 tree), bundle 14. A stream's first token goes out before its first drafter pass, which
+otherwise ran inside every drafting reply's time to first token. A drafter pass that fails on a failed RDMA ring ends the
+process with status 75, as a round and a prompt pass already did, instead of failing until the 300 s stall exit. The
+server's writes never block: each send takes the room the socket has, and a client that stops reading is given up after
+write_ms without progress (a blocking write past that room waited with no timeout). A peer that sent a byte and closed
+is seen as gone (POLLRDHUP). Tokens are unchanged. CPU-tested with four red copies, source-reviewed twice, and A/B-checked
+on the pair: 92/92 exact against 0063, TTFT by arrival rank -0.1 to -3.5 % in all but one cell (research/
+LOCAL-STACK-20261106.md, "Bundle 14"). Generated with `git diff --binary` in a checkout of the 0063 tree; `git apply` of it
+gives the served source file for file (1286 files, sha256-compared).
+
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 2094bc8..be59332 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -522,6 +522,7 @@ pub const LaneHost = struct {
+             h.filling = null;
+             if (quota_owner) h.releaseBudgetOwner(owner_id);
+         }
++        job.stream.first = .{ .ptr = h, .run = firstOut };
+         h.core.addStream(&job.stream) catch |e| {
+             if (e == error.Cancelled) return h.cancel(job);
+             // refused for room while other streams hold it: back to the queue, also inside another request's pass (a
+@@ -531,7 +532,7 @@ pub const LaneHost = struct {
+             if (e == error.NanLogits) h.forgetFaulted(job);
+             return h.drop(job, h.words(e));
+         };
+-        h.prefilled(job, began);
++        if (job.prefilled == null) h.prefilled(job, began); // (firstOut stamped it already when the first token came)
+         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         if (now - began >= long_pass_ns and !h.nesting) { // (a nested pass: the long one it ran in goes on)
+             h.lock();
+@@ -750,6 +751,15 @@ pub const LaneHost = struct {
+         return false;
+     }
+ 
++    /// (bundle 14) A stream's first token, committed: its prompt pass reported and the token sent now, before the
++    /// stream's first drafter pass (the job stays; admitOne delivers the rest and finishes it).
++    fn firstOut(ptr: *anyopaque, s: *lanes.Stream) void {
++        const h: *LaneHost = @ptrCast(@alignCast(ptr));
++        const job: *Job = @alignCast(@fieldParentPtr("stream", s));
++        h.prefilled(job, job.began);
++        h.send(job);
++    }
++
+     fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
+         const done = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         h.lock();
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index bffb361..b43b080 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -117,6 +117,7 @@ pub const Engine = struct {
+         const value = try e.readFeed(feed);
+         _ = try s.commit(e.gpa, &.{value});
+         s.pending = value;
++        if (s.first) |out| out.run(out.ptr, s); // (bundle 14) the first token goes out before the first drafter pass
+         if (drafting) {
+             // then Rule.headDepth as every later round asks it: none for a copy ahead that holds (the first plan's window,
+             // which drops held drafts)
+diff --git a/zig/src/core/lanes/engine_test.zig b/zig/src/core/lanes/engine_test.zig
+index 14f61b4..a723426 100644
+--- a/zig/src/core/lanes/engine_test.zig
++++ b/zig/src/core/lanes/engine_test.zig
+@@ -235,6 +235,40 @@ fn copiedPrompt(sampling: ?Sampling) ![23]u32 {
+     return error.NoFirstTokenCopies;
+ }
+ 
++test "bundle14: a stream's first token goes to the host before its first drafts are asked" {
++    var cfg = try model();
++    defer cfg.deinit(gpa);
++    var target: fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: fake.FixedClock = .{};
++    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer engine.deinit();
++    const Seen = struct {
++        target: *fake.Fake,
++        calls: usize = 0,
++        drafts_before: usize = 0,
++        tokens: usize = 0,
++        fn run(ptr: *anyopaque, s: *sm.Stream) void {
++            const seen: *@This() = @ptrCast(@alignCast(ptr));
++            seen.calls += 1;
++            seen.drafts_before = seen.target.draft_calls;
++            seen.tokens = s.emitted().len;
++        }
++    };
++    var seen: Seen = .{ .target = &target };
++    const prompt = [_]u32{ 11, 12, 13, 14, 15, 16, 17, 18 };
++    var s = try sm.Stream.init(gpa, .{ .id = "first", .prompt = &prompt, .max_new = 8 });
++    defer s.deinit(gpa);
++    s.first = .{ .ptr = &seen, .run = Seen.run };
++    try engine.addStream(&s);
++    try std.testing.expectEqual(@as(usize, 1), seen.calls);
++    try std.testing.expectEqual(@as(usize, 0), seen.drafts_before); // before the first drafter pass
++    try std.testing.expectEqual(@as(usize, 1), seen.tokens); // with the first token committed
++    try std.testing.expect(target.draft_calls > 0); // and that pass still asked, after it
++    while (engine.activeCount() > 0) try engine.step();
++    try std.testing.expectEqual(@as(usize, 1), seen.calls); // once a stream
++}
++
+ test "bundle11: a stream whose first round copies from its prompt asks the head for no first drafts, and its tokens stay the target's" {
+     const sampled: Sampling = .{ .seed = 5, .temperature = 0.7, .top_k = 0, .top_p = 0.95 };
+     for ([_][]const ?Sampling{ &.{null}, &.{sampled}, &.{ null, sampled } }) |samplings| {
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index b6112be..a439e55 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -149,6 +149,13 @@ pub const Spec = struct {
+     } = null,
+ };
+ 
++/// The host's delivery of a stream's first token, called once it is committed and before its first drafts are asked
++/// (bundle 14): the first drafter pass, up to a full depth, otherwise ran inside every reply's time to first token.
++pub const First = struct {
++    ptr: *anyopaque,
++    run: *const fn (ptr: *anyopaque, s: *Stream) void,
++};
++
+ /// Decode rounds for the other live streams between two prompt chunks (Stream.between).
+ pub const Between = struct {
+     ptr: *anyopaque,
+@@ -179,6 +186,7 @@ pub const Stream = struct {
+     /// Prefill interleave (TF_PREFILL_INTERLEAVE_MS): the host's decode rounds for the OTHER live streams, which a
+     /// backend may call between two of this stream's prompt chunks; null: the pass runs whole, as before.
+     between: ?Between = null,
++    first: ?First = null, // (bundle 14) the host's delivery of the first token, before the first drafts; null: none
+     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
+     prefill_done: u32 = 0, // host scheduling progress only; never a cache-validity or KV-reuse count
+     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index ab9c9c6..91cca61 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -265,6 +265,29 @@ test "bundle5: a round that fails on a failed RDMA ring ends the process; other
+     try std.testing.expect(broken_seen == null);
+ }
+ 
++test "bundle14: a drafter pass that fails on a failed RDMA ring ends the process too" {
++    const keep = broken;
++    defer broken = keep;
++    broken = sawBroken;
++    var r: rdma.Ring = undefined;
++    r.failed = .init(true);
++    r.why = @splat(0);
++    @memcpy(r.why[0.."completion queue error".len], "completion queue error");
++    var m: Model = undefined;
++    m.ring = &r;
++    m.dr = null; // no drafter here: the pass fails before it touches the GPU
++    var lanes_: Lanes = undefined;
++    lanes_.m = &m;
++    broken_seen = null;
++    try std.testing.expectError(error.NoDraftHead, Lanes.draftFn(&lanes_, &.{}));
++    try std.testing.expect(broken_seen != null);
++    try std.testing.expectEqualStrings("completion queue error", broken_seen.?);
++    r.failed.store(false, .release);
++    broken_seen = null;
++    try std.testing.expectError(error.NoDraftHead, Lanes.draftFn(&lanes_, &.{})); // a sound ring: the error only
++    try std.testing.expect(broken_seen == null);
++}
++
+ test "a placement leaves a kept state room to grow while one fits so" {
+     const c = model.chunk_rows;
+     const gpa = std.testing.allocator;
+@@ -1137,8 +1160,14 @@ pub const Lanes = struct {
+         }
+     }
+ 
+-    /// One drafter pass for every stream asked: its pending token at its new length, `depth` drafts held.
++    /// One drafter pass for every stream asked: its pending token at its new length, `depth` drafts held. A pass that
++    /// failed on a failed ring ends the process as a round or a prompt pass does (bundle 14, review a8060ced: rank 1 then
++    /// waited in the pass for data that never came, until the 300 s stall exit).
+     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
++        return onRing(of(ptr).m.ring, draftBody(ptr, requests));
++    }
++
++    fn draftBody(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
+         const self = of(ptr);
+         const m = self.m;
+         const gpa = self.gpa;
+diff --git a/zig/src/families/dsv41/pil.zig b/zig/src/families/dsv41/pil.zig
+index 7c39df4..225fc75 100644
+--- a/zig/src/families/dsv41/pil.zig
++++ b/zig/src/families/dsv41/pil.zig
+@@ -20,13 +20,13 @@ pub const deadline_ms: i32 = 110_000;
+ /// RGB rows or the error's text. The lane refuses past 134,217,728 pixels: twice Image.MAX_IMAGE_PIXELS.
+ /// (bundle 13) Every picture is checked here at the size its header declares, before its decode, above memguard's line
+ /// (4.25 GiB) and a 1 GiB margin as vision.zig's roomToDecode checks: 16 bytes a pixel for JPEG, MPO and PNG (that
+-/// check's figure), 26 for every other format (this child measured 22.4 for a WebP lossless and 19.2 for a JPEG 2000
+-/// at 33.5 Mpx, plus the lane's 3 for the RGB it receives). Before, vision.zig counted a format it reads no header of
+-/// as 24 Mpx, and a 134 Mpx JPEG 2000 took 2.9 GiB for about 15 s. Pillow's own size check of every picture it is
+-/// about to decode, an embedded one too (ICO while it opens, ICNS, BLP, GIF frames, TIFF tiles), passes the same room
+-/// check at 16 bytes a pixel (review a1e38979: an embedded picture of up to 134 Mpx decoded after a check at the
+-/// declared size). The picture's objects go before the child waits for the next one (review ab4acaf8: they held up to
+-/// 1.5 GB idle).
++/// check's figure), 26 for every other format (this child measured 22.4 for a WebP lossless and 19.2 for a JPEG 2000 at
++/// 33.5 Mpx, plus the lane's 3 for the RGB it receives). Before, vision.zig counted a format it reads no header of as
++/// 24 Mpx, and a 134 Mpx JPEG 2000 would take about 2.9 GiB for about 15 s (x4 from 33.5 Mpx). Pillow's own size check
++/// of every picture it is about to decode, an embedded one too (ICO while it opens, ICNS, BLP, GIF frames, TIFF tiles),
++/// passes the same room check at 16 bytes a pixel (review a1e38979: an embedded picture of up to 134 Mpx decoded after
++/// a check at the declared size). The picture's objects go before the child waits for the next one (review ab4acaf8:
++/// they held up to 1.5 GB idle).
+ pub const script =
+     \\import io, struct, sys, warnings
+     \\from PIL import Image
+diff --git a/zig/src/server/http_conn.zig b/zig/src/server/http_conn.zig
+index f29d9f8..e927666 100644
+--- a/zig/src/server/http_conn.zig
++++ b/zig/src/server/http_conn.zig
+@@ -17,6 +17,9 @@ pub const Timeouts = struct {
+ 
+ pub const IoError = error{ Closed, Timeout };
+ 
++/// Linux poll's POLLRDHUP (std's POLL leaves it out, as link.zig notes): the peer shut its end.
++const pollrdhup: i16 = 0x2000;
++
+ /// What reading a request head ended with.
+ pub const Outcome = enum { ready, handled, closed };
+ 
+@@ -108,12 +111,14 @@ pub const Conn = struct {
+         return n - want;
+     }
+ 
+-    /// Whether the peer has gone: readable with nothing to read (Python's socket_cancellation).
++    /// Whether the peer has gone: readable with nothing to read (Python's socket_cancellation), or shut, with bytes it
++    /// sent still unread (bundle 14, review a1b1abde: a pipelined byte hid a close, and the reply ran on for nobody).
+     pub fn peerGone(c: *Conn) bool {
+         if (c.broken) return true;
+-        var fds = [_]posix.pollfd{.{ .fd = c.fd, .events = posix.POLL.IN | posix.POLL.PRI, .revents = 0 }};
++        var fds = [_]posix.pollfd{.{ .fd = c.fd, .events = posix.POLL.IN | posix.POLL.PRI | pollrdhup, .revents = 0 }};
+         const ready = posix.poll(&fds, 0) catch return true;
+         if (ready == 0) return false;
++        if (fds[0].revents & (pollrdhup | posix.POLL.HUP | posix.POLL.ERR) != 0) return true;
+         var probe: [1]u8 = undefined;
+         const rc = posix.system.recvfrom(c.fd, &probe, 1, posix.MSG.PEEK | posix.MSG.DONTWAIT, null, null);
+         return switch (posix.errno(rc)) {
+@@ -123,7 +128,9 @@ pub const Conn = struct {
+         };
+     }
+ 
+-    /// Writes ``data`` whole; a write that cannot progress for ``write_ms`` marks the client gone.
++    /// Writes ``data`` whole; a write that cannot progress for ``write_ms`` marks the client gone. Each send takes what
++    /// the socket has room for and never waits (bundle 14, review a1b1abde: a blocking write past the room the poll saw
++    /// waited without a timeout for a client that stopped reading, holding its thread and socket).
+     pub fn writeAll(c: *Conn, data: []const u8) error{Closed}!void {
+         if (c.broken) return error.Closed;
+         var sent: usize = 0;
+@@ -131,7 +138,7 @@ pub const Conn = struct {
+             var fds = [_]posix.pollfd{.{ .fd = c.fd, .events = posix.POLL.OUT, .revents = 0 }};
+             const ready = posix.poll(&fds, c.timeouts.write_ms) catch return c.fail();
+             if (ready == 0) return c.fail();
+-            const rc = posix.system.write(c.fd, data[sent..].ptr, data.len - sent);
++            const rc = posix.system.sendto(c.fd, data[sent..].ptr, data.len - sent, posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL, null, 0);
+             switch (posix.errno(rc)) {
+                 .SUCCESS => sent += @intCast(rc),
+                 .AGAIN, .INTR => {},
+@@ -468,6 +475,53 @@ fn htmlEscape(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
+     return out.items;
+ }
+ 
++test "bundle14: a write to a client that stopped reading gives up after write_ms" {
++    // (the write before bundle 14 blocked here until the other end closed; that is a SIGPIPE in a test, so ignore it)
++    const ignore: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
++    var was: posix.Sigaction = undefined;
++    posix.sigaction(.PIPE, &ignore, &was);
++    defer posix.sigaction(.PIPE, &was, null);
++    var pair: [2]std.c.fd_t = undefined;
++    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair));
++    defer _ = std.c.close(pair[0]);
++    var c = try Conn.init(std.testing.allocator, pair[0], "test");
++    defer c.deinit();
++    c.timeouts.write_ms = 200;
++    const data = try std.testing.allocator.alloc(u8, 4 << 20);
++    defer std.testing.allocator.free(data);
++    @memset(data, 'x');
++    const W = struct {
++        fn run(conn: *Conn, d: []const u8, out: *std.atomic.Value(u8)) void {
++            conn.writeAll(d) catch {
++                out.store(2, .release);
++                return;
++            };
++            out.store(1, .release);
++        }
++    };
++    var out = std.atomic.Value(u8).init(0);
++    const t = try std.Thread.spawn(.{}, W.run, .{ &c, data, &out });
++    var waited: usize = 0;
++    while (out.load(.acquire) == 0 and waited < 2000) : (waited += 10) std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
++    const gave_up_in_time = out.load(.acquire) == 2;
++    _ = std.c.close(pair[1]); // (ends a write still blocked)
++    t.join();
++    try std.testing.expect(gave_up_in_time);
++}
++
++test "bundle14: a peer that sent a byte and closed is gone" {
++    var pair: [2]std.c.fd_t = undefined;
++    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &pair));
++    defer _ = std.c.close(pair[0]);
++    var c = try Conn.init(std.testing.allocator, pair[0], "test");
++    defer c.deinit();
++    try std.testing.expect(!c.peerGone()); // nothing yet: here
++    try std.testing.expectEqual(@as(isize, 1), std.c.write(pair[1], "x", 1));
++    try std.testing.expect(!c.peerGone()); // a pipelined byte: still here
++    _ = std.c.close(pair[1]);
++    try std.testing.expect(c.peerGone());
++}
++
+ test "versions and repr" {
+     try std.testing.expectEqual([2]u64{ 1, 1 }, parseVersion("HTTP/1.1").?);
+     try std.testing.expect(parseVersion("HTTP/1") == null);
